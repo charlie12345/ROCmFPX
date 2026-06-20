@@ -216,6 +216,26 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
+// TurboQuant 3-bit KV-cache quantization (3.5 bpw)
+#define TURBO3_BLOCK_SIZE 32
+#define QK_TURBO3 32
+#define QR_TURBO3 2
+typedef struct {
+    ggml_half d;        // FP16 L2-norm
+    uint8_t qs[12];     // 32 x 3-bit packed indices
+} block_turbo3_0;
+static_assert(sizeof(block_turbo3_0) == 14, "wrong turbo3 block size");
+
+// TurboQuant 4-bit KV-cache quantization (4.5 bpw)
+#define TURBO4_BLOCK_SIZE 32
+#define QK_TURBO4 32
+#define QR_TURBO4 2
+typedef struct {
+    ggml_half d;        // FP16 L2-norm
+    uint8_t qs[16];     // 32 x 4-bit packed indices
+} block_turbo4_0;
+static_assert(sizeof(block_turbo4_0) == 18, "wrong turbo4 block size");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta

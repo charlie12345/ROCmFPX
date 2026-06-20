@@ -259,6 +259,10 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
+
+    # TurboQuant CPU reference tests (FWHT, MSE, bitpack)
+    llama_build(test-turboquant.cpp)
+    llama_test(test-turboquant)
 endif()
 
 # libmtmd

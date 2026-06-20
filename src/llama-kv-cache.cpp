@@ -204,6 +204,21 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
+        if (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0) {
+            const uint32_t n_embd_head_k = hparams.n_embd_head_k(il);
+            if (n_embd_head_k != 128 && n_embd_head_k != 256) {
+                LLAMA_LOG_ERROR("%s: TurboQuant requires head_dim=128 or 256, got %d (layer %d)\n", __func__, n_embd_head_k, il);
+                throw std::runtime_error("turbo types require head_dim=128 or 256");
+            }
+        }
+        if (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0) {
+            const uint32_t n_embd_head_v = hparams.n_embd_head_v(il);
+            if (n_embd_head_v != 128 && n_embd_head_v != 256) {
+                LLAMA_LOG_ERROR("%s: TurboQuant requires head_dim=128 or 256, got %d (layer %d)\n", __func__, n_embd_head_v, il);
+                throw std::runtime_error("turbo types require head_dim=128 or 256");
+            }
+        }
+
         const bool has_k = true;
         const bool has_v = !is_mla && model.arch != LLM_ARCH_DEEPSEEK4;
 
@@ -287,19 +302,21 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
     }
 
-    // Walsh-Hadamard attn_rot corrupts fp3 ROCmFPX KV cache. Higher-bit
-    // ROCmFPX cache types keep rotation enabled so they retain quantized-KV
-    // parity with the promoted ROCmFP4 path.
+    // TurboQuant carries its own FWHT rotation; fp3 ROCmFPX is likewise
+    // incompatible with the shared attention rotation path.
     const bool attn_rot_k_rocmfpx_fp3 = type_k == GGML_TYPE_Q3_0_ROCMFPX;
     const bool attn_rot_v_rocmfpx_fp3 = type_v == GGML_TYPE_Q3_0_ROCMFPX;
-    if (attn_rot_k_rocmfpx_fp3 || attn_rot_v_rocmfpx_fp3) {
-        LLAMA_LOG_WARN("%s: attention rotation disabled for fp3 ROCmFPX KV cache (K=%s, V=%s)\n", __func__,
+    const bool attn_rot_k_turbo       = type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0;
+    const bool attn_rot_v_turbo       = type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0;
+    if (attn_rot_k_rocmfpx_fp3 || attn_rot_v_rocmfpx_fp3 || attn_rot_k_turbo || attn_rot_v_turbo) {
+        LLAMA_LOG_WARN("%s: attention rotation disabled for fp3 ROCmFPX/TurboQuant KV cache (K=%s, V=%s)\n", __func__,
                 ggml_type_name(type_k), ggml_type_name(type_v));
     }
 
     attn_rot_k =
         !attn_rot_disable &&
         !attn_rot_k_rocmfpx_fp3 &&
+        !attn_rot_k_turbo &&
         n_embd_head_k_all > 0 &&
         ggml_is_quantized(type_k) &&
         hparams.n_embd_head_k() % 64 == 0;
@@ -307,6 +324,7 @@ llama_kv_cache::llama_kv_cache(
     attn_rot_v =
         !attn_rot_disable &&
         !attn_rot_v_rocmfpx_fp3 &&
+        !attn_rot_v_turbo &&
         n_embd_head_v_all > 0 &&
         ggml_is_quantized(type_v) &&
         hparams.n_embd_head_v() % 64 == 0;
@@ -1238,7 +1256,11 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
-    return ggml_set_rows(ctx, k, k_cur, k_idxs);
+    ggml_tensor * result = ggml_set_rows(ctx, k, k_cur, k_idxs);
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
+        result->op_params[0] = (int32_t) n_embd_head;
+    }
+    return result;
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -1273,7 +1295,11 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
         }
 
-        return ggml_set_rows(ctx, v, v_cur, v_idxs);
+        ggml_tensor * result = ggml_set_rows(ctx, v, v_cur, v_idxs);
+        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
+            result->op_params[0] = (int32_t) n_embd_head;
+        }
+        return result;
     }
 
     if (ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]) {
@@ -1294,7 +1320,11 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 
     v_cur = ggml_reshape_2d(ctx, v_cur, 1, ggml_nelements(v_cur));
 
-    return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
+    ggml_tensor * result = ggml_set_rows(ctx, v_view, v_cur, v_idxs);
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
+        result->op_params[0] = (int32_t) n_embd_head;
+    }
+    return result;
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {

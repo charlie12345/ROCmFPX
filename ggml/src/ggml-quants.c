@@ -551,6 +551,342 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// ============================================================
+// TurboQuant codebook data (Lloyd-Max optimal for d=128 after WHT)
+// ============================================================
+
+static const float turbo_codebook_3bit[8] = {
+    -0.1883972972f, -0.1181399059f, -0.0665857641f, -0.0216044751f,
+     0.0216041461f,  0.0665854520f,  0.1181396281f,  0.1883970748f
+};
+
+static const float turbo_codebook_4bit[16] = {
+    -0.2376389871f, -0.1808080141f, -0.1417777640f, -0.1102646123f,
+    -0.0828112376f, -0.0577640422f, -0.0341540905f, -0.0113168380f,
+     0.0112761586f,  0.0341139667f,  0.0577250301f,  0.0827738972f,
+     0.1102295202f,  0.1417455465f,  0.1807794468f,  0.2376153882f
+};
+
+// ============================================================
+// TurboQuant helper: pack/unpack bit-packed indices
+// ============================================================
+
+static void turbo_pack3(const uint8_t *indices, uint8_t *out) {
+    // Pack 32 x 3-bit values into 12 bytes (96 bits)
+    memset(out, 0, 12);
+    for (int i = 0; i < 32; i++) {
+        int bit_off = i * 3;
+        int byte_idx = bit_off / 8;
+        int shift = bit_off % 8;
+        out[byte_idx] |= (uint8_t)((indices[i] & 0x07) << shift);
+        if (shift > 5 && byte_idx + 1 < 12) {
+            out[byte_idx + 1] |= (uint8_t)((indices[i] & 0x07) >> (8 - shift));
+        }
+    }
+}
+
+static void turbo_unpack3(const uint8_t *packed, uint8_t *indices) {
+    // Unpack 12 bytes into 32 x 3-bit values
+    for (int i = 0; i < 32; i++) {
+        int bit_off = i * 3;
+        int byte_idx = bit_off / 8;
+        int shift = bit_off % 8;
+        uint16_t raw = (uint16_t)packed[byte_idx] >> shift;
+        if (shift > 5 && byte_idx + 1 < 12) {
+            raw |= (uint16_t)packed[byte_idx + 1] << (8 - shift);
+        }
+        indices[i] = (uint8_t)(raw & 0x07);
+    }
+}
+
+static void turbo_pack4(const uint8_t *indices, uint8_t *out) {
+    // Pack 32 x 4-bit values into 16 bytes
+    for (int i = 0; i < 16; i++) {
+        out[i] = (indices[2*i] & 0x0F) | ((indices[2*i + 1] & 0x0F) << 4);
+    }
+}
+
+static void turbo_unpack4(const uint8_t *packed, uint8_t *indices) {
+    // Unpack 16 bytes into 32 x 4-bit values
+    for (int i = 0; i < 16; i++) {
+        indices[2*i]     = packed[i] & 0x0F;
+        indices[2*i + 1] = (packed[i] >> 4) & 0x0F;
+    }
+}
+
+static uint8_t turbo_quantize_scalar(float val, const float *codebook, int n_codes) {
+    // Find nearest codebook entry (linear scan - codebook is sorted)
+    float best_dist = fabsf(val - codebook[0]);
+    uint8_t best_idx = 0;
+    for (int i = 1; i < n_codes; i++) {
+        float dist = fabsf(val - codebook[i]);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_idx = (uint8_t)i;
+        }
+    }
+    return best_idx;
+}
+
+// ============================================================
+// TurboQuant FWHT (Fast Walsh-Hadamard Transform)
+// Self-inverse with 1/sqrt(n) normalization.
+// ============================================================
+
+#define TURBO_HEAD_DIM 128
+#define TURBO_BLOCKS_PER_CHUNK (TURBO_HEAD_DIM / 32)  // 4 blocks of 32 = 128
+
+static void turbo_fwht_f32(float *x, int n) {
+    // Butterfly sums
+    for (int h = 1; h < n; h *= 2) {
+        for (int i = 0; i < n; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float a = x[j];
+                float b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    // Normalize by 1/sqrt(n)
+    float scale = 1.0f / sqrtf((float)n);
+    for (int i = 0; i < n; i++) {
+        x[i] *= scale;
+    }
+}
+
+// ============================================================
+// TurboQuant TURBO3_0 (3-bit, 3.5 bpw)
+// ============================================================
+
+void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT src, block_turbo3_0 * GGML_RESTRICT dst, int64_t k) {
+    assert(k % TURBO3_BLOCK_SIZE == 0);
+    assert(k % TURBO_HEAD_DIM == 0);
+
+    float tmp[TURBO_HEAD_DIM];
+    int64_t blocks_done = 0;
+
+    for (int64_t offset = 0; offset < k; offset += TURBO_HEAD_DIM) {
+        // Step 1: Compute L2 norm of this head_dim chunk
+        float sum_sq = 0.0f;
+        for (int i = 0; i < TURBO_HEAD_DIM; i++) {
+            sum_sq += src[offset + i] * src[offset + i];
+        }
+        float norm = sqrtf(sum_sq);
+
+        // Step 2: Normalize the chunk
+        float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+        for (int i = 0; i < TURBO_HEAD_DIM; i++) {
+            tmp[i] = src[offset + i] * inv_norm;
+        }
+
+        // Step 3: Apply FWHT rotation
+        turbo_fwht_f32(tmp, TURBO_HEAD_DIM);
+
+        // Step 4: Scalar quantize + pack, one block at a time
+        for (int blk = 0; blk < TURBO_BLOCKS_PER_CHUNK; blk++) {
+            uint8_t indices[32];
+            for (int i = 0; i < TURBO3_BLOCK_SIZE; i++) {
+                indices[i] = turbo_quantize_scalar(tmp[blk * TURBO3_BLOCK_SIZE + i], turbo_codebook_3bit, 8);
+            }
+            // Store same norm in every block of this chunk
+            dst[blocks_done].d = GGML_FP32_TO_FP16(norm);
+            turbo_pack3(indices, dst[blocks_done].qs);
+            blocks_done++;
+        }
+    }
+}
+
+static void quantize_row_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t k) {
+    quantize_row_turbo3_0_ref(src, (block_turbo3_0 *)dst, k);
+}
+
+void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % TURBO3_BLOCK_SIZE == 0);
+    const int64_t num_blocks = k / TURBO3_BLOCK_SIZE;
+
+    // Pass 1: Unpack all blocks and look up centroids
+    for (int64_t b = 0; b < num_blocks; b++) {
+        uint8_t indices[32];
+        turbo_unpack3(x[b].qs, indices);
+        for (int i = 0; i < TURBO3_BLOCK_SIZE; i++) {
+            y[b * TURBO3_BLOCK_SIZE + i] = turbo_codebook_3bit[indices[i]];
+        }
+    }
+
+    // Pass 2: Inverse FWHT per head_dim chunk, then scale by norm
+    for (int64_t offset = 0; offset < k; offset += TURBO_HEAD_DIM) {
+        int chunk = TURBO_HEAD_DIM;
+        if (offset + chunk > k) chunk = (int)(k - offset);
+
+        // Inverse FWHT (self-inverse with 1/sqrt(n) normalization)
+        turbo_fwht_f32(y + offset, chunk);
+
+        // Read norm from the first block of this chunk
+        float norm = GGML_FP16_TO_FP32(x[offset / TURBO3_BLOCK_SIZE].d);
+        for (int i = 0; i < chunk; i++) {
+            y[offset + i] *= norm;
+        }
+    }
+}
+
+// ============================================================
+// TurboQuant TURBO4_0 (4-bit, 4.5 bpw)
+// ============================================================
+
+void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT src, block_turbo4_0 * GGML_RESTRICT dst, int64_t k) {
+    assert(k % TURBO4_BLOCK_SIZE == 0);
+    assert(k % TURBO_HEAD_DIM == 0);
+
+    float tmp[TURBO_HEAD_DIM];
+    int64_t blocks_done = 0;
+
+    for (int64_t offset = 0; offset < k; offset += TURBO_HEAD_DIM) {
+        // Step 1: Compute L2 norm of this head_dim chunk
+        float sum_sq = 0.0f;
+        for (int i = 0; i < TURBO_HEAD_DIM; i++) {
+            sum_sq += src[offset + i] * src[offset + i];
+        }
+        float norm = sqrtf(sum_sq);
+
+        // Step 2: Normalize the chunk
+        float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+        for (int i = 0; i < TURBO_HEAD_DIM; i++) {
+            tmp[i] = src[offset + i] * inv_norm;
+        }
+
+        // Step 3: Apply FWHT rotation
+        turbo_fwht_f32(tmp, TURBO_HEAD_DIM);
+
+        // Step 4: Scalar quantize + pack, one block at a time
+        for (int blk = 0; blk < TURBO_BLOCKS_PER_CHUNK; blk++) {
+            uint8_t indices[32];
+            for (int i = 0; i < TURBO4_BLOCK_SIZE; i++) {
+                indices[i] = turbo_quantize_scalar(tmp[blk * TURBO4_BLOCK_SIZE + i], turbo_codebook_4bit, 16);
+            }
+            // Store same norm in every block of this chunk
+            dst[blocks_done].d = GGML_FP32_TO_FP16(norm);
+            turbo_pack4(indices, dst[blocks_done].qs);
+            blocks_done++;
+        }
+    }
+}
+
+static void quantize_row_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t k) {
+    quantize_row_turbo4_0_ref(src, (block_turbo4_0 *)dst, k);
+}
+
+void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % TURBO4_BLOCK_SIZE == 0);
+    const int64_t num_blocks = k / TURBO4_BLOCK_SIZE;
+
+    // Pass 1: Unpack all blocks and look up centroids
+    for (int64_t b = 0; b < num_blocks; b++) {
+        uint8_t indices[32];
+        turbo_unpack4(x[b].qs, indices);
+        for (int i = 0; i < TURBO4_BLOCK_SIZE; i++) {
+            y[b * TURBO4_BLOCK_SIZE + i] = turbo_codebook_4bit[indices[i]];
+        }
+    }
+
+    // Pass 2: Inverse FWHT per head_dim chunk, then scale by norm
+    for (int64_t offset = 0; offset < k; offset += TURBO_HEAD_DIM) {
+        int chunk = TURBO_HEAD_DIM;
+        if (offset + chunk > k) chunk = (int)(k - offset);
+
+        // Inverse FWHT (self-inverse with 1/sqrt(n) normalization)
+        turbo_fwht_f32(y + offset, chunk);
+
+        // Read norm from the first block of this chunk
+        float norm = GGML_FP16_TO_FP32(x[offset / TURBO4_BLOCK_SIZE].d);
+        for (int i = 0; i < chunk; i++) {
+            y[offset + i] *= norm;
+        }
+    }
+}
+
+// ============================================================
+// TurboQuant vec_dot (for flash attention compatibility)
+// ============================================================
+
+void ggml_vec_dot_turbo3_0(int n, float * GGML_RESTRICT s, size_t bs,
+                            const void * GGML_RESTRICT vx, size_t bx,
+                            const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const block_turbo3_0 *x = (const block_turbo3_0 *)vx;
+    const float *y = (const float *)vy;
+
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    // Dequantize x into temp buffer (includes inverse FWHT + norm scaling),
+    // then compute dot product with y.
+    float tmp[TURBO_HEAD_DIM];
+    float sum = 0.0f;
+
+    for (int64_t offset = 0; offset < n; offset += TURBO_HEAD_DIM) {
+        int chunk = TURBO_HEAD_DIM;
+        if (offset + chunk > n) chunk = (int)(n - offset);
+        int64_t base_block = offset / TURBO3_BLOCK_SIZE;
+
+        // Unpack + centroid lookup for this chunk
+        for (int blk = 0; blk < chunk / TURBO3_BLOCK_SIZE; blk++) {
+            uint8_t indices[32];
+            turbo_unpack3(x[base_block + blk].qs, indices);
+            for (int i = 0; i < TURBO3_BLOCK_SIZE; i++) {
+                tmp[blk * TURBO3_BLOCK_SIZE + i] = turbo_codebook_3bit[indices[i]];
+            }
+        }
+
+        // Inverse FWHT
+        turbo_fwht_f32(tmp, chunk);
+
+        // Scale by norm and accumulate dot product
+        float norm = GGML_FP16_TO_FP32(x[base_block].d);
+        for (int i = 0; i < chunk; i++) {
+            sum += tmp[i] * norm * y[offset + i];
+        }
+    }
+    *s = sum;
+}
+
+void ggml_vec_dot_turbo4_0(int n, float * GGML_RESTRICT s, size_t bs,
+                            const void * GGML_RESTRICT vx, size_t bx,
+                            const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const block_turbo4_0 *x = (const block_turbo4_0 *)vx;
+    const float *y = (const float *)vy;
+
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    // Dequantize x into temp buffer (includes inverse FWHT + norm scaling),
+    // then compute dot product with y.
+    float tmp[TURBO_HEAD_DIM];
+    float sum = 0.0f;
+
+    for (int64_t offset = 0; offset < n; offset += TURBO_HEAD_DIM) {
+        int chunk = TURBO_HEAD_DIM;
+        if (offset + chunk > n) chunk = (int)(n - offset);
+        int64_t base_block = offset / TURBO4_BLOCK_SIZE;
+
+        // Unpack + centroid lookup for this chunk
+        for (int blk = 0; blk < chunk / TURBO4_BLOCK_SIZE; blk++) {
+            uint8_t indices[32];
+            turbo_unpack4(x[base_block + blk].qs, indices);
+            for (int i = 0; i < TURBO4_BLOCK_SIZE; i++) {
+                tmp[blk * TURBO4_BLOCK_SIZE + i] = turbo_codebook_4bit[indices[i]];
+            }
+        }
+
+        // Inverse FWHT
+        turbo_fwht_f32(tmp, chunk);
+
+        // Scale by norm and accumulate dot product
+        float norm = GGML_FP16_TO_FP32(x[base_block].d);
+        for (int i = 0; i < chunk; i++) {
+            sum += tmp[i] * norm * y[offset + i];
+        }
+    }
+    *s = sum;
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -5464,6 +5800,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
+            } break;
+        case GGML_TYPE_TURBO3_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_turbo3_0, data, nb);
+            } break;
+        case GGML_TYPE_TURBO4_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_turbo4_0, data, nb);
             } break;
         case GGML_TYPE_IQ1_S:
             {

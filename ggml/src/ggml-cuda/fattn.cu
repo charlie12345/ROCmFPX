@@ -5,6 +5,7 @@
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
+#include "convert.cuh"
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -323,6 +324,8 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+
+    // TurboQuant: pre-dequantized to f16 before FA, no turbo vec cases needed
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
@@ -346,6 +349,10 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16  = 400,
 };
+
+static bool ggml_type_is_turbo(ggml_type type) {
+    return type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+}
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
@@ -433,8 +440,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
-        return BEST_FATTN_KERNEL_NONE;
+    {
+        const ggml_type eff_k = ggml_type_is_turbo(K->type) ? GGML_TYPE_F16 : K->type;
+        const ggml_type eff_v = ggml_type_is_turbo(V->type) ? GGML_TYPE_F16 : V->type;
+        if (eff_k != eff_v) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
@@ -456,6 +467,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q8_0_ROCMFPX:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+            break;
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
+            // Turbo types are handled via pre-dequantize to f16 before FA
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -565,8 +580,72 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+// Pre-dequantize a turbo tensor to f16, returning a stack-allocated tensor copy.
+// The caller must keep pool_buf alive until after FA completes.
+static ggml_tensor turbo_pre_dequantize(
+        const ggml_tensor * src,
+        ggml_cuda_pool_alloc<half> & pool_buf,
+        cudaStream_t stream) {
+    const int64_t n_elements = ggml_nelements(src);
+
+    pool_buf.alloc(n_elements);
+
+    to_fp16_cuda_t dequant = ggml_get_to_fp16_cuda(src->type);
+    GGML_ASSERT(dequant != nullptr);
+    dequant(src->data, pool_buf.ptr, n_elements, stream);
+
+    // Scale existing strides from turbo block layout to f16 element layout.
+    // This preserves any permutation (e.g. ggml_permute swapping dims 1 and 2).
+    // The dequantized f16 data is in the same physical order as the turbo data,
+    // so the stride relationships must be preserved, just rescaled.
+    const size_t bs = ggml_blck_size(src->type);
+    const size_t ts = ggml_type_size(src->type);
+
+    ggml_tensor tmp = *src;
+    tmp.type = GGML_TYPE_F16;
+    tmp.data = pool_buf.ptr;
+    tmp.nb[0] = sizeof(half);
+    tmp.nb[1] = src->nb[1] * bs * sizeof(half) / ts;
+    tmp.nb[2] = src->nb[2] * bs * sizeof(half) / ts;
+    tmp.nb[3] = src->nb[3] * bs * sizeof(half) / ts;
+    tmp.view_src  = nullptr;
+    tmp.view_offs = 0;
+
+    return tmp;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    const bool k_is_turbo = ggml_type_is_turbo(K->type);
+    const bool v_is_turbo = V && ggml_type_is_turbo(V->type);
+
+    // Pre-dequantize turbo KV to f16 so standard FA kernels can handle them.
+    // Pool buffers must outlive the FA dispatch (RAII frees on scope exit).
+    ggml_cuda_pool_alloc<half> k_pool(ctx.pool());
+    ggml_cuda_pool_alloc<half> v_pool(ctx.pool());
+    ggml_tensor k_f16, v_f16;
+
+    cudaStream_t stream = ctx.stream();
+
+    // Save original src pointers
+    ggml_tensor * orig_k = dst->src[1];
+    ggml_tensor * orig_v = dst->src[2];
+
+    if (k_is_turbo) {
+        k_f16 = turbo_pre_dequantize(K, k_pool, stream);
+        dst->src[1] = &k_f16;
+    }
+    if (v_is_turbo) {
+        v_f16 = turbo_pre_dequantize(V, v_pool, stream);
+        dst->src[2] = &v_f16;
+    }
+
+
+    // Standard FA dispatch — now sees f16 tensors
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -583,6 +662,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
     }
+
+    // Restore original src pointers
+    dst->src[1] = orig_k;
+    dst->src[2] = orig_v;
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {

@@ -831,6 +831,14 @@ void process_shaders() {
         string_to_spv("set_rows_" + t + "_i64", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }
 
+    // TurboQuant KV: decode = cooperative inverse-FWHT -> f16 (pre-dequant before FA);
+    // encode = cooperative FWHT set_rows. Registered explicitly (KV-only: no mul_mat/get_rows).
+    for (std::string t : {"turbo3_0", "turbo4_0"}) {
+        string_to_spv("dequant_" + t, "dequant_" + t + ".comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float16_t"}});
+        string_to_spv("set_rows_" + t + "_i32", "set_rows_turbo.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"},  {"B_SIZE", "32"}});
+        string_to_spv("set_rows_" + t + "_i64", "set_rows_turbo.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}});
+    }
+
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";
     };

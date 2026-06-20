@@ -706,6 +706,140 @@ static void dequantize_row_nvfp4_cuda(
     const int nb = k / QK_NVFP4;
     dequantize_block_nvfp4<<<nb, 32, 0, stream>>>(vx, y, k);
 }
+// ============================================================
+// TurboQuant GPU bulk dequantize kernels (with FWHT)
+// ============================================================
+
+// Each CUDA block processes one 128-element chunk (= 4 turbo blocks).
+// 128 threads per block, one thread per element.
+// Step 1: unpack index + centroid lookup -> shared memory
+// Step 2: FWHT butterfly in shared memory (7 stages for n=128)
+// Step 3: normalize by 1/sqrt(128) and scale by stored norm
+// Step 4: write to output
+
+#define TURBO_HEAD_DIM_GPU 128
+#define TURBO_BLOCKS_PER_CHUNK_GPU (TURBO_HEAD_DIM_GPU / 32)  // 4
+
+template <typename dst_t>
+static __global__ void dequantize_block_turbo3_0_kernel(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
+    __shared__ float smem[TURBO_HEAD_DIM_GPU];
+
+    const int64_t chunk_idx = blockIdx.x;
+    const int tid = threadIdx.x;  // 0..127
+
+    const int64_t output_offset = chunk_idx * TURBO_HEAD_DIM_GPU;
+    if (output_offset + tid >= k) return;
+
+    // Which of the 4 blocks within this chunk does this thread belong to?
+    const int local_block = tid / TURBO3_BLOCK_SIZE;    // 0..3
+    const int elem_in_block = tid % TURBO3_BLOCK_SIZE;  // 0..31
+
+    const int64_t global_block_idx = chunk_idx * TURBO_BLOCKS_PER_CHUNK_GPU + local_block;
+
+    // Unpack 3-bit index and look up centroid
+    const block_turbo3_0 * x = (const block_turbo3_0 *)vx + global_block_idx;
+    const uint8_t * qs = x->qs;
+
+    int bit_off = elem_in_block * 3;
+    int byte_idx = bit_off / 8;
+    int shift = bit_off % 8;
+    uint16_t raw = (uint16_t)qs[byte_idx] >> shift;
+    if (shift > 5 && byte_idx + 1 < 12)
+        raw |= (uint16_t)qs[byte_idx + 1] << (8 - shift);
+    uint8_t idx = (uint8_t)(raw & 0x07);
+
+    smem[tid] = dc_codebook_3bit[idx];
+    __syncthreads();
+
+    // FWHT butterfly stages (7 stages for n=128)
+    for (int h = 1; h < TURBO_HEAD_DIM_GPU; h *= 2) {
+        if (tid < 64) {  // 128/2 = 64 butterflies per stage
+            int group = tid / h;
+            int pos = tid % h;
+            int i = group * h * 2 + pos;
+            float a = smem[i];
+            float b = smem[i + h];
+            smem[i]     = a + b;
+            smem[i + h] = a - b;
+        }
+        __syncthreads();
+    }
+
+    // Normalize by 1/sqrt(128) and scale by stored norm
+    const float fwht_scale = 0.08838834764831844f;  // 1/sqrt(128)
+    const block_turbo3_0 * first_block = (const block_turbo3_0 *)vx + chunk_idx * TURBO_BLOCKS_PER_CHUNK_GPU;
+    float norm = __half2float(first_block->d);
+    smem[tid] *= fwht_scale * norm;
+    __syncthreads();
+
+    // Write to output
+    y[output_offset + tid] = ggml_cuda_cast<dst_t>(smem[tid]);
+}
+
+template <typename dst_t>
+static void dequantize_row_turbo3_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    GGML_ASSERT(k % TURBO_HEAD_DIM_GPU == 0);
+    const int num_chunks = (int)(k / TURBO_HEAD_DIM_GPU);
+    dequantize_block_turbo3_0_kernel<<<num_chunks, TURBO_HEAD_DIM_GPU, 0, stream>>>(vx, y, k);
+}
+
+template <typename dst_t>
+static __global__ void dequantize_block_turbo4_0_kernel(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
+    __shared__ float smem[TURBO_HEAD_DIM_GPU];
+
+    const int64_t chunk_idx = blockIdx.x;
+    const int tid = threadIdx.x;  // 0..127
+
+    const int64_t output_offset = chunk_idx * TURBO_HEAD_DIM_GPU;
+    if (output_offset + tid >= k) return;
+
+    // Which of the 4 blocks within this chunk does this thread belong to?
+    const int local_block = tid / TURBO4_BLOCK_SIZE;    // 0..3
+    const int elem_in_block = tid % TURBO4_BLOCK_SIZE;  // 0..31
+
+    const int64_t global_block_idx = chunk_idx * TURBO_BLOCKS_PER_CHUNK_GPU + local_block;
+
+    // Unpack 4-bit index and look up centroid
+    const block_turbo4_0 * x = (const block_turbo4_0 *)vx + global_block_idx;
+    int pair_idx = elem_in_block / 2;
+    uint8_t packed = x->qs[pair_idx];
+    uint8_t idx = (elem_in_block & 1) ? ((packed >> 4) & 0x0F) : (packed & 0x0F);
+
+    smem[tid] = dc_codebook_4bit[idx];
+    __syncthreads();
+
+    // FWHT butterfly stages (7 stages for n=128)
+    for (int h = 1; h < TURBO_HEAD_DIM_GPU; h *= 2) {
+        if (tid < 64) {  // 128/2 = 64 butterflies per stage
+            int group = tid / h;
+            int pos = tid % h;
+            int i = group * h * 2 + pos;
+            float a = smem[i];
+            float b = smem[i + h];
+            smem[i]     = a + b;
+            smem[i + h] = a - b;
+        }
+        __syncthreads();
+    }
+
+    // Normalize by 1/sqrt(128) and scale by stored norm
+    const float fwht_scale = 0.08838834764831844f;  // 1/sqrt(128)
+    const block_turbo4_0 * first_block = (const block_turbo4_0 *)vx + chunk_idx * TURBO_BLOCKS_PER_CHUNK_GPU;
+    float norm = __half2float(first_block->d);
+    smem[tid] *= fwht_scale * norm;
+    __syncthreads();
+
+    // Write to output
+    y[output_offset + tid] = ggml_cuda_cast<dst_t>(smem[tid]);
+}
+
+template <typename dst_t>
+static void dequantize_row_turbo4_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    GGML_ASSERT(k % TURBO_HEAD_DIM_GPU == 0);
+    const int num_chunks = (int)(k / TURBO_HEAD_DIM_GPU);
+    dequantize_block_turbo4_0_kernel<<<num_chunks, TURBO_HEAD_DIM_GPU, 0, stream>>>(vx, y, k);
+}
+
 template <typename src_t, typename dst_t>
 static __global__ void convert_unary(
         const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00, const int64_t ne01,
@@ -818,6 +952,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_block_cont_cuda<QK_ROCMFP8, QR_ROCMFP8, dequantize_rocmfpx_fp8>;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_row_turbo3_0_cuda;
+        case GGML_TYPE_TURBO4_0:
+            return dequantize_row_turbo4_0_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -883,6 +1021,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_block_cont_cuda<QK_ROCMFP8, QR_ROCMFP8, dequantize_rocmfpx_fp8>;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_row_turbo3_0_cuda;
+        case GGML_TYPE_TURBO4_0:
+            return dequantize_row_turbo4_0_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
@@ -918,6 +1060,10 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK_ROCMFP6, QR_ROCMFP6, dequantize_rocmfpx_fp6>;
         case GGML_TYPE_Q8_0_ROCMFPX:
             return dequantize_block_cuda<QK_ROCMFP8, QR_ROCMFP8, dequantize_rocmfpx_fp8>;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_block_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
+        case GGML_TYPE_TURBO4_0:
+            return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
         default:
@@ -951,6 +1097,10 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK_ROCMFP6, QR_ROCMFP6, dequantize_rocmfpx_fp6>;
         case GGML_TYPE_Q8_0_ROCMFPX:
             return dequantize_block_cuda<QK_ROCMFP8, QR_ROCMFP8, dequantize_rocmfpx_fp8>;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_block_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
+        case GGML_TYPE_TURBO4_0:
+            return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
         case GGML_TYPE_F16:
             return convert_unary_cuda<half, nv_bfloat16>;
         default:
@@ -984,6 +1134,10 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK_ROCMFP6, QR_ROCMFP6, dequantize_rocmfpx_fp6>;
         case GGML_TYPE_Q8_0_ROCMFPX:
             return dequantize_block_cuda<QK_ROCMFP8, QR_ROCMFP8, dequantize_rocmfpx_fp8>;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_block_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
+        case GGML_TYPE_TURBO4_0:
+            return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16, float>;
         default:

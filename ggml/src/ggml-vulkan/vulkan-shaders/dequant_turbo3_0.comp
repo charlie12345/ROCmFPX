@@ -1,0 +1,65 @@
+#version 450
+
+// TurboQuant turbo3 (3-bit) KV dequant: cooperative inverse-FWHT decode.
+// One workgroup per 128- or 256-element head; 32-element storage blocks stay unchanged.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_turbo3_0 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+shared float smem[256];
+
+const float dc_codebook_3bit[8] = float[8](
+    -0.1883972972, -0.1181399059, -0.0665857641, -0.0216044751,
+     0.0216041461,  0.0665854520,  0.1181396281,  0.1883970748);
+
+void main() {
+    const uint chunk_idx = gl_WorkGroupID.x;
+    const uint tid       = gl_LocalInvocationID.x;
+    const uint head_dim  = (p.M == 256u) ? 256u : 128u;
+    const uint base_elem = chunk_idx * head_dim;
+    if (base_elem >= p.nel) {
+        return;
+    }
+
+    smem[tid] = 0.0f;
+    if (tid < head_dim) {
+        const uint local_blk = tid >> 5;               // /32
+        const uint elem      = tid & 31u;              // %32
+        const uint gbi       = chunk_idx * (head_dim >> 5) + local_blk;
+
+        // unpack 3-bit index (12 bytes hold 32 x 3-bit, LSB-first)
+        const uint bit_off  = elem * 3u;
+        const uint byte_idx = bit_off >> 3u;
+        const uint shift    = bit_off & 7u;
+        uint raw = uint(data_a[gbi].qs[byte_idx]) >> shift;
+        if (shift > 5u && byte_idx + 1u < 12u) {
+            raw |= uint(data_a[gbi].qs[byte_idx + 1u]) << (8u - shift);
+        }
+        smem[tid] = dc_codebook_3bit[raw & 7u];
+    }
+    barrier();
+
+    for (uint h = 1u; h < head_dim; h <<= 1u) {
+        if (tid < (head_dim >> 1)) {
+            const uint g   = tid / h;
+            const uint pos = tid % h;
+            const uint i   = g * h * 2u + pos;
+            const float a = smem[i];
+            const float b = smem[i + h];
+            smem[i]     = a + b;
+            smem[i + h] = a - b;
+        }
+        barrier();
+    }
+
+    const float fwht_scale = (head_dim == 256u) ? 0.0625 : 0.08838834764831844;
+    const float norm = float(data_a[chunk_idx * (head_dim >> 5)].d);
+    if (tid < head_dim) {
+        data_b[base_elem + tid] = D_TYPE(smem[tid] * fwht_scale * norm);
+    }
+}

@@ -1796,6 +1796,36 @@ struct block_rocmfpx_fp8
 #define DATA_A_ROCMFPX_FAMILY
 #endif
 
+#define QUANT_K_TURBO3_0 32
+#define QUANT_R_TURBO3_0 2
+
+struct block_turbo3_0
+{
+    float16_t d;
+    uint8_t qs[12];
+};
+
+#define QUANT_K_TURBO4_0 32
+#define QUANT_R_TURBO4_0 2
+
+struct block_turbo4_0
+{
+    float16_t d;
+    uint8_t qs[16];
+};
+
+#if defined(DATA_A_TURBO3_0)
+#define QUANT_K QUANT_K_TURBO3_0
+#define QUANT_R QUANT_R_TURBO3_0
+#define A_TYPE block_turbo3_0
+#endif
+
+#if defined(DATA_A_TURBO4_0)
+#define QUANT_K QUANT_K_TURBO4_0
+#define QUANT_R QUANT_R_TURBO4_0
+#define A_TYPE block_turbo4_0
+#endif
+
 #define QUANT_K_NVFP4 64
 #define QUANT_R_NVFP4 1
 
