@@ -27,6 +27,49 @@ static float mse(const float * a, const float * b, int n) {
     return err / (float) n;
 }
 
+static float weighted_mse(const float * a, const float * b, const float * w, int n) {
+    float err = 0.0f;
+    float sum_w = 0.0f;
+
+    for (int i = 0; i < n; ++i) {
+        const float d = a[i] - b[i];
+        err += w[i]*d*d;
+        sum_w += w[i];
+    }
+
+    return sum_w > 0.0f ? err / sum_w : 0.0f;
+}
+
+static void check_weighted_imatrix_fp3(void) {
+    enum { N = QK_ROCMFP3 };
+
+    float src[N];
+    float imatrix[N];
+    float plain[N];
+    float weighted[N];
+    block_rocmfp3 q_plain[N / QK_ROCMFP3];
+    block_rocmfp3 q_weighted[N / QK_ROCMFP3];
+
+    for (int i = 0; i < N; ++i) {
+        src[i] = (i % 2) ? 0.21f : -0.21f;
+        imatrix[i] = 100.0f;
+    }
+
+    src[0] = 9.0f;
+    imatrix[0] = 0.0f;
+
+    rocmfpx_quantize_fp3(src, q_plain,    1, N, NULL);
+    rocmfpx_quantize_fp3(src, q_weighted, 1, N, imatrix);
+    rocmfpx_dequantize_row_fp3(q_plain,    plain,    N);
+    rocmfpx_dequantize_row_fp3(q_weighted, weighted, N);
+
+    const float plain_err = weighted_mse(src, plain, imatrix, N);
+    const float weighted_err = weighted_mse(src, weighted, imatrix, N);
+
+    printf("ROCmFP3 imatrix weighted_mse: plain=%g weighted=%g\n", plain_err, weighted_err);
+    assert(weighted_err < plain_err);
+}
+
 int main(void) {
     enum { N = 64 };
 
@@ -72,6 +115,8 @@ int main(void) {
     assert(isfinite(mse8));
     assert(mse8 < mse6);
     assert(mse6 < mse3);
+
+    check_weighted_imatrix_fp3();
 
     return 0;
 }
