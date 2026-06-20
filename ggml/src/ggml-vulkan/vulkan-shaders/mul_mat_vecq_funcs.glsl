@@ -183,13 +183,11 @@ uint rocmfpx_vq_fp3_get_bits(uint ib, uint bit_pos) {
 }
 
 int rocmfpx_vq_fp3_decode(uint code) {
-    const uint mag_code = code & 3u;
-    const int mag = mag_code == 3u ? 4 : int(mag_code);
-    return (code & 4u) != 0u ? -mag : mag;
+    return int(kvalues_rocmfpx_fp3_const[code & 7u]);
 }
 
-int32_t rocmfpx_vq_fp3_pack4(uint ib, uint iqs, uint lane) {
-    const uint start_bit = 12u * (iqs + lane);
+int32_t rocmfpx_vq_fp3_pack4(uint ib, uint group) {
+    const uint start_bit = 12u * group;
     const uint reg_shift = start_bit & 31u;
     const uint reg_idx = start_bit >> 5;
     const uint qs0 = pack32(u8vec4(data_a[ib].qs[0], data_a[ib].qs[1], data_a[ib].qs[2], data_a[ib].qs[3]));
@@ -197,7 +195,9 @@ int32_t rocmfpx_vq_fp3_pack4(uint ib, uint iqs, uint lane) {
     const uint qs2 = pack32(u8vec4(data_a[ib].qs[8], data_a[ib].qs[9], data_a[ib].qs[10], data_a[ib].qs[11]));
     const uint val_low  = reg_idx == 0u ? qs0 : (reg_idx == 1u ? qs1 : qs2);
     const uint val_high = reg_idx == 0u ? qs1 : (reg_idx == 1u ? qs2 : 0u);
-    const uint bits12 = ((val_low >> reg_shift) | (val_high << (32u - reg_shift))) & 0xFFFu;
+    const uint bits12 = reg_shift == 0u ?
+        (val_low & 0xFFFu) :
+        (((val_low >> reg_shift) | (val_high << (32u - reg_shift))) & 0xFFFu);
     return pack32(i8vec4(int8_t(rocmfpx_vq_fp3_decode(bits12 & 7u)),
                          int8_t(rocmfpx_vq_fp3_decode((bits12 >> 3) & 7u)),
                          int8_t(rocmfpx_vq_fp3_decode((bits12 >> 6) & 7u)),
@@ -208,13 +208,14 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     int32_t sumi0 = 0;
     int32_t sumi1 = 0;
     [[unroll]] for (uint lane = 0u; lane < 2u; ++lane) {
-        const int32_t v = rocmfpx_vq_fp3_pack4(ib_a, iqs, lane);
-        const uint base = 4u * (iqs + lane);
+        const uint group = 2u * iqs + lane;
+        const int32_t v = rocmfpx_vq_fp3_pack4(ib_a, group);
+        const uint base = 4u * group;
         const int32_t u = cache_b_qs[lane];
         if (base < QUANT_K / 2u) {
-            sumi0 = dotPacked4x8EXT(v, u);
+            sumi0 += dotPacked4x8EXT(v, u);
         } else {
-            sumi1 = dotPacked4x8EXT(v, u);
+            sumi1 += dotPacked4x8EXT(v, u);
         }
     }
     const FLOAT_TYPE d0 = FLOAT_TYPE(ue4m3_to_fp32(data_a[ib_a].e[0]));

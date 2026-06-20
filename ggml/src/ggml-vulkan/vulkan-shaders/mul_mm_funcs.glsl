@@ -1,29 +1,23 @@
 #if defined(DATA_A_ROCMFPX_FP3)
-uint rocmfpx_mm_fp3_get_bits(uint ib, uint bit_pos) {
-    uint code = 0u;
-    [[unroll]] for (uint bit = 0u; bit < 3u; ++bit) {
-        const uint src_bit = bit_pos + bit;
-        code |= ((uint(data_a[ib].qs[src_bit >> 3u]) >> (src_bit & 7u)) & 1u) << bit;
+int32_t rocmfpx_mm_fp3_pack4_window(uint ib, uint idx) {
+    const uint bit_pos = idx * 3u;
+    const uint byte_pos = bit_pos >> 3u;
+    const uint sh = bit_pos & 7u;
+    uint bits = uint(data_a[ib].qs[byte_pos]) |
+                (uint(data_a[ib].qs[byte_pos + 1u]) << 8);
+    if (sh > 4u) {
+        bits |= uint(data_a[ib].qs[byte_pos + 2u]) << 16;
     }
-    return code;
-}
-
-int rocmfpx_mm_fp3_decode(uint code) {
-    const uint mag_code = code & 3u;
-    const int mag = mag_code == 3u ? 4 : int(mag_code);
-    return (code & 4u) != 0u ? -mag : mag;
-}
-
-float rocmfpx_mm_fp3_value(uint ib, uint idx) {
-    const float d = ue4m3_to_fp32(data_a[ib].e[idx >= 16u ? 1u : 0u]);
-    return float(rocmfpx_mm_fp3_decode(rocmfpx_mm_fp3_get_bits(ib, idx * 3u))) * d;
+    bits = (bits >> sh) & 0xFFFu;
+    return pack32(i8vec4(kvalues_rocmfpx_fp3_const[ bits        & 7u],
+                         kvalues_rocmfpx_fp3_const[(bits >> 3) & 7u],
+                         kvalues_rocmfpx_fp3_const[(bits >> 6) & 7u],
+                         kvalues_rocmfpx_fp3_const[(bits >> 9) & 7u]));
 }
 
 vec4 rocmfpx_mm_fp3_vec4(uint ib, uint idx) {
-    return vec4(rocmfpx_mm_fp3_value(ib, idx + 0u),
-                rocmfpx_mm_fp3_value(ib, idx + 1u),
-                rocmfpx_mm_fp3_value(ib, idx + 2u),
-                rocmfpx_mm_fp3_value(ib, idx + 3u));
+    const float d = ue4m3_to_fp32(data_a[ib].e[idx >= 16u ? 1u : 0u]);
+    return vec4(unpack8(rocmfpx_mm_fp3_pack4_window(ib, idx))) * d;
 }
 #endif
 

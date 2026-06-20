@@ -1975,6 +1975,11 @@ float ue4m3_to_fp32(uint8_t x) {
 #endif
 
 #if defined(DATA_A_ROCMFPX_FAMILY)
+const int8_t kvalues_rocmfpx_fp3_const[8] = {
+    int8_t(0), int8_t(1), int8_t(2), int8_t(4),
+    int8_t(0), int8_t(-1), int8_t(-2), int8_t(-4)
+};
+
 const int8_t kvalues_rocmfpx_fp6_const[64] = {
     int8_t(0), int8_t(1), int8_t(2), int8_t(3), int8_t(4), int8_t(5), int8_t(6), int8_t(7),
     int8_t(8), int8_t(9), int8_t(10), int8_t(11), int8_t(12), int8_t(13), int8_t(14), int8_t(15),
