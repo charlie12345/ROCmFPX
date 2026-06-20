@@ -110,10 +110,13 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         num_iters++;
     }
 #if defined(DATA_A_ROCMFPX_FP3)
-    int unroll_count = 1;
+    uint i = 0;
+    while (i < num_iters) {
+        iter(temp, first_row, num_rows, tid, i*K_PER_ITER);
+        i++;
+    }
 #else
     int unroll_count = 4;
-#endif
     uint unrolled_iters = num_iters & ~(unroll_count - 1);
 
     uint i = 0;
@@ -139,6 +142,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         iter(temp, first_row, num_rows, tid, i*K_PER_ITER);
         i++;
     }
+#endif
 
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
