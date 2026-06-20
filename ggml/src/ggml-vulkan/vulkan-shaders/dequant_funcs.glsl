@@ -538,14 +538,36 @@ uint rocmfpx_fp3_get_bits(uint ib, uint bit_pos, uint a_offset) {
 }
 
 int rocmfpx_fp3_decode_code(uint code) {
-    const uint mag_code = code & 3u;
-    const int mag = mag_code == 3u ? 4 : int(mag_code);
-    return (code & 4u) != 0u ? -mag : mag;
+    return int(kvalues_rocmfpx_fp3_const[code & 7u]);
 }
 
 float rocmfpx_fp3_dequant(uint ib, uint idx, uint a_offset) {
     const float d = ue4m3_to_fp32(data_a[a_offset + ib].e[idx >= 16u ? 1u : 0u]);
     return float(rocmfpx_fp3_decode_code(rocmfpx_fp3_get_bits(ib, idx * 3u, a_offset))) * d;
+}
+
+int32_t rocmfpx_fp3_pack4_window(uint ib, uint idx, uint a_offset) {
+    const uint bit_pos = idx * 3u;
+    const uint byte_pos = bit_pos >> 3u;
+    const uint sh = bit_pos & 7u;
+    uint bits = uint(data_a[a_offset + ib].qs[byte_pos]) |
+                (uint(data_a[a_offset + ib].qs[byte_pos + 1u]) << 8);
+    if (sh > 4u) {
+        bits |= uint(data_a[a_offset + ib].qs[byte_pos + 2u]) << 16;
+    }
+    bits = (bits >> sh) & 0xFFFu;
+    return pack32(i8vec4(kvalues_rocmfpx_fp3_const[ bits        & 7u],
+                         kvalues_rocmfpx_fp3_const[(bits >> 3) & 7u],
+                         kvalues_rocmfpx_fp3_const[(bits >> 6) & 7u],
+                         kvalues_rocmfpx_fp3_const[(bits >> 9) & 7u]));
+}
+
+vec4 rocmfpx_fp3_dequant4(uint ib, uint idx, uint a_offset) {
+    const vec4 q = vec4(unpack8(rocmfpx_fp3_pack4_window(ib, idx, a_offset)));
+    return q * vec4(ue4m3_to_fp32(data_a[a_offset + ib].e[(idx + 0u) >= 16u ? 1u : 0u]),
+                    ue4m3_to_fp32(data_a[a_offset + ib].e[(idx + 1u) >= 16u ? 1u : 0u]),
+                    ue4m3_to_fp32(data_a[a_offset + ib].e[(idx + 2u) >= 16u ? 1u : 0u]),
+                    ue4m3_to_fp32(data_a[a_offset + ib].e[(idx + 3u) >= 16u ? 1u : 0u]));
 }
 
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
@@ -554,10 +576,7 @@ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
 }
 
 vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
-    return vec4(rocmfpx_fp3_dequant(ib, iqs + 0u, a_offset),
-                rocmfpx_fp3_dequant(ib, iqs + 1u, a_offset),
-                rocmfpx_fp3_dequant(ib, iqs + 2u, a_offset),
-                rocmfpx_fp3_dequant(ib, iqs + 3u, a_offset));
+    return rocmfpx_fp3_dequant4(ib, iqs, a_offset);
 }
 #endif
 

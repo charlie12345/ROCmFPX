@@ -1357,9 +1357,7 @@ uint rocmfpx_cm2_fp3_get_bits(const in decodeBufROCMFPXFP3 bl, uint bit_pos)
 
 int rocmfpx_cm2_fp3_decode(uint code)
 {
-    const uint mag_code = code & 3u;
-    const int mag = mag_code == 3u ? 4 : int(mag_code);
-    return (code & 4u) != 0u ? -mag : mag;
+    return int(kvalues_rocmfpx_fp3_const[code & 7u]);
 }
 
 float16_t dequantFuncROCMFPXFP3(const in decodeBufROCMFPXFP3 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
@@ -1369,13 +1367,31 @@ float16_t dequantFuncROCMFPXFP3(const in decodeBufROCMFPXFP3 bl, const in uint b
     return float16_t(float(rocmfpx_cm2_fp3_decode(rocmfpx_cm2_fp3_get_bits(bl, idx * 3u))) * d);
 }
 
+int32_t rocmfpx_cm2_fp3_pack4_window(const in decodeBufROCMFPXFP3 bl, uint idx)
+{
+    const uint bit_pos = idx * 3u;
+    const uint byte_pos = bit_pos >> 3u;
+    const uint sh = bit_pos & 7u;
+    uint bits = uint(bl.block.qs[byte_pos]) |
+                (uint(bl.block.qs[byte_pos + 1u]) << 8);
+    if (sh > 4u) {
+        bits |= uint(bl.block.qs[byte_pos + 2u]) << 16;
+    }
+    bits = (bits >> sh) & 0xFFFu;
+    return pack32(i8vec4(kvalues_rocmfpx_fp3_const[ bits        & 7u],
+                         kvalues_rocmfpx_fp3_const[(bits >> 3) & 7u],
+                         kvalues_rocmfpx_fp3_const[(bits >> 6) & 7u],
+                         kvalues_rocmfpx_fp3_const[(bits >> 9) & 7u]));
+}
+
 f16vec4 dequantFuncROCMFPXFP3_v(const in decodeBufROCMFPXFP3 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
 {
     const uint idx = coordInBlock[1];
-    return f16vec4(float16_t(float(rocmfpx_cm2_fp3_decode(rocmfpx_cm2_fp3_get_bits(bl, (idx + 0u) * 3u))) * ue4m3_to_fp32(bl.block.e[(idx + 0u) >= 16u ? 1u : 0u])),
-                   float16_t(float(rocmfpx_cm2_fp3_decode(rocmfpx_cm2_fp3_get_bits(bl, (idx + 1u) * 3u))) * ue4m3_to_fp32(bl.block.e[(idx + 1u) >= 16u ? 1u : 0u])),
-                   float16_t(float(rocmfpx_cm2_fp3_decode(rocmfpx_cm2_fp3_get_bits(bl, (idx + 2u) * 3u))) * ue4m3_to_fp32(bl.block.e[(idx + 2u) >= 16u ? 1u : 0u])),
-                   float16_t(float(rocmfpx_cm2_fp3_decode(rocmfpx_cm2_fp3_get_bits(bl, (idx + 3u) * 3u))) * ue4m3_to_fp32(bl.block.e[(idx + 3u) >= 16u ? 1u : 0u])));
+    const vec4 q = vec4(unpack8(rocmfpx_cm2_fp3_pack4_window(bl, idx)));
+    return f16vec4(q * vec4(ue4m3_to_fp32(bl.block.e[(idx + 0u) >= 16u ? 1u : 0u]),
+                            ue4m3_to_fp32(bl.block.e[(idx + 1u) >= 16u ? 1u : 0u]),
+                            ue4m3_to_fp32(bl.block.e[(idx + 2u) >= 16u ? 1u : 0u]),
+                            ue4m3_to_fp32(bl.block.e[(idx + 3u) >= 16u ? 1u : 0u])));
 }
 #endif
 

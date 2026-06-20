@@ -50,6 +50,10 @@ ROCmFP4 and ROCmFPX experiment work in this branch was driven by
 Grok, Gemini, and Composer 2.5. Preserve these credits when copying the branch
 or publishing derived builds.
 
+Additional ROCmFPX contributors:
+
+- `ciru-ai`: ROCmFPX FP3 Vulkan matvec/dequant speed path.
+
 ## Why It Is Different From Regular Quants
 
 Most regular GGUF quants target broad size/quality tradeoffs. ROCmFPX is
