@@ -195,8 +195,8 @@ int32_t rocmfpx_vq_fp3_pack4(uint qs0, uint qs1, uint qs2, uint group) {
     const uint val_low  = reg_idx == 0u ? qs0 : (reg_idx == 1u ? qs1 : qs2);
     const uint val_high = reg_idx == 0u ? qs1 : (reg_idx == 1u ? qs2 : 0u);
     const uint bits12 = reg_shift == 0u ?
-        val_low :
-        ((val_low >> reg_shift) | (val_high << (32u - reg_shift)));
+        (val_low & 0xFFFu) :
+        (((val_low >> reg_shift) | (val_high << (32u - reg_shift))) & 0xFFFu);
     return pack32(i8vec4(int8_t(rocmfpx_vq_fp3_decode(bits12 & 7u)),
                          int8_t(rocmfpx_vq_fp3_decode((bits12 >> 3) & 7u)),
                          int8_t(rocmfpx_vq_fp3_decode((bits12 >> 6) & 7u)),
