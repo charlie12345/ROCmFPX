@@ -304,8 +304,12 @@ curl -sS http://127.0.0.1:18180/v1/chat/completions \
 
 ## Dynamic Drafting
 
-Use `scripts/rocmfpx-draft-profile.py` when a client wants to select draft
-depth from prompt length before sending a request:
+ROCmFPX supports Dynamic Drafting as a request-layer policy over llama-server's
+per-request speculative controls. Start the server with a high enough draft cap,
+then let the client choose safer or more aggressive values for each prompt.
+
+Use `scripts/rocmfpx-draft-profile.py` when a client only needs the static
+prompt-length policy:
 
 ```bash
 scripts/rocmfpx-draft-profile.py --profile fp3-mtp --prompt-tokens 4096 --pretty
@@ -319,6 +323,46 @@ scripts/rocmfpx-draft-profile.py \
 The helper emits only request JSON fields. It does not change the server cap,
 so the server still needs to start with a high enough `--spec-draft-n-max`.
 Available profiles are `fp3-mtp`, `fp4-general`, and `dense-coder`.
+
+Use `scripts/rocmfpx-dynamic-draft.py` for full Dynamic Drafting. It injects
+`speculative.n_max`, `speculative.n_min`, `speculative.p_min`, and
+`speculative.p_split` into each request, then optionally records
+`draft_n/draft_n_accepted` feedback from responses and adjusts later requests.
+
+```bash
+scripts/rocmfpx-dynamic-draft.py \
+  --base-url http://127.0.0.1:18180 \
+  --endpoint /completion \
+  --profile dense-coder \
+  --state-file /tmp/rocmfpx-dd-state.json \
+  --json '{
+    "prompt": "Write a small JSON parser in Python.",
+    "n_predict": 512,
+    "temperature": 0
+  }'
+```
+
+For OpenAI-compatible chat:
+
+```bash
+scripts/rocmfpx-dynamic-draft.py \
+  --base-url http://127.0.0.1:18180 \
+  --endpoint /v1/chat/completions \
+  --profile fp4-general \
+  --state-file /tmp/rocmfpx-dd-state.json \
+  --json '{
+    "model": "rocmfpx-mtp",
+    "messages": [{"role": "user", "content": "Return a tool-call shaped JSON object."}],
+    "max_tokens": 256,
+    "temperature": 0
+  }'
+```
+
+The state file stores an exponential moving average of acceptance. If
+acceptance falls below the low threshold, the wrapper lowers `n_max` and raises
+`p_min`; if acceptance is high, it cautiously raises `n_max` up to
+`--max-n-max`. Use `--dry-run --pretty` to inspect the exact request before it
+is sent.
 
 ## Suggested Starting Points
 

@@ -178,6 +178,33 @@ byte 2: v2[5:4] | v3[5:0]<<2
 | Python/shell syntax checks | passed |
 | DiffusionGemma BF16 → ROCmFP4 coherent agent quant | passed, `13,764.94 MiB / 4.57 BPW` |
 
+## Session 003 — 2026-06-21
+
+**Scope:** Add ROCmFPX Dynamic Drafting support for MTP/speculative serving.
+
+### Server request parser
+
+| File | Detail |
+|------|--------|
+| `tools/server/server-task.cpp` | Added per-request `speculative.p_split` parsing and clamping alongside `speculative.n_max`, `speculative.n_min`, and `speculative.p_min`. |
+
+### Dynamic Drafting tools
+
+| File | Detail |
+|------|--------|
+| `scripts/rocmfpx-dynamic-draft.py` | Added adaptive request wrapper that injects speculative fields from prompt length and optional draft-acceptance feedback. |
+| `scripts/check-rocmfpx-dynamic-draft.sh` | Added smoke coverage for static policy, low-acceptance backoff, high-acceptance raise, Python syntax, and shell syntax. |
+| `scripts/check-rocmfpx-all.sh`, `scripts/check-rocmfpx-summary.sh` | Added the Dynamic Drafting gate to standard ROCmFPX validation. |
+| `docs/ROCmFPX-SERVING.md`, `README.md` | Documented Dynamic Drafting usage for `/completion` and OpenAI-compatible chat requests. |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| `scripts/check-rocmfpx-dynamic-draft.sh` | passed |
+| Python/shell syntax checks | passed |
+| `scripts/build-strix-rocmfp4-mtp.sh llama-server` | passed |
+
 <!-- TEMPLATE FOR FUTURE AI SESSIONS:
 
 ## Session NNN — YYYY-MM-DD

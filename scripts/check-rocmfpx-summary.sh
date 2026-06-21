@@ -43,6 +43,7 @@ run_gate() {
 
 run_gate reference        "$SCRIPT_DIR/check-rocmfpx-reference.sh"
 run_gate capabilities     "$SCRIPT_DIR/check-rocmfpx-model-capabilities.sh"
+run_gate dynamic-draft    "$SCRIPT_DIR/check-rocmfpx-dynamic-draft.sh"
 run_gate qwen-all         "$SCRIPT_DIR/check-rocmfpx-qwen-all.sh"
 run_gate agent-json       "$SCRIPT_DIR/check-rocmfpx-agent-json.sh"
 run_gate tool-calling     "$SCRIPT_DIR/check-rocmfpx-tool-calling.sh"

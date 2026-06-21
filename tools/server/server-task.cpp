@@ -308,6 +308,8 @@ task_params server_task::params_from_json_cmpl(
     params.speculative.draft.n_min = std::max(0, std::min(params.speculative.draft.n_min, params.speculative.draft.n_max));
     params.speculative.draft.p_min = json_value(data, "speculative.p_min", defaults.speculative.draft.p_min);
     params.speculative.draft.p_min = std::max(0.0f, std::min(params.speculative.draft.p_min, 1.0f));
+    params.speculative.draft.p_split = json_value(data, "speculative.p_split", defaults.speculative.draft.p_split);
+    params.speculative.draft.p_split = std::max(0.0f, std::min(params.speculative.draft.p_split, 1.0f));
 
     // TODO: to keep things simple, we disable speculative parameter adjustments for now
 #if 0

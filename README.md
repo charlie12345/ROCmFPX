@@ -69,6 +69,8 @@ AMD-oriented and keeps the ROCmFP4 discipline:
 - tensor-aware routing for low-bit coherency instead of applying one blunt type
   everywhere
 - optional agent presets for JSON, tool calling, coding, and chat coherency
+- Dynamic Drafting for MTP/speculative models through per-request draft depth
+  selection and feedback from accepted draft tokens
 
 The agent presets do not invent a separate dequant kernel. They use the same
 ROCmFPX math but protect the tensors that tend to break structured output:
