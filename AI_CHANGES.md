@@ -223,6 +223,25 @@ byte 2: v2[5:4] | v3[5:0]<<2
 | Qwable Q6 ROCmFPX Agent ROCm dynamic drafting | best observed chat decode: `28.94 tok/s`, draft acceptance `112/125` |
 | Qwable Q6 ROCmFPX Agent Vulkan dynamic drafting | best observed chat decode: `20.12 tok/s`, draft acceptance `117/126` |
 
+## Session 005 — 2026-06-21
+
+**Scope:** Add research-backed ROCmFPX Dynamic Drafting policy improvements.
+
+| File | Detail |
+|------|--------|
+| `scripts/rocmfpx-dynamic-draft.py` | Added mode inference/pinning for coding, JSON, tool, chat, and completion requests; scoped state by profile, mode, backend, model, and context; added neighbor exploration for throughput learning; added optional per-position acceptance state and cap logic for servers that expose that telemetry. |
+| `scripts/check-rocmfpx-dynamic-draft.sh` | Added smoke coverage for mode-specific JSON/tool-safe caps, scoped state metadata, per-position acceptance updates, and per-position cap backoff. |
+| `scripts/sweep-rocmfpx-backend-ops.sh` | Narrowed the default backend gate to runtime-relevant ROCmFPX cases so CPU/ROCm/Vulkan validation is not failed by unrelated upstream quant tests or unsupported permuted BF16-to-FP3 copy conversions. The old broad behavior is still available with `OPS=...`. |
+| `docs/ROCmFPX-SERVING.md`, `README.md` | Documented mode-aware Dynamic Drafting, backend/model/context scoped state, exploration control, per-position cap behavior, and agent-safe JSON/tool defaults. |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| `scripts/check-rocmfpx-dynamic-draft.sh` | passed |
+| `scripts/sweep-rocmfpx-backend-ops.sh` | passed on CPU, ROCm0, and Vulkan0 |
+| Python syntax checks | passed |
+
 <!-- TEMPLATE FOR FUTURE AI SESSIONS:
 
 ## Session NNN — YYYY-MM-DD

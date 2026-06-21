@@ -328,12 +328,20 @@ Use `scripts/rocmfpx-dynamic-draft.py` for full Dynamic Drafting. It injects
 `speculative.n_max`, `speculative.n_min`, `speculative.p_min`, and
 `speculative.p_split` into each request, then optionally records
 `draft_n/draft_n_accepted` feedback from responses and adjusts later requests.
+The wrapper scopes learned feedback by profile, inferred workload mode, backend,
+model, and context size so a Vulkan JSON run does not drag down a ROCm coding
+run. Modes are inferred automatically, or can be pinned with `--mode coding`,
+`--mode json`, `--mode tool`, `--mode chat`, or `--mode completion`.
 
 ```bash
 scripts/rocmfpx-dynamic-draft.py \
   --base-url http://127.0.0.1:18180 \
   --endpoint /completion \
   --profile dense-coder \
+  --backend ROCm0 \
+  --model-key qwable-agent \
+  --ctx-size 65536 \
+  --mode coding \
   --state-file /tmp/rocmfpx-dd-state.json \
   --json '{
     "prompt": "Write a small JSON parser in Python.",
@@ -349,6 +357,10 @@ scripts/rocmfpx-dynamic-draft.py \
   --base-url http://127.0.0.1:18180 \
   --endpoint /v1/chat/completions \
   --profile fp4-general \
+  --backend ROCm0 \
+  --model-key rocmfpx-agent \
+  --ctx-size 65536 \
+  --mode tool \
   --state-file /tmp/rocmfpx-dd-state.json \
   --json '{
     "model": "rocmfpx-mtp",
@@ -364,11 +376,31 @@ acceptance falls below the low threshold, the wrapper lowers `n_max` and raises
 `--max-n-max`. Use `--dry-run --pretty` to inspect the exact request before it
 is sent.
 
+The adaptive policy is throughput-first, not acceptance-only. It keeps per
+`n_max` throughput buckets and occasionally explores a neighboring draft depth
+with `--explore-rate` so it can learn whether `n_max=5` is actually faster than
+`n_max=6` for the current model/backend/context. Set `--explore-rate 0` for
+fully repeatable benchmark sweeps. When llama-server exposes per-position draft
+acceptance telemetry, the wrapper also stores it and caps future `n_max` at the
+first consistently weak draft position instead of waiting for whole-request
+acceptance to fall.
+
 For Qwen/Qwable-style templates, the wrapper also strips literal
 `<think>...</think>` blocks and `reasoning_content` fields from returned JSON by
 default. Disable that only for debugging with `--no-strip-thinking`. The wrapper
-also tracks throughput per `n_max` in the state file and prefers the fastest
-nearby draft depth when enough feedback exists.
+also requests `reasoning_format=deepseek` by default for OpenAI-compatible chat
+calls, which keeps Hermes-style clients from seeing raw reasoning fields when
+the backend supports the parser.
+
+Mode defaults:
+
+| Mode | Default adjustment | Use when |
+|---|---|---|
+| `coding` | slightly deeper draft cap, moderate split | Qwable/code models with deterministic code output |
+| `json` | lower draft cap, `p_min>=0.25`, low split | strict JSON responses and schema-constrained output |
+| `tool` | lower draft cap, `p_min>=0.25`, low split | agent tool-call plans and function-call shaped output |
+| `chat` | profile default | normal chat |
+| `completion` | profile default | raw `/completion` prompts |
 
 ## Suggested Starting Points
 

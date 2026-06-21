@@ -12,6 +12,7 @@ import argparse
 import copy
 import importlib.util
 import json
+import random
 import re
 import sys
 import time
@@ -41,7 +42,21 @@ DEFAULT_STATE = {
     "last_n_max": None,
     "last_p_min": None,
     "n_max_stats": {},
+    "position_stats": {},
     "last_update": None,
+}
+
+MODE_CHOICES = ("auto", "completion", "chat", "coding", "json", "tool")
+
+MODE_POLICY_OVERRIDES = {
+    # Coding prompts tend to have long deterministic runs where a deeper draft
+    # is often useful. JSON/tool calls value structural correctness more than
+    # the last bit of speculative depth, so start with tighter caps.
+    "coding": {"n_delta": 1, "p_min_floor": 0.0, "p_split": 0.15},
+    "json": {"n_delta": -1, "p_min_floor": 0.25, "p_split": 0.05},
+    "tool": {"n_delta": -1, "p_min_floor": 0.25, "p_split": 0.05},
+    "chat": {"n_delta": 0, "p_min_floor": 0.0, "p_split": None},
+    "completion": {"n_delta": 0, "p_min_floor": 0.0, "p_split": None},
 }
 
 
@@ -63,6 +78,42 @@ def load_state(path: str | None) -> dict[str, Any]:
     state = copy.deepcopy(DEFAULT_STATE)
     state.update(data)
     return state
+
+
+def state_scope_key(args: argparse.Namespace, payload: dict[str, Any], mode: str) -> str:
+    if args.state_scope and args.state_scope != "auto":
+        return args.state_scope
+    model = args.model_key or str(payload.get("model") or payload.get("cache_prompt") or "default")
+    backend = args.backend or "default"
+    ctx = args.ctx_size if args.ctx_size is not None else "default"
+    return f"{args.profile}:{mode}:{backend}:{model}:ctx{ctx}"
+
+
+def get_scoped_state(root: dict[str, Any], scope: str) -> dict[str, Any]:
+    scopes = root.get("scopes")
+    if isinstance(scopes, dict):
+        scoped = scopes.get(scope)
+        state = copy.deepcopy(DEFAULT_STATE)
+        if isinstance(scoped, dict):
+            state.update(scoped)
+        return state
+
+    # Backward compatibility: an older flat state file is treated as the active
+    # scope until it is saved again.
+    state = copy.deepcopy(DEFAULT_STATE)
+    state.update({key: value for key, value in root.items() if key in DEFAULT_STATE})
+    return state
+
+
+def set_scoped_state(root: dict[str, Any], scope: str, state: dict[str, Any]) -> dict[str, Any]:
+    result = dict(root)
+    scopes = result.get("scopes")
+    if not isinstance(scopes, dict):
+        scopes = {}
+    scopes[scope] = state
+    result["scopes"] = scopes
+    result["version"] = 2
+    return result
 
 
 def save_state(path: str | None, state: dict[str, Any]) -> None:
@@ -88,6 +139,26 @@ def extract_text(payload: dict[str, Any], endpoint: str) -> str:
     return str(payload.get("prompt", ""))
 
 
+def infer_mode(args: argparse.Namespace, payload: dict[str, Any]) -> str:
+    if args.mode != "auto":
+        return args.mode
+    if payload.get("tools") or payload.get("tool_choice"):
+        return "tool"
+    response_format = payload.get("response_format")
+    if isinstance(response_format, dict):
+        fmt_type = str(response_format.get("type", "")).lower()
+        if "json" in fmt_type:
+            return "json"
+    text = extract_text(payload, args.endpoint).lower()
+    if any(marker in text for marker in ("json", "schema", "tool call", "function call")):
+        return "json"
+    if any(marker in text for marker in ("write code", "debug", "function", "class ", "python", "typescript", "rust", "c++")):
+        return "coding"
+    if args.endpoint.endswith("/v1/chat/completions") or "messages" in payload:
+        return "chat"
+    return "completion"
+
+
 def infer_prompt_tokens(args: argparse.Namespace, payload: dict[str, Any]) -> int:
     if args.prompt_tokens is not None:
         return args.prompt_tokens
@@ -99,45 +170,105 @@ def infer_prompt_tokens(args: argparse.Namespace, payload: dict[str, Any]) -> in
     return tokenize_count(args.base_url, text, args.api_key)
 
 
-def adapt_policy(policy: dict[str, Any], state: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+def apply_mode_policy(policy: dict[str, Any], mode: str, args: argparse.Namespace) -> dict[str, Any]:
+    if not args.mode_overrides:
+        return dict(policy)
+    result = dict(policy)
+    override = MODE_POLICY_OVERRIDES.get(mode)
+    if not override:
+        return result
+    n_max = int(result.get("speculative.n_max", 0))
+    if n_max > 0:
+        n_max = max(args.min_n_max, min(args.max_n_max, n_max + int(override["n_delta"])))
+        result["speculative.n_max"] = n_max
+        result["speculative.n_min"] = min(int(result.get("speculative.n_min", 0)), n_max)
+    p_min_floor = float(override["p_min_floor"])
+    result["speculative.p_min"] = min(1.0, max(float(result.get("speculative.p_min", 0.0)), p_min_floor))
+    if override["p_split"] is not None:
+        result["speculative.p_split"] = float(override["p_split"])
+    return result
+
+
+def best_n_max_from_stats(base_n_max: int, state: dict[str, Any], args: argparse.Namespace) -> int:
+    stats = state.get("n_max_stats")
+    if not isinstance(stats, dict):
+        return base_n_max
+    best_n_max = base_n_max
+    best_tps = -1.0
+    for key, value in stats.items():
+        if not isinstance(value, dict):
+            continue
+        try:
+            candidate_n_max = int(key)
+        except ValueError:
+            continue
+        if candidate_n_max < args.min_n_max or candidate_n_max > args.max_n_max:
+            continue
+        if abs(candidate_n_max - base_n_max) > args.max_profile_shift:
+            continue
+        tps = value.get("throughput_ema")
+        acceptance = value.get("acceptance_ema")
+        count = value.get("count", 0)
+        if (
+            isinstance(tps, (int, float))
+            and isinstance(acceptance, (int, float))
+            and isinstance(count, int)
+            and count >= args.min_stats_count
+            and float(acceptance) >= args.low_acceptance
+            and float(tps) > best_tps
+        ):
+            best_n_max = candidate_n_max
+            best_tps = float(tps)
+    return best_n_max
+
+
+def maybe_explore_n_max(n_max: int, state: dict[str, Any], args: argparse.Namespace) -> int:
+    if args.explore_rate <= 0.0 or random.random() >= args.explore_rate:
+        return n_max
+    candidates = [n for n in (n_max - 1, n_max + 1) if args.min_n_max <= n <= args.max_n_max]
+    if not candidates:
+        return n_max
+    stats = state.get("n_max_stats")
+    if isinstance(stats, dict):
+        candidates.sort(key=lambda item: int(stats.get(str(item), {}).get("count", 0) if isinstance(stats.get(str(item)), dict) else 0))
+    return random.choice(candidates[:1])
+
+
+def position_limited_n_max(n_max: int, state: dict[str, Any], args: argparse.Namespace) -> int:
+    stats = state.get("position_stats")
+    if not isinstance(stats, dict):
+        return n_max
+    limited = n_max
+    for pos in range(1, n_max + 1):
+        bucket = stats.get(str(pos))
+        if not isinstance(bucket, dict):
+            continue
+        count = bucket.get("count", 0)
+        rate = bucket.get("acceptance_ema")
+        if (
+            isinstance(count, int)
+            and count >= args.min_position_stats_count
+            and isinstance(rate, (int, float))
+            and float(rate) < args.min_position_acceptance
+        ):
+            limited = max(args.min_n_max, pos - 1)
+            break
+    return limited
+
+
+def adapt_policy(policy: dict[str, Any], state: dict[str, Any], args: argparse.Namespace, mode: str) -> dict[str, Any]:
+    policy = apply_mode_policy(policy, mode, args)
     result = dict(policy)
     base_n_max = int(result.get("speculative.n_max", 0))
     n_max = base_n_max
     if n_max <= 0:
         return result
 
-    # Prefer the fastest nearby n_max seen for this workload, then apply the
-    # global acceptance guard below. This keeps the policy adaptive without
-    # letting one outlier request swing all future calls.
-    stats = state.get("n_max_stats")
-    if isinstance(stats, dict):
-        best_n_max = n_max
-        best_tps = -1.0
-        for key, value in stats.items():
-            if not isinstance(value, dict):
-                continue
-            try:
-                candidate_n_max = int(key)
-            except ValueError:
-                continue
-            if candidate_n_max < args.min_n_max or candidate_n_max > args.max_n_max:
-                continue
-            if abs(candidate_n_max - base_n_max) > args.max_profile_shift:
-                continue
-            tps = value.get("throughput_ema")
-            acceptance = value.get("acceptance_ema")
-            count = value.get("count", 0)
-            if (
-                isinstance(tps, (int, float))
-                and isinstance(acceptance, (int, float))
-                and isinstance(count, int)
-                and count >= args.min_stats_count
-                and float(acceptance) >= args.low_acceptance
-                and float(tps) > best_tps
-            ):
-                best_n_max = candidate_n_max
-                best_tps = float(tps)
-        n_max = best_n_max
+    # Prefer the fastest nearby n_max seen for this exact workload scope, use
+    # occasional neighbor exploration, then clamp with acceptance/position data.
+    n_max = best_n_max_from_stats(base_n_max, state, args)
+    n_max = maybe_explore_n_max(n_max, state, args)
+    n_max = position_limited_n_max(n_max, state, args)
 
     acceptance = state.get("acceptance_ema")
     if not isinstance(acceptance, (int, float)):
@@ -214,6 +345,26 @@ def update_state_from_response(state: dict[str, Any], response: dict[str, Any], 
     if isinstance(p_min, (int, float)):
         state["last_p_min"] = float(p_min)
 
+    position_rates = (
+        find_key(response, "acceptance_per_position")
+        or find_key(response, "draft_acceptance_per_position")
+        or find_key(response, "draft_position_acceptance")
+    )
+    if isinstance(position_rates, list):
+        position_stats = state.get("position_stats")
+        if not isinstance(position_stats, dict):
+            position_stats = {}
+        for index, value in enumerate(position_rates, start=1):
+            if not isinstance(value, (int, float)):
+                continue
+            bucket = position_stats.get(str(index))
+            if not isinstance(bucket, dict):
+                bucket = {"count": 0}
+            bucket["count"] = int(bucket.get("count", 0)) + 1
+            bucket["acceptance_ema"] = ema(bucket.get("acceptance_ema"), max(0.0, min(float(value), 1.0)), alpha)
+            position_stats[str(index)] = bucket
+        state["position_stats"] = position_stats
+
     state["requests"] = int(state.get("requests", 0)) + 1
     state["draft_n"] = int(state.get("draft_n", 0)) + int(draft_n)
     state["draft_n_accepted"] = int(state.get("draft_n_accepted", 0)) + int(draft_n_accepted)
@@ -273,6 +424,15 @@ def main() -> int:
     parser.add_argument("--json-file", help="Request payload JSON file")
     parser.add_argument("--prompt-tokens", type=int, help="Known prompt token count")
     parser.add_argument("--profile", default="fp3-mtp", choices=("fp3-mtp", "fp4-general", "dense-coder"))
+    parser.add_argument("--mode", default="auto", choices=MODE_CHOICES,
+                        help="Workload mode for scoped feedback and conservative JSON/tool caps")
+    parser.add_argument("--state-scope", default="auto",
+                        help="State scope key; default includes profile, inferred mode, backend, model, and ctx")
+    parser.add_argument("--backend", help="Backend name to include in the state scope, e.g. ROCm0 or Vulkan0")
+    parser.add_argument("--model-key", help="Model identifier to include in the state scope")
+    parser.add_argument("--ctx-size", type=int, help="Context size to include in the state scope")
+    parser.add_argument("--mode-overrides", action=argparse.BooleanOptionalAction, default=True,
+                        help="Apply mode-specific n_max/p_min/p_split adjustments")
     parser.add_argument("--state-file", help="Persist draft acceptance feedback here")
     parser.add_argument("--no-tokenize", action="store_true", help="Estimate token count instead of calling /tokenize")
     parser.add_argument("--dry-run", action="store_true", help="Print adjusted payload and do not send")
@@ -287,16 +447,24 @@ def main() -> int:
     parser.add_argument("--max-n-max", type=int, default=8)
     parser.add_argument("--max-profile-shift", type=int, default=2)
     parser.add_argument("--min-stats-count", type=int, default=1)
+    parser.add_argument("--explore-rate", type=float, default=0.05,
+                        help="Probability of testing a neighboring n_max for throughput learning")
+    parser.add_argument("--min-position-acceptance", type=float, default=0.35,
+                        help="Per-position acceptance floor when server telemetry is available")
+    parser.add_argument("--min-position-stats-count", type=int, default=3)
     parser.add_argument("--low-acceptance", type=float, default=0.45)
     parser.add_argument("--high-acceptance", type=float, default=0.80)
     parser.add_argument("--ema-alpha", type=float, default=0.35)
     args = parser.parse_args()
 
     payload = load_json_arg(args.json, args.json_file)
-    state = load_state(args.state_file)
+    root_state = load_state(args.state_file)
+    mode = infer_mode(args, payload)
+    scope = state_scope_key(args, payload, mode)
+    state = get_scoped_state(root_state, scope)
     prompt_tokens = infer_prompt_tokens(args, payload)
     policy = choose_profile(prompt_tokens, args.profile)
-    policy = adapt_policy(policy, state, args)
+    policy = adapt_policy(policy, state, args, mode)
 
     adjusted = dict(payload)
     adjusted.update(policy)
@@ -307,13 +475,16 @@ def main() -> int:
         result: dict[str, Any] = {
             "prompt_tokens": prompt_tokens,
             "profile": args.profile,
+            "mode": mode,
+            "state_scope": scope,
             "state": state,
             "request": adjusted,
         }
     else:
         result = send_request(args, adjusted)
         state = update_state_from_response(state, result, args.ema_alpha)
-        save_state(args.state_file, state)
+        root_state = set_scoped_state(root_state, scope, state)
+        save_state(args.state_file, root_state)
         if args.strip_thinking:
             result = strip_thinking_response(result)
 
