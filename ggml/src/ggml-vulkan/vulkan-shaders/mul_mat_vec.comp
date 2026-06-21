@@ -74,6 +74,12 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
             ibi += p.ncols;
 
 #if K_PER_ITER == 8
+#if defined(DATA_A_ROCMFPX_FP6)
+            const vec4 v = rocmfpx_fp6_dequant4_aligned(ib, iqs, a_offset);
+            const vec4 v2 = rocmfpx_fp6_dequant4_aligned(ib, iqs + 4u, a_offset);
+
+            temp[j][n] += dot(bv0, v) + dot(bv1, v2);
+#else
             vec4 v = dequantize4(ib, iqs, a_offset);
             vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
 
@@ -91,6 +97,7 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
                 rowtmp *= dm.x;
 
             temp[j][n] += rowtmp;
+#endif
 #else
             if (!OOB_w) {
                 const vec4 v = dequantize4(ib, iqs, a_offset);

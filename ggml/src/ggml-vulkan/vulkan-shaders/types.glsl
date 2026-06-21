@@ -2031,6 +2031,32 @@ uint rocmfpx_fp6_code_at(uint q0, uint q1, uint q2, uint q3, uint q4, uint q5, u
     return ((low >> shift) | (high << (32u - shift))) & 0x3Fu;
 }
 
+int32_t rocmfpx_fp6_pack4_regs(uint qs0, uint qs1, uint qs2, uint qs3, uint qs4, uint qs5, uint ei) {
+    const uint b0 = ei * 6u;
+    return pack32(i8vec4(
+        kvalues_rocmfpx_fp6_const[rocmfpx_fp6_code_at(qs0, qs1, qs2, qs3, qs4, qs5, b0 + 0u)],
+        kvalues_rocmfpx_fp6_const[rocmfpx_fp6_code_at(qs0, qs1, qs2, qs3, qs4, qs5, b0 + 6u)],
+        kvalues_rocmfpx_fp6_const[rocmfpx_fp6_code_at(qs0, qs1, qs2, qs3, qs4, qs5, b0 + 12u)],
+        kvalues_rocmfpx_fp6_const[rocmfpx_fp6_code_at(qs0, qs1, qs2, qs3, qs4, qs5, b0 + 18u)]));
+}
+
+int32_t rocmfpx_fp6_pack4_window_qs(const uint8_t qs[24], uint ei) {
+    const uint bit_pos = ei * 6u;
+    const uint byte_pos = bit_pos >> 3u;
+    const uint shift = bit_pos & 7u;
+    const uint bits =
+        (uint(qs[byte_pos + 0u])      ) |
+        (uint(qs[byte_pos + 1u]) <<  8) |
+        (uint(qs[byte_pos + 2u]) << 16) |
+        ((byte_pos + 3u < 24u ? uint(qs[byte_pos + 3u]) : 0u) << 24);
+    const uint window = bits >> shift;
+    return pack32(i8vec4(
+        kvalues_rocmfpx_fp6_const[ window        & 0x3Fu],
+        kvalues_rocmfpx_fp6_const[(window >>  6) & 0x3Fu],
+        kvalues_rocmfpx_fp6_const[(window >> 12) & 0x3Fu],
+        kvalues_rocmfpx_fp6_const[(window >> 18) & 0x3Fu]));
+}
+
 int32_t rocmfpx_fp6_pack4_qs(const uint8_t qs[24], uint ei) {
     const uint qs0 = pack32(u8vec4(qs[0], qs[1], qs[2], qs[3]));
     const uint qs1 = pack32(u8vec4(qs[4], qs[5], qs[6], qs[7]));
@@ -2038,12 +2064,7 @@ int32_t rocmfpx_fp6_pack4_qs(const uint8_t qs[24], uint ei) {
     const uint qs3 = pack32(u8vec4(qs[12], qs[13], qs[14], qs[15]));
     const uint qs4 = pack32(u8vec4(qs[16], qs[17], qs[18], qs[19]));
     const uint qs5 = pack32(u8vec4(qs[20], qs[21], qs[22], qs[23]));
-    const uint b0 = ei * 6u;
-    return pack32(i8vec4(
-        kvalues_rocmfpx_fp6_const[rocmfpx_fp6_code_at(qs0, qs1, qs2, qs3, qs4, qs5, b0 + 0u)],
-        kvalues_rocmfpx_fp6_const[rocmfpx_fp6_code_at(qs0, qs1, qs2, qs3, qs4, qs5, b0 + 6u)],
-        kvalues_rocmfpx_fp6_const[rocmfpx_fp6_code_at(qs0, qs1, qs2, qs3, qs4, qs5, b0 + 12u)],
-        kvalues_rocmfpx_fp6_const[rocmfpx_fp6_code_at(qs0, qs1, qs2, qs3, qs4, qs5, b0 + 18u)]));
+    return rocmfpx_fp6_pack4_regs(qs0, qs1, qs2, qs3, qs4, qs5, ei);
 }
 #endif
 

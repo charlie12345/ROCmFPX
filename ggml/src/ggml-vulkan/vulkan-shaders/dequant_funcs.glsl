@@ -595,9 +595,36 @@ int rocmfpx_fp6_decode_code(uint code) {
     return (code & 32u) != 0u ? -mag : mag;
 }
 
+float rocmfpx_fp6_decode_code_f32(uint code) {
+    const int sign = -int(code >> 5);
+    return float((int(code & 31u) ^ sign) - sign);
+}
+
 float rocmfpx_fp6_dequant(uint ib, uint idx, uint a_offset) {
     const float d = ue4m3_to_fp32(data_a[a_offset + ib].e[idx >= 16u ? 1u : 0u]);
     return float(rocmfpx_fp6_decode_code(rocmfpx_fp6_get_bits(ib, idx * 6u, a_offset))) * d;
+}
+
+vec4 rocmfpx_fp6_dequant4_aligned(uint ib, uint idx, uint a_offset) {
+    const uint qib = a_offset + ib;
+    const uint byte_pos = 3u * (idx >> 2);
+    const uint bits = uint(data_a[qib].qs[byte_pos + 0u]) |
+                     (uint(data_a[qib].qs[byte_pos + 1u]) <<  8) |
+                     (uint(data_a[qib].qs[byte_pos + 2u]) << 16);
+    const float d = ue4m3_to_fp32(data_a[qib].e[idx >= 16u ? 1u : 0u]);
+    return d * vec4(rocmfpx_fp6_decode_code_f32( bits        & 0x3Fu),
+                    rocmfpx_fp6_decode_code_f32((bits >>  6) & 0x3Fu),
+                    rocmfpx_fp6_decode_code_f32((bits >> 12) & 0x3Fu),
+                    rocmfpx_fp6_decode_code_f32((bits >> 18) & 0x3Fu));
+}
+
+vec4 rocmfpx_fp6_dequant4(uint ib, uint idx, uint a_offset) {
+    const uint qib = a_offset + ib;
+    const vec4 q = vec4(unpack8(rocmfpx_fp6_pack4_window_qs(data_a[qib].qs, idx)));
+    return q * vec4(ue4m3_to_fp32(data_a[qib].e[(idx + 0u) >= 16u ? 1u : 0u]),
+                    ue4m3_to_fp32(data_a[qib].e[(idx + 1u) >= 16u ? 1u : 0u]),
+                    ue4m3_to_fp32(data_a[qib].e[(idx + 2u) >= 16u ? 1u : 0u]),
+                    ue4m3_to_fp32(data_a[qib].e[(idx + 3u) >= 16u ? 1u : 0u]));
 }
 
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
@@ -606,10 +633,7 @@ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
 }
 
 vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
-    return vec4(rocmfpx_fp6_dequant(ib, iqs + 0u, a_offset),
-                rocmfpx_fp6_dequant(ib, iqs + 1u, a_offset),
-                rocmfpx_fp6_dequant(ib, iqs + 2u, a_offset),
-                rocmfpx_fp6_dequant(ib, iqs + 3u, a_offset));
+    return rocmfpx_fp6_dequant4(ib, iqs, a_offset);
 }
 #endif
 
