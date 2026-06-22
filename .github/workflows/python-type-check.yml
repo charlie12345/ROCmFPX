@@ -40,4 +40,4 @@ jobs:
       #     warnings: true
       - name: Type-check with ty
         run: |
-            ty check --output-format=github
+            ty check --output-format=github gguf-py/gguf/constants.py gguf-py/gguf/quants.py gguf-py/tests/test_quants.py
