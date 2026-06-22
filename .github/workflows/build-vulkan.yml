@@ -82,7 +82,8 @@ jobs:
         run: |
           source ./vulkan_sdk/setup-env.sh
           cmake -B build \
-            -DGGML_VULKAN=ON
+            -DGGML_VULKAN=ON \
+            -DLLAMA_BUILD_WEBUI=OFF
           cmake --build build --config Release -j $(nproc)
 
       - name: Test
