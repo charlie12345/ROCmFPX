@@ -601,15 +601,19 @@ float rocmfpx_fp6_dequant(uint ib, uint idx, uint a_offset) {
 }
 
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
-    return vec2(rocmfpx_fp6_dequant(ib, iqs + 0u, a_offset),
-                rocmfpx_fp6_dequant(ib, iqs + 1u, a_offset));
+    const float d0 = ue4m3_to_fp32(data_a[a_offset + ib].e[0]);
+    const float d1 = ue4m3_to_fp32(data_a[a_offset + ib].e[1]);
+    return vec2(float(rocmfpx_fp6_decode_code(rocmfpx_fp6_get_bits(ib, (iqs + 0u) * 6u, a_offset))) * ((iqs + 0u) >= 16u ? d1 : d0),
+                float(rocmfpx_fp6_decode_code(rocmfpx_fp6_get_bits(ib, (iqs + 1u) * 6u, a_offset))) * ((iqs + 1u) >= 16u ? d1 : d0));
 }
 
 vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
-    return vec4(rocmfpx_fp6_dequant(ib, iqs + 0u, a_offset),
-                rocmfpx_fp6_dequant(ib, iqs + 1u, a_offset),
-                rocmfpx_fp6_dequant(ib, iqs + 2u, a_offset),
-                rocmfpx_fp6_dequant(ib, iqs + 3u, a_offset));
+    const float d0 = ue4m3_to_fp32(data_a[a_offset + ib].e[0]);
+    const float d1 = ue4m3_to_fp32(data_a[a_offset + ib].e[1]);
+    return vec4(float(rocmfpx_fp6_decode_code(rocmfpx_fp6_get_bits(ib, (iqs + 0u) * 6u, a_offset))) * ((iqs + 0u) >= 16u ? d1 : d0),
+                float(rocmfpx_fp6_decode_code(rocmfpx_fp6_get_bits(ib, (iqs + 1u) * 6u, a_offset))) * ((iqs + 1u) >= 16u ? d1 : d0),
+                float(rocmfpx_fp6_decode_code(rocmfpx_fp6_get_bits(ib, (iqs + 2u) * 6u, a_offset))) * ((iqs + 2u) >= 16u ? d1 : d0),
+                float(rocmfpx_fp6_decode_code(rocmfpx_fp6_get_bits(ib, (iqs + 3u) * 6u, a_offset))) * ((iqs + 3u) >= 16u ? d1 : d0));
 }
 #endif
 

@@ -2028,7 +2028,11 @@ uint rocmfpx_fp6_code_at(uint q0, uint q1, uint q2, uint q3, uint q4, uint q5, u
                       reg_idx == 3u ? q3 : reg_idx == 4u ? q4 : q5;
     const uint high = reg_idx == 0u ? q1 : reg_idx == 1u ? q2 : reg_idx == 2u ? q3 :
                       reg_idx == 3u ? q4 : reg_idx == 4u ? q5 : 0u;
-    return ((low >> shift) | (high << (32u - shift))) & 0x3Fu;
+    uint bits = low >> shift;
+    if (shift > 26u) {
+        bits |= high << (32u - shift);
+    }
+    return bits & 0x3Fu;
 }
 
 int32_t rocmfpx_fp6_pack4_qs(const uint8_t qs[24], uint ei) {
