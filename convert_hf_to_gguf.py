@@ -14437,21 +14437,34 @@ def main() -> None:
         if args.mtp:
             model_class.mtp_only = True  # ty: ignore[unresolved-attribute]
 
-        model_instance = model_class(dir_model, output_type, fname_out,
-                                     is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
-                                     eager=args.no_lazy,
-                                     metadata_override=args.metadata, model_name=args.model_name,
-                                     split_max_tensors=args.split_max_tensors,
-                                     split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,
-                                     small_first_shard=args.no_tensor_first_split,
-                                     remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
-                                     sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
-                                     target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
-                                     fuse_gate_up_exps=args.fuse_gate_up_exps,
-                                     fp8_as_q8=args.fp8_as_q8,
-                                     deepseek4_max_layers=args.deepseek4_max_layers,
-                                     deepseek4_include_mtp=args.deepseek4_include_mtp,
-                                     )
+        model_kwargs = {
+            "is_big_endian": args.bigendian,
+            "use_temp_file": args.use_temp_file,
+            "eager": args.no_lazy,
+            "metadata_override": args.metadata,
+            "model_name": args.model_name,
+            "split_max_tensors": args.split_max_tensors,
+            "split_max_size": split_str_to_n_bytes(args.split_max_size),
+            "dry_run": args.dry_run,
+            "small_first_shard": args.no_tensor_first_split,
+            "remote_hf_model_id": hf_repo_id,
+            "disable_mistral_community_chat_template": disable_mistral_community_chat_template,
+            "sentence_transformers_dense_modules": args.sentence_transformers_dense_modules,
+            "target_model_dir": Path(args.target_model_dir) if args.target_model_dir else None,
+            "fuse_gate_up_exps": args.fuse_gate_up_exps,
+            "fp8_as_q8": args.fp8_as_q8,
+        }
+        supports_deepseek4_options = (
+            getattr(model_class, "model_arch", None) == getattr(gguf.MODEL_ARCH, "DEEPSEEK4", None)
+        )
+        if (args.deepseek4_max_layers is not None or args.deepseek4_include_mtp) and not supports_deepseek4_options:
+            logger.error("--deepseek4-max-layers / --deepseek4-include-mtp are only supported for DeepSeek V4")
+            sys.exit(1)
+        if supports_deepseek4_options:
+            model_kwargs["deepseek4_max_layers"] = args.deepseek4_max_layers
+            model_kwargs["deepseek4_include_mtp"] = args.deepseek4_include_mtp
+
+        model_instance = model_class(dir_model, output_type, fname_out, **model_kwargs)
 
         if args.vocab_only:
             logger.info("Exporting model vocab...")
