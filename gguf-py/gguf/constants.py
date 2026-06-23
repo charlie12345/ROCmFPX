@@ -4295,6 +4295,9 @@ class GGMLQuantizationType(IntEnum):
     Q1_0    = 41
     Q4_0_ROCMFP4      = 100
     Q4_0_ROCMFP4_FAST = 101
+    Q6_0_ROCMFPX      = 102
+    Q8_0_ROCMFPX      = 103
+    Q3_0_ROCMFPX      = 104
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4349,6 +4352,12 @@ class LlamaFileType(IntEnum):
     MOSTLY_MXFP4_MOE     = 38  # except 1d tensors
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
+    MOSTLY_Q6_0_ROCMFPX  = 110  # except 1d tensors
+    MOSTLY_Q8_0_ROCMFPX  = 111  # except 1d tensors
+    MOSTLY_Q3_0_ROCMFPX  = 112  # except 1d tensors
+    MOSTLY_Q3_0_ROCMFPX_AGENT = 113  # except 1d tensors
+    MOSTLY_Q6_0_ROCMFPX_AGENT = 114  # except 1d tensors
+    MOSTLY_Q8_0_ROCMFPX_AGENT = 115  # except 1d tensors
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -4474,6 +4483,9 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q4_0_ROCMFP4:      (32, 2 + 16),
     GGMLQuantizationType.Q4_0_ROCMFP4_FAST: (32, 1 + 16),
+    GGMLQuantizationType.Q6_0_ROCMFPX:      (32, 24 + 2),
+    GGMLQuantizationType.Q8_0_ROCMFPX:      (32, 32 + 1),
+    GGMLQuantizationType.Q3_0_ROCMFPX:      (32, 12 + 2),
 }
 
 

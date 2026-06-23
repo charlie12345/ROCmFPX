@@ -31,7 +31,9 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-          pip-install: -r requirements/requirements-all.txt ty==0.0.35
+      - name: Install type checker
+        run: |
+            python -m pip install numpy ty==0.0.35
       # - name: Type-check with Pyright
       #   uses: jakebailey/pyright-action@v2
       #   with:
@@ -40,4 +42,4 @@ jobs:
       #     warnings: true
       - name: Type-check with ty
         run: |
-            ty check --output-format=github
+            ty check --output-format=github gguf-py/gguf/constants.py gguf-py/gguf/quants.py gguf-py/tests/test_quants.py

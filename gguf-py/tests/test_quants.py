@@ -29,6 +29,23 @@ logger = logging.getLogger("test-quants")
 c_float_p = ctypes.POINTER(ctypes.c_float)
 
 
+DEQUANTIZE_ROW_SYMBOLS = {
+    GGMLQuantizationType.Q3_0_ROCMFPX: "rocmfpx_dequantize_row_fp3",
+    GGMLQuantizationType.Q6_0_ROCMFPX: "rocmfpx_dequantize_row_fp6",
+    GGMLQuantizationType.Q8_0_ROCMFPX: "rocmfpx_dequantize_row_fp8",
+}
+
+
+def dequantize_row_symbol(qtype: GGMLQuantizationType) -> str:
+    if qtype in DEQUANTIZE_ROW_SYMBOLS:
+        return DEQUANTIZE_ROW_SYMBOLS[qtype]
+
+    lw_qname = qtype.name.lower()
+    if lw_qname[-1] == "k":
+        lw_qname = lw_qname[:-1] + "K"
+    return "dequantize_row_" + lw_qname
+
+
 class ggml_init_params(ctypes.Structure):
     _fields_ = [
         ("mem_size", ctypes.c_size_t),
@@ -63,16 +80,27 @@ class GGMLQuants:
         self.libggml.ggml_quantize_requires_imatrix.restype = ctypes.c_bool
         self.libggml.ggml_quantize_requires_imatrix.argtypes = (ctypes.c_int,)
 
-        for t in (
-            "q4_0", "q4_1", "q5_0", "q5_1", "q8_0",
-            "q2_K", "q3_K", "q4_K", "q5_K", "q6_K",
-            "tq1_0", "tq2_0",
-            "mxfp4",
-            "nvfp4",
-            "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "iq1_s", "iq1_m",
-            "iq4_nl", "iq4_xs",
+        for qtype in (
+            GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q4_1,
+            GGMLQuantizationType.Q5_0, GGMLQuantizationType.Q5_1,
+            GGMLQuantizationType.Q8_0,
+            GGMLQuantizationType.Q2_K, GGMLQuantizationType.Q3_K,
+            GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K,
+            GGMLQuantizationType.Q6_K,
+            GGMLQuantizationType.TQ1_0, GGMLQuantizationType.TQ2_0,
+            GGMLQuantizationType.MXFP4, GGMLQuantizationType.NVFP4,
+            GGMLQuantizationType.Q3_0_ROCMFPX,
+            GGMLQuantizationType.Q6_0_ROCMFPX,
+            GGMLQuantizationType.Q8_0_ROCMFPX,
+            GGMLQuantizationType.IQ2_XXS, GGMLQuantizationType.IQ2_XS,
+            GGMLQuantizationType.IQ2_S, GGMLQuantizationType.IQ3_XXS,
+            GGMLQuantizationType.IQ3_S, GGMLQuantizationType.IQ1_S,
+            GGMLQuantizationType.IQ1_M, GGMLQuantizationType.IQ4_NL,
+            GGMLQuantizationType.IQ4_XS,
         ):
-            dequant_func: ctypes._NamedFuncPointer = getattr(self.libggml, "dequantize_row_" + t)
+            dequant_func: ctypes._NamedFuncPointer = getattr(
+                self.libggml, dequantize_row_symbol(qtype)
+            )
             dequant_func.restype = None
             dequant_func.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int64)
 
@@ -95,10 +123,7 @@ class GGMLQuants:
         elif qtype == GGMLQuantizationType.BF16:
             self.libggml.ggml_bf16_to_fp32_row(tensor.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)), result.ctypes.data_as(c_float_p), result.size)
         else:
-            lw_qname = qtype.name.lower()
-            if lw_qname[-1] == "k":
-                lw_qname = lw_qname[:-1] + "K"
-            dequant_func: ctypes._NamedFuncPointer = getattr(self.libggml, "dequantize_row_" + lw_qname)
+            dequant_func: ctypes._NamedFuncPointer = getattr(self.libggml, dequantize_row_symbol(qtype))
             dequant_func(tensor.ctypes.data_as(ctypes.c_void_p), result.ctypes.data_as(c_float_p), result.size)
         return result
 

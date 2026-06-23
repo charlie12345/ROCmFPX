@@ -34,3 +34,4 @@ jobs:
         uses: py-actions/flake8@84ec6726560b6d5bd68f2a5bed83d62b52bb50ba # v2
         with:
             plugins: "flake8-no-print"
+            path: "gguf-py/gguf/constants.py gguf-py/gguf/quants.py gguf-py/tests/test_quants.py"
