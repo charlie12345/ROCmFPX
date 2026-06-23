@@ -1454,10 +1454,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     const auto & hparams = model.hparams;
 
-    // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
+    // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim.
+    // MTP carries h_pre_norm rows instead of normal input embeddings.
     const int64_t n_embd  = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP
         ? model.n_embd_pre_norm()
-        : hparams.n_embd_inp();
+        : hparams.n_embd_inp_enc();
     const int64_t n_vocab = model.vocab.n_tokens();
 
     // note: during encode, we always pass the full sequence starting from pos = 0
