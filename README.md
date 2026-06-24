@@ -13,8 +13,10 @@ https://github.com/charlie12345/ROCmFPX/tree/experimental-rocmfpx-branch
 The same source is intended to live on `main` so GitHub shows the ROCmFPX
 instructions by default.
 
-> Status: experimental research build. Results are hardware-, driver-, model-,
-> and prompt-sensitive. Use BF16/F16 sources for real quality tests.
+> Status: experimental branch. This branch is for community testing before
+> changes are promoted to `main`. APIs, serving defaults, benchmark thresholds,
+> and ROCmFPX tuning choices may change quickly. Results are hardware-, driver-,
+> model-, and prompt-sensitive, so use BF16/F16 sources for real quality tests.
 
 ## What Is ROCmFPX?
 
@@ -45,10 +47,8 @@ kernel coverage.
 This work builds on `llama.cpp`; upstream authors and contributors retain credit
 under the MIT license. See `AUTHORS`, `LICENSE`, and `THIRD_PARTY_NOTICES.md`.
 
-ROCmFP4 and ROCmFPX experiment work in this branch was driven by
-`charlie12345` / `caf`, with iterative code and review assistance from Codex,
-Grok, Gemini, and Composer 2.5. Preserve these credits when copying the branch
-or publishing derived builds.
+ROCmFP4 and ROCmFPX experiment work in this branch is maintained by
+`charlie12345` / `caf`.
 
 Additional ROCmFPX contributors:
 
