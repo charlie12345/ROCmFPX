@@ -74,6 +74,64 @@ ROCmFPX math but protect the tensors that tend to break structured output:
 token/output embeddings, attention Q/K/V/O, selected FFN-down, and selected
 FFN-gate tensors.
 
+## Preliminary Benchmarks
+
+These are local experimental-branch results from a Strix Halo / `gfx1151`
+system. Treat them as early comparison data, not a final benchmark site. All
+rows used the same model pair, backend, batch shape, q4 K/V cache, Flash
+Attention enabled, and one test at a time.
+
+### Qwen3.6 27B, Vanilla No-MTP
+
+Model pair:
+
+- Baseline: `Qwen3.6-27B-Q4_K_M.gguf`, `16.55 GB`
+- ROCmFPX: `Qwen3.6-27B-VANILLA-NO-MTP-BF16-to-ROCmFP4-STRIX_LEAN.gguf`, `14.59 GB`
+- Size delta: ROCmFP4 is `11.82%` smaller
+- Test: `llama-bench`, `pp512 + tg128`, MTP/speculative decoding disabled
+
+| Backend | Quant | Prompt fill tok/s | Decode tg128 tok/s |
+|---|---|---:|---:|
+| ROCm0 | Q4_K_M | 336.97 | 11.74 |
+| ROCm0 | ROCmFP4 STRIX_LEAN | 328.03 | 13.53 |
+| Vulkan0 | Q4_K_M | 352.04 | 12.89 |
+| Vulkan0 | ROCmFP4 STRIX_LEAN | 376.98 | 14.27 |
+
+On this 27B vanilla run, ROCmFP4 was slightly behind Q4_K_M for ROCm prompt
+fill, but faster for decode on both ROCm and Vulkan. Vulkan ROCmFP4 also led
+prompt fill.
+
+### Qwen3.6 35B A3B MTP
+
+Model pair:
+
+- Baseline: `Qwen3.6-35B-A3B-MTP-Q4_K_M.gguf`, `21.71 GB`
+- ROCmFPX: `Qwen3.6-35B-A3B-MTP-BF16-to-ROCmFP4-STRIX_LEAN-ROCmFPXCLONE.gguf`, `19.05 GB`
+- Size delta: ROCmFP4 is `12.28%` smaller
+- Test: `llama-bench`, `pp512 + tg128`
+
+| Backend | Quant | Prompt fill tok/s | Decode tg128 tok/s |
+|---|---|---:|---:|
+| ROCm0 | Q4_K_M | 1353.50 | 59.00 |
+| ROCm0 | ROCmFP4 STRIX_LEAN | 1301.21 | 66.42 |
+| Vulkan0 | Q4_K_M | 1065.83 | 70.57 |
+| Vulkan0 | ROCmFP4 STRIX_LEAN | 1200.81 | 76.71 |
+
+The same 35B A3B pair was also run through a 20-prompt Hermes-style agent
+smoke:
+
+| Backend | Quant | Prompt tok/s | Generation tok/s |
+|---|---|---:|---:|
+| ROCm0 | Q4_K_M | 699.7 | 31.9 |
+| ROCm0 | ROCmFP4 STRIX_LEAN | 731.4 | 47.1 |
+| Vulkan0 | Q4_K_M | 654.0 | 40.2 |
+| Vulkan0 | ROCmFP4 STRIX_LEAN | 730.9 | 57.5 |
+
+On this 35B A3B MTP run, ROCmFP4 was smaller and faster on decode/generation
+across ROCm and Vulkan. ROCm prompt fill was still slightly behind Q4_K_M in
+`llama-bench`, while Vulkan prompt fill and Hermes-style prompts favored
+ROCmFP4.
+
 ## Clone And Build
 
 ```bash
