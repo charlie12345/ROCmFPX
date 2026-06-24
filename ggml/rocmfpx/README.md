@@ -44,6 +44,22 @@ Current status (June 16, 2026):
     `Q3_0_ROCMFPX`, embeddings/output at `Q4_0_ROCMFP4_FAST`.
   - `Q6_0_ROCMFPX`: early attention and boosted FFN-down at `Q8_0_ROCMFPX`,
     embeddings/output at `Q6_0_ROCMFPX`, bulk gate/up on `Q6_0_ROCMFPX`.
+  - `Q6_0_ROCMFPX_STRIX_LEAN`: Strix Halo lean recipe with
+    `Q4_0_ROCMFP4_FAST` as the bulk transformer layout and
+    `Q6_0_ROCMFPX` reserved for token/output, attention Q/K/V/O, fused QKV,
+    and selected FFN down/gate layers. This tests whether FP6 protection can
+    recover quality while staying closer to FP4 speed than the mostly-FP6
+    quality preset.
+  - `Q6_0_ROCMFPX_STRIX_SPEED`: Strix Halo speed probe with
+    `Q4_0_ROCMFP4_FAST` as the bulk transformer layout and `Q6_0_ROCMFPX`
+    reserved for token/output and attention tensors only. This is the
+    faster, riskier follow-up when the selected FFN down/gate protection in
+    `Q6_0_ROCMFPX_STRIX_LEAN` is still too slow.
+  - `Q6_0_ROCMFPX_STRIX_QUALITY`: Strix Halo quality recipe with
+    `Q6_0_ROCMFPX` as the bulk transformer layout, token/output and attention
+    tensors at `Q8_0_ROCMFPX`, and selected FFN down/gate layers at
+    `Q8_0_ROCMFPX`. This is the first candidate when the FP4-fast Strix
+    recipes are below a Q6 quality floor.
   - `Q8_0_ROCMFPX`: pure FP8-family preset.
 - Opt-in `*_AGENT` presets boost attention/FFN routing for tool-call /
   Hermes / OpenClaw style workloads:

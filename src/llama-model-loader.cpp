@@ -51,6 +51,9 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX_AGENT: return "Q3_0_ROCMFPX_AGENT";
         case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT: return "Q6_0_ROCMFPX_AGENT";
         case LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT: return "Q8_0_ROCMFPX_AGENT";
+        case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_STRIX_LEAN: return "Q6_0_ROCMFPX_STRIX_LEAN";
+        case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_STRIX_SPEED: return "Q6_0_ROCMFPX_STRIX_SPEED";
+        case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_STRIX_QUALITY: return "Q6_0_ROCMFPX_STRIX_QUALITY";
         case LLAMA_FTYPE_MOSTLY_Q4_1:     return "Q4_1";
         case LLAMA_FTYPE_MOSTLY_Q5_0:     return "Q5_0";
         case LLAMA_FTYPE_MOSTLY_Q5_1:     return "Q5_1";
