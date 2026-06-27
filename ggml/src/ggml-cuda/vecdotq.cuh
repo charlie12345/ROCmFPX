@@ -350,9 +350,42 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #define VDR_ROCMFP4_Q8_1_MMQ  GGML_ROCMFP4_Q8_1_MMQ_VDR
 #define VDR_ROCMFP4_FAST_Q8_1_MMVQ GGML_ROCMFP4_FAST_Q8_1_MMVQ_VDR
 #define VDR_ROCMFP4_FAST_Q8_1_MMQ  GGML_ROCMFP4_FAST_Q8_1_MMQ_VDR
-#define VDR_ROCMFP3_Q8_1_MMVQ 2
-#define VDR_ROCMFP6_Q8_1_MMVQ 4
-#define VDR_ROCMFP8_Q8_1_MMVQ 2
+#ifndef GGML_ROCMFP3_Q8_1_MMVQ_VDR
+#define GGML_ROCMFP3_Q8_1_MMVQ_VDR 2
+#endif
+
+#ifndef GGML_ROCMFP6_Q8_1_MMVQ_VDR
+#define GGML_ROCMFP6_Q8_1_MMVQ_VDR 4
+#endif
+
+#ifndef GGML_ROCMFP8_Q8_1_MMVQ_VDR
+#define GGML_ROCMFP8_Q8_1_MMVQ_VDR 2
+#endif
+
+#if GGML_ROCMFP3_Q8_1_MMVQ_VDR != 1 && \
+    GGML_ROCMFP3_Q8_1_MMVQ_VDR != 2 && \
+    GGML_ROCMFP3_Q8_1_MMVQ_VDR != 4 && \
+    GGML_ROCMFP3_Q8_1_MMVQ_VDR != 8
+#error "GGML_ROCMFP3_Q8_1_MMVQ_VDR must be 1, 2, 4, or 8"
+#endif
+
+#if GGML_ROCMFP6_Q8_1_MMVQ_VDR != 1 && \
+    GGML_ROCMFP6_Q8_1_MMVQ_VDR != 2 && \
+    GGML_ROCMFP6_Q8_1_MMVQ_VDR != 4 && \
+    GGML_ROCMFP6_Q8_1_MMVQ_VDR != 8
+#error "GGML_ROCMFP6_Q8_1_MMVQ_VDR must be 1, 2, 4, or 8"
+#endif
+
+#if GGML_ROCMFP8_Q8_1_MMVQ_VDR != 1 && \
+    GGML_ROCMFP8_Q8_1_MMVQ_VDR != 2 && \
+    GGML_ROCMFP8_Q8_1_MMVQ_VDR != 4 && \
+    GGML_ROCMFP8_Q8_1_MMVQ_VDR != 8
+#error "GGML_ROCMFP8_Q8_1_MMVQ_VDR must be 1, 2, 4, or 8"
+#endif
+
+#define VDR_ROCMFP3_Q8_1_MMVQ GGML_ROCMFP3_Q8_1_MMVQ_VDR
+#define VDR_ROCMFP6_Q8_1_MMVQ GGML_ROCMFP6_Q8_1_MMVQ_VDR
+#define VDR_ROCMFP8_Q8_1_MMVQ GGML_ROCMFP8_Q8_1_MMVQ_VDR
 
 #define VDR_ROCMFP3_Q8_1_MMQ 4
 #define VDR_ROCMFP6_Q8_1_MMQ 4
@@ -494,7 +527,7 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp6_q8_1(
     memcpy(&qs4, bq6->qs + 16, 4);
     memcpy(&qs5, bq6->qs + 20, 4);
 
-    const uint32_t qs[6] = { qs0, qs1, qs2, qs3, qs4, qs5 };
+    const uint32_t qs[7] = { qs0, qs1, qs2, qs3, qs4, qs5, 0 };
 
     int sumi0 = 0;
     int sumi1 = 0;
