@@ -1413,7 +1413,7 @@ uint rocmfpx_cm2_fp6_get_bits(const in decodeBufROCMFPXFP6 bl, uint bit_pos)
 int rocmfpx_cm2_fp6_decode(uint code)
 {
     const int mag = int(code & 31u);
-    return (code & 32u) != 0u ? -mag : mag;
+    return (code & 32u) != 0u ? -(mag == 0 ? 32 : mag) : mag;
 }
 
 float16_t dequantFuncROCMFPXFP6(const in decodeBufROCMFPXFP6 bl, const in uint blockCoords[2], const in uint coordInBlock[2])

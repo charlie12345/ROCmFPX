@@ -2019,7 +2019,7 @@ const int8_t kvalues_rocmfpx_fp6_const[64] = {
     int8_t(8), int8_t(9), int8_t(10), int8_t(11), int8_t(12), int8_t(13), int8_t(14), int8_t(15),
     int8_t(16), int8_t(17), int8_t(18), int8_t(19), int8_t(20), int8_t(21), int8_t(22), int8_t(23),
     int8_t(24), int8_t(25), int8_t(26), int8_t(27), int8_t(28), int8_t(29), int8_t(30), int8_t(31),
-    int8_t(0), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-5), int8_t(-6), int8_t(-7),
+    int8_t(-32), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-5), int8_t(-6), int8_t(-7),
     int8_t(-8), int8_t(-9), int8_t(-10), int8_t(-11), int8_t(-12), int8_t(-13), int8_t(-14), int8_t(-15),
     int8_t(-16), int8_t(-17), int8_t(-18), int8_t(-19), int8_t(-20), int8_t(-21), int8_t(-22), int8_t(-23),
     int8_t(-24), int8_t(-25), int8_t(-26), int8_t(-27), int8_t(-28), int8_t(-29), int8_t(-30), int8_t(-31)

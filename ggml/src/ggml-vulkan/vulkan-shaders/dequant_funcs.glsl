@@ -592,12 +592,11 @@ uint rocmfpx_fp6_get_bits(uint ib, uint bit_pos, uint a_offset) {
 
 int rocmfpx_fp6_decode_code(uint code) {
     const int mag = int(code & 31u);
-    return (code & 32u) != 0u ? -mag : mag;
+    return (code & 32u) != 0u ? -(mag == 0 ? 32 : mag) : mag;
 }
 
 float rocmfpx_fp6_decode_code_f32(uint code) {
-    const int sign = -int(code >> 5);
-    return float((int(code & 31u) ^ sign) - sign);
+    return float(rocmfpx_fp6_decode_code(code));
 }
 
 float rocmfpx_fp6_dequant(uint ib, uint idx, uint a_offset) {

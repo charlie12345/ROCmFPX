@@ -99,6 +99,52 @@ static void check_weighted_imatrix_fp6(void) {
     assert(weighted_err < plain_err);
 }
 
+static void check_fp6_negative_full_scale(void) {
+    enum { N = QK_ROCMFP6 };
+
+    float src[N];
+    float dst[N];
+    block_rocmfp6 q[N / QK_ROCMFP6];
+
+    for (int i = 0; i < N; ++i) {
+        src[i] = (i & 1) ? 31.0f : -32.0f;
+    }
+
+    rocmfpx_quantize_row_fp6_ref(src, q, N);
+    rocmfpx_dequantize_row_fp6(q, dst, N);
+
+    const uint8_t code0 = q[0].qs[0] & 63u;
+
+    printf("ROCmFP6 -32 code: code0=%u dequant0=%g dequant1=%g\n",
+            (unsigned) code0, dst[0], dst[1]);
+    assert(code0 == 32u);
+    assert(fabsf(dst[0] + 32.0f) < 1e-6f);
+    assert(fabsf(dst[1] - 31.0f) < 1e-6f);
+}
+
+static void check_fp6_positive_full_scale(void) {
+    enum { N = QK_ROCMFP6 };
+
+    float src[N];
+    float dst[N];
+    block_rocmfp6 q[N / QK_ROCMFP6];
+
+    for (int i = 0; i < N; ++i) {
+        src[i] = (i & 1) ? -31.0f : 32.0f;
+    }
+
+    rocmfpx_quantize_row_fp6_ref(src, q, N);
+    rocmfpx_dequantize_row_fp6(q, dst, N);
+
+    const uint8_t code0 = q[0].qs[0] & 63u;
+
+    printf("ROCmFP6 +32 saturation: e0=0x%02x code0=%u dequant0=%g dequant1=%g\n",
+            (unsigned) q[0].e[0], (unsigned) code0, dst[0], dst[1]);
+    assert((code0 & 32u) == 0u);
+    assert(fabsf(dst[0] - 32.0f) < 0.75f);
+    assert(fabsf(dst[1] + 31.0f) < 0.75f);
+}
+
 static void check_weighted_imatrix_fp8(void) {
     enum { N = QK_ROCMFP8 };
 
@@ -171,6 +217,8 @@ int main(void) {
 
     check_weighted_imatrix_fp3();
     check_weighted_imatrix_fp6();
+    check_fp6_negative_full_scale();
+    check_fp6_positive_full_scale();
     check_weighted_imatrix_fp8();
 
     return 0;

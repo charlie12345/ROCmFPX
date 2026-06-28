@@ -444,21 +444,23 @@ static uint8_t rocmfpx_choose_scale_fp3_weighted_mse(const float * x, int n, con
 }
 
 static int rocmfpx_decode_fp6_code(uint8_t code) {
-    const int value = code & 31u;
-    return (code & 32u) ? -value : value;
+    const int mag = code & 31u;
+    return (code & 32u) ? -(mag == 0 ? 32 : mag) : mag;
 }
 
 static uint8_t rocmfpx_quantize_fp6_code(float x, float inv_scale) {
-    if (!isfinite(x) || inv_scale <= 0.0f) {
+    if (!isfinite(x) || !isfinite(inv_scale) || inv_scale <= 0.0f) {
         return 0;
     }
 
-    int mag = (int) lroundf(fabsf(x * inv_scale));
-    if (mag > 31) {
-        mag = 31;
+    int q = (int) lroundf(x * inv_scale);
+    if (q > 31) {
+        q = 31;
+    } else if (q < -32) {
+        q = -32;
     }
 
-    return mag == 0 ? 0 : (uint8_t) ((x < 0.0f ? 32u : 0u) | (uint8_t) mag);
+    return q == 0 ? 0 : (uint8_t) (q < 0 ? (32u | ((uint8_t) -q & 31u)) : (uint8_t) q);
 }
 
 static float rocmfpx_fp6_block_mse_for_scale(const float * x, int n, uint8_t e, float best_err) {

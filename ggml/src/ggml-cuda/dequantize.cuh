@@ -108,7 +108,7 @@ static __device__ __forceinline__ int rocmfpx_decode_fp3_code_cuda(const uint32_
 
 static __device__ __forceinline__ int rocmfpx_decode_fp6_code_cuda(const uint32_t code) {
     const int mag = (int) (code & 31u);
-    return (code & 32u) ? -mag : mag;
+    return (code & 32u) ? -(mag == 0 ? 32 : mag) : mag;
 }
 
 static __device__ __forceinline__ void dequantize_rocmfpx_fp3(const void * vx, const int64_t ib, const int iqs, float2 & v) {

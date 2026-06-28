@@ -602,17 +602,21 @@ void quantize(uint dst_idx, uint src_idx)
 
 #if defined(DATA_A_ROCMFPX_FP6)
 uint rocmfpx_fp6_quantize_code(float x, float inv_scale) {
-    if (inv_scale <= 0.0) {
+    if (isnan(x) || isinf(x) || isnan(inv_scale) || isinf(inv_scale) || inv_scale <= 0.0) {
         return 0u;
     }
 
-    uint mag = uint(clamp(int(round(abs(x * inv_scale))), 0, 31));
-    return mag == 0u ? 0u : ((x < 0.0 ? 32u : 0u) | mag);
+    const int q = clamp(int(round(x * inv_scale)), -32, 31);
+    if (q == 0) {
+        return 0u;
+    }
+
+    return q < 0 ? (32u | (uint(-q) & 31u)) : uint(q);
 }
 
 int rocmfpx_fp6_decode_value(uint code) {
     const int mag = int(code & 31u);
-    return (code & 32u) != 0u ? -mag : mag;
+    return (code & 32u) != 0u ? -(mag == 0 ? 32 : mag) : mag;
 }
 
 float rocmfpx_fp6_mse_for_scale(uint src_idx, uint offset, uint e, float best_err) {

@@ -517,18 +517,18 @@ static __device__ __forceinline__ uint8_t rocmfpx_choose_scale_fp3_mse_cuda(cons
 }
 
 static __device__ __forceinline__ uint8_t rocmfpx_fp6_quantize_code_cuda(float x, float inv_scale) {
-    if (!isfinite(x) || inv_scale <= 0.0f) {
+    if (!isfinite(x) || !isfinite(inv_scale) || inv_scale <= 0.0f) {
         return 0;
     }
 
-    int mag = (int) roundf(fabsf(x * inv_scale));
-    mag = mag > 31 ? 31 : mag;
-    return mag == 0 ? 0 : (uint8_t) ((x < 0.0f ? 32u : 0u) | (uint8_t) mag);
+    int q = (int) roundf(x * inv_scale);
+    q = q > 31 ? 31 : (q < -32 ? -32 : q);
+    return q == 0 ? 0 : (uint8_t) (q < 0 ? (32u | ((uint8_t) -q & 31u)) : (uint8_t) q);
 }
 
 static __device__ __forceinline__ int rocmfpx_fp6_decode_value_cuda(uint8_t code) {
     const int mag = (int) (code & 31u);
-    return (code & 32u) ? -mag : mag;
+    return (code & 32u) ? -(mag == 0 ? 32 : mag) : mag;
 }
 
 template<int start, int n>
