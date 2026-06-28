@@ -1,0 +1,5 @@
+^blk\.64\.attn_output\.weight$=q6_0_rocmfpx
+^blk\.0\.attn_qkv\.weight$=q6_0_rocmfpx
+^blk\.[0-9]+\.attn_qkv\.weight$=q6_k
+^blk\.[0-9]+\.attn_output\.weight$=q6_k
+^blk\.[0-9]+\.ffn_down\.weight$=q8_0

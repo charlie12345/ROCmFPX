@@ -38,17 +38,27 @@ def read_ranked_names(path: Path, count: int, column: str) -> list[str]:
     return names
 
 
-def build_policy_lines(rank_csv: Path, leave_count: int, name_column: str, base_type: str, restore_type: str) -> list[str]:
+def build_policy_lines(
+    rank_csv: Path,
+    leave_count: int,
+    name_column: str,
+    base_type: str,
+    restore_type: str,
+    base_tensor_type_file: Path | None,
+) -> list[str]:
     leave_names = read_ranked_names(rank_csv, leave_count, name_column)
 
     lines = [f"{regex_exact(name)}={base_type}" for name in leave_names]
-    lines.extend([
-        r"^blk\.[0-9]+\.ffn_up\.weight$=" + restore_type,
-        r"^blk\.[0-9]+\.ffn_gate\.weight$=" + restore_type,
-        r"^blk\.[0-9]+\.ffn_down\.weight$=" + restore_type,
-        r"^blk\.[0-9]+\.attn_qkv\.weight$=" + restore_type,
-        r"^blk\.[0-9]+\.attn_output\.weight$=" + restore_type,
-    ])
+    if base_tensor_type_file is not None:
+        lines.extend(base_tensor_type_file.read_text(encoding="utf-8").splitlines())
+    else:
+        lines.extend([
+            r"^blk\.[0-9]+\.ffn_up\.weight$=" + restore_type,
+            r"^blk\.[0-9]+\.ffn_gate\.weight$=" + restore_type,
+            r"^blk\.[0-9]+\.ffn_down\.weight$=" + restore_type,
+            r"^blk\.[0-9]+\.attn_qkv\.weight$=" + restore_type,
+            r"^blk\.[0-9]+\.attn_output\.weight$=" + restore_type,
+        ])
 
     return lines
 
@@ -63,10 +73,13 @@ def main() -> None:
     parser.add_argument("--name-column", default="name")
     parser.add_argument("--base-type", default="q6_0_rocmfpx")
     parser.add_argument("--restore-type", default="q6_k")
+    parser.add_argument("--base-tensor-type-file", type=Path)
     args = parser.parse_args()
 
     if args.leave_count <= 0:
         parser.error("--leave-count must be positive")
+    if args.base_tensor_type_file is not None and not args.base_tensor_type_file.is_file():
+        parser.error(f"--base-tensor-type-file does not exist: {args.base_tensor_type_file}")
 
     text = "\n".join(build_policy_lines(
         args.rank_csv,
@@ -74,6 +87,7 @@ def main() -> None:
         args.name_column,
         args.base_type,
         args.restore_type,
+        args.base_tensor_type_file,
     )) + "\n"
 
     if args.output:

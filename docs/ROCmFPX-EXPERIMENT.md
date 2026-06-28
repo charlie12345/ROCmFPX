@@ -376,6 +376,7 @@ attention plus FFN up/gate/down tensors to `Q6_K`:
 scripts/rocmfpx-ranked-policy.py \
   --rank-csv attention-fp6-residual-rank.csv \
   --leave-count 32 \
+  --base-tensor-type-file base.tensor-type.txt \
   --output rankleave32.tensor-type.txt
 
 FORMAT=rocmfp6 PROFILE=straight TENSOR_TYPE_FILE=rankleave32.tensor-type.txt \
@@ -384,7 +385,10 @@ SRC=model-BF16.gguf OUT=model-rankleave32.gguf scripts/quantize-rocmfpx-agent.sh
 
 The policy is explicit rather than a new ftype because the ranking CSV is
 model/evaluation specific. `--leave-count` must be positive; use separate
-tensor-type rules if an all-restored policy is needed.
+tensor-type rules if an all-restored policy is needed. When
+`--base-tensor-type-file` is set, ranked exact attention rules are emitted
+before the base tensor policy because tensor-type overrides are first-match
+wins.
 
 For local served-inference experiments, `scripts/run-rocmfpx-fp3-mtp-server-speed-profile.sh`
 starts a `llama-server` FP3 MTP profile with the observed Strix/Vulkan settings:
