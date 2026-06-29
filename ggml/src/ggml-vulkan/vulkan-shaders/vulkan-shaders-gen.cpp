@@ -814,7 +814,7 @@ void process_shaders() {
     string_to_spv("cpy_rocmfp4_rocmfp4", "copy_quant_same.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}, {"QUANT_K", "32"}, {"BLOCK_BYTES", "18"}});
     string_to_spv("cpy_rocmfp4_fast_rocmfp4_fast", "copy_quant_same.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}, {"QUANT_K", "32"}, {"BLOCK_BYTES", "17"}});
     string_to_spv("cpy_rocmfpx_fp3_rocmfpx_fp3", "copy_quant_same.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}, {"QUANT_K", "32"}, {"BLOCK_BYTES", "14"}});
-    string_to_spv("cpy_rocmfpx_fp6_rocmfpx_fp6", "copy_quant_same.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}, {"QUANT_K", "32"}, {"BLOCK_BYTES", "26"}});
+    string_to_spv("cpy_rocmfpx_fp6_rocmfpx_fp6", "copy_quant_same.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}, {"QUANT_K", "32"}, {"BLOCK_BYTES", "34"}});
     string_to_spv("cpy_rocmfpx_fp8_rocmfpx_fp8", "copy_quant_same.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}, {"QUANT_K", "32"}, {"BLOCK_BYTES", "33"}});
 
     for (std::string t : {"q1_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "rocmfp4", "rocmfp4_fast", "rocmfpx_fp3", "rocmfpx_fp6", "rocmfpx_fp8"}) {

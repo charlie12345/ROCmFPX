@@ -53,8 +53,8 @@ ROCmFP4 and ROCmFPX experiment work in this branch is maintained by
 Additional ROCmFPX contributors:
 
 - `ciru-ai`: ROCmFPX FP3 Vulkan matvec/dequant speed path.
-- `PlunderStruck` / Aydan S.: TurboQuant `turbo3`/`turbo4` K/V-cache
-  quantization paths for ROCm/HIP and Vulkan.
+- Tom Turney / `PlunderStruck` / Aydan S.: TurboQuant `turbo3`/`turbo4`
+  K/V-cache quantization paths for ROCm/HIP and Vulkan.
 
 ## Why It Is Different From Regular Quants
 

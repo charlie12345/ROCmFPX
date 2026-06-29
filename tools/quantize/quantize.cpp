@@ -47,6 +47,8 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q3_0_ROCMFPX_AGENT",    LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX_AGENT,    " agent/tool-call coherent ROCmFPx Q3 routing", },
     { "Q6_0_ROCMFPX_AGENT",    LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT,    " agent/tool-call coherent ROCmFPx Q6 routing", },
     { "Q8_0_ROCMFPX_AGENT",    LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT,    " agent/tool-call coherent ROCmFPx Q8 routing", },
+    { "Q6_0_ROCMFPX_LEAN",     LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN,     " size/speed-biased ROCmFPx Q6 routing", },
+    { "Q6_0_ROCMFPX_AGENT_LEAN", LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN, " agent ROCmFPx Q6 routing without Q8-heavy boosts", },
     { "Q4_1",     LLAMA_FTYPE_MOSTLY_Q4_1,     " 4.78G, +0.4511 ppl @ Llama-3-8B",  },
     { "MXFP4_MOE",LLAMA_FTYPE_MOSTLY_MXFP4_MOE," MXFP4 MoE",  },
     { "Q5_0",     LLAMA_FTYPE_MOSTLY_Q5_0,     " 5.21G, +0.1316 ppl @ Llama-3-8B",  },

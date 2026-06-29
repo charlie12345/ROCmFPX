@@ -62,7 +62,7 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     type = LLM_TYPE_UNKNOWN;
 }
 
-void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
+void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     const int64_t q_lora_rank     = hparams.n_lora_q;
@@ -143,9 +143,29 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
             layer.ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_expert_used, n_vocab}, TENSOR_NOT_REQUIRED);
         }
 
-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
-        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+        const auto gate_exps_name = tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i);
+        const auto down_exps_name = tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i);
+        const auto up_exps_name   = tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i);
+
+        const ggml_tensor * gate_exps_meta = ml.get_tensor_meta(gate_exps_name.str().c_str());
+        const ggml_tensor * down_exps_meta = ml.get_tensor_meta(down_exps_name.str().c_str());
+        const ggml_tensor * up_exps_meta   = ml.get_tensor_meta(up_exps_name.str().c_str());
+
+        const bool fable_half_width_experts =
+            gate_exps_meta && down_exps_meta && up_exps_meta &&
+            gate_exps_meta->ne[0] == n_embd / 2 && gate_exps_meta->ne[1] == n_ff_exp     && gate_exps_meta->ne[2] == n_expert &&
+            up_exps_meta->ne[0]   == n_embd / 2 && up_exps_meta->ne[1]   == n_ff_exp     && up_exps_meta->ne[2]   == n_expert &&
+            down_exps_meta->ne[0] == n_ff_exp / 2 && down_exps_meta->ne[1] == n_embd     && down_exps_meta->ne[2] == n_expert;
+
+        if (fable_half_width_experts) {
+            layer.ffn_gate_exps = create_tensor(gate_exps_name, {n_embd / 2,   n_ff_exp, n_expert}, 0);
+            layer.ffn_down_exps = create_tensor(down_exps_name, {n_ff_exp / 2, n_embd,   n_expert}, 0);
+            layer.ffn_up_exps   = create_tensor(up_exps_name,   {n_embd / 2,   n_ff_exp, n_expert}, 0);
+        } else {
+            layer.ffn_gate_exps = create_tensor(gate_exps_name, {n_embd,   n_ff_exp, n_expert}, 0);
+            layer.ffn_down_exps = create_tensor(down_exps_name, {n_ff_exp, n_embd,   n_expert}, 0);
+            layer.ffn_up_exps   = create_tensor(up_exps_name,   {n_embd,   n_ff_exp, n_expert}, 0);
+        }
 
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, 0);

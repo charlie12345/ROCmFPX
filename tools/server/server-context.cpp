@@ -811,14 +811,27 @@ private:
             const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                             params_base.speculative.types.end(),
                                             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+            const bool spec_eagle3 = std::find(params_base.speculative.types.begin(),
+                                               params_base.speculative.types.end(),
+                                               COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != params_base.speculative.types.end();
+            const bool spec_dflash = std::find(params_base.speculative.types.begin(),
+                                               params_base.speculative.types.end(),
+                                               COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
             if (spec_mtp) {
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                cparams.ctx_other = ctx_tgt;
+            } else if (spec_eagle3 || spec_dflash) {
+                cparams.ctx_other = ctx_tgt;
             }
 
             // note: for small models maybe we can set this to the maximum possible draft from all speculative types
             //       the extra memory for small models is likely negligible?
             cparams.n_rs_seq = 0;
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+            if (ctx_dft == nullptr) {
+                SRV_ERR("failed to create draft context, '%s'\n", params_dft.model.path.c_str());
+                return false;
+            }
 
             ctx_dft_seq_rm_type = spec_mtp ? COMMON_CONTEXT_SEQ_RM_TYPE_NO : common_context_can_seq_rm(ctx_dft.get());
 
@@ -831,6 +844,7 @@ private:
 
             auto cparams_mtp = common_context_params_to_llama(params_base);
             cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_mtp.ctx_other = ctx_tgt;
             cparams_mtp.type_k   = params_base.speculative.draft.cache_type_k;
             cparams_mtp.type_v   = params_base.speculative.draft.cache_type_v;
             cparams_mtp.n_rs_seq = 0;

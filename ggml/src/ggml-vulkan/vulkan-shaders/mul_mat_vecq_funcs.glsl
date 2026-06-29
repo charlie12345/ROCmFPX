@@ -225,25 +225,17 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 
 #if defined(DATA_A_ROCMFPX_FP6)
 int32_t rocmfpx_vq_fp6_pack4(uint ib, uint base) {
-    return rocmfpx_fp6_pack4_qs(data_a[ib].qs, base);
+    const uint qh = base >> 1;
+    return pack32(i16vec2(data_a_packed16[ib].qs[qh], data_a_packed16[ib].qs[qh + 1u]));
 }
 
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
-    int32_t sumi0 = 0;
-    int32_t sumi1 = 0;
-    [[unroll]] for (uint lane = 0u; lane < 2u; ++lane) {
-        const uint base = 4u * (iqs + lane);
-        const int32_t v = rocmfpx_vq_fp6_pack4(ib_a, base);
-        const int32_t u = cache_b_qs[lane];
-        if (base < QUANT_K / 2u) {
-            sumi0 = dotPacked4x8EXT(v, u);
-        } else {
-            sumi1 = dotPacked4x8EXT(v, u);
-        }
-    }
-    const FLOAT_TYPE d0 = FLOAT_TYPE(ue4m3_to_fp32(data_a[ib_a].e[0]));
-    const FLOAT_TYPE d1 = FLOAT_TYPE(ue4m3_to_fp32(data_a[ib_a].e[1]));
-    return FLOAT_TYPE(cache_b_ds.x * (d0 * float(sumi0) + d1 * float(sumi1)));
+    const uint base = iqs * K_PER_ITER;
+    const int32_t q_sum = dotPacked4x8EXT(rocmfpx_vq_fp6_pack4(ib_a, base),      cache_b_qs[0]) +
+                          dotPacked4x8EXT(rocmfpx_vq_fp6_pack4(ib_a, base + 4u), cache_b_qs[1]);
+    const uint scale_idx = base < QUANT_K / 2u ? 0u : 1u;
+    const FLOAT_TYPE d = FLOAT_TYPE(ue4m3_to_fp32(data_a[ib_a].e[scale_idx]));
+    return FLOAT_TYPE(cache_b_ds.x * d * float(q_sum));
 }
 #endif
 

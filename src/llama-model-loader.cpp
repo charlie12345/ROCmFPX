@@ -51,6 +51,8 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX_AGENT: return "Q3_0_ROCMFPX_AGENT";
         case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT: return "Q6_0_ROCMFPX_AGENT";
         case LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT: return "Q8_0_ROCMFPX_AGENT";
+        case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN: return "Q6_0_ROCMFPX_LEAN";
+        case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN: return "Q6_0_ROCMFPX_AGENT_LEAN";
         case LLAMA_FTYPE_MOSTLY_Q4_1:     return "Q4_1";
         case LLAMA_FTYPE_MOSTLY_Q5_0:     return "Q5_0";
         case LLAMA_FTYPE_MOSTLY_Q5_1:     return "Q5_1";
@@ -280,10 +282,28 @@ namespace GGUFMeta {
     };
 }
 
+static std::string llama_model_loader_compat_key(const std::string & key) {
+    if (key.rfind("gemma4_assistant.", 0) == 0) {
+        std::string compat_key = key;
+        compat_key.replace(0, std::string("gemma4_assistant").size(), "gemma4-assistant");
+        return compat_key;
+    }
+    if (key.rfind("dflash.", 0) == 0) {
+        std::string compat_key = key;
+        compat_key.replace(0, std::string("dflash").size(), "dflash-draft");
+        return compat_key;
+    }
+    return {};
+}
+
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
     llama_model_loader::get_arr_n(const std::string & key, T & result, bool required) {
-        const int kid = gguf_find_key(metadata, key.c_str());
+        int kid = gguf_find_key(metadata, key.c_str());
+        const std::string compat_key = kid < 0 ? llama_model_loader_compat_key(key) : std::string();
+        if (kid < 0 && !compat_key.empty()) {
+            kid = gguf_find_key(metadata, compat_key.c_str());
+        }
 
         if (kid < 0) {
             if (required) {
@@ -311,7 +331,15 @@ namespace GGUFMeta {
     template<typename T>
     bool llama_model_loader::get_arr(const std::string & key, std::vector<T> & result, bool required) {
         const gguf_context * ctx = metadata;
-        const int kid = gguf_find_key(ctx, key.c_str());
+        int kid = gguf_find_key(ctx, key.c_str());
+        std::string found_key = key;
+        const std::string compat_key = kid < 0 ? llama_model_loader_compat_key(key) : std::string();
+        if (kid < 0 && !compat_key.empty()) {
+            kid = gguf_find_key(ctx, compat_key.c_str());
+            if (kid >= 0) {
+                found_key = compat_key;
+            }
+        }
 
         if (kid < 0 || gguf_get_kv_type(ctx, kid) != GGUF_TYPE_ARRAY) {
             if (required) {
@@ -330,7 +358,7 @@ namespace GGUFMeta {
             case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T,       float>::value)); break;
             case GGUF_TYPE_STRING:  GGML_ASSERT((std::is_same<T, std::string>::value)); break;
             default:
-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32 array", key.c_str()));
+                throw std::runtime_error(format("%s is not a string/float32/uint32/int32 array", found_key.c_str()));
         }
 
         if constexpr (std::is_same<T, std::string>::value) {
@@ -352,7 +380,15 @@ namespace GGUFMeta {
     template<typename T, size_t N_MAX>
     bool llama_model_loader::get_arr(const std::string & key, std::array<T, N_MAX> & result, bool required) {
         const gguf_context * ctx = metadata;
-        const int kid = gguf_find_key(ctx, key.c_str());
+        int kid = gguf_find_key(ctx, key.c_str());
+        std::string found_key = key;
+        const std::string compat_key = kid < 0 ? llama_model_loader_compat_key(key) : std::string();
+        if (kid < 0 && !compat_key.empty()) {
+            kid = gguf_find_key(ctx, compat_key.c_str());
+            if (kid >= 0) {
+                found_key = compat_key;
+            }
+        }
 
         if (kid < 0 || gguf_get_kv_type(ctx, kid) != GGUF_TYPE_ARRAY) {
             if (required) {
@@ -372,11 +408,11 @@ namespace GGUFMeta {
             case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T,       float>::value)); break;
             case GGUF_TYPE_STRING:  GGML_ASSERT((std::is_same<T, std::string>::value)); break;
             default:
-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32 array", key.c_str()));
+                throw std::runtime_error(format("%s is not a string/float32/uint32/int32 array", found_key.c_str()));
         }
 
         if (arr_info.length > N_MAX) {
-            throw std::runtime_error(format("array length %u for key %s exceeds max %u", (uint32_t) arr_info.length, key.c_str(), (uint32_t) N_MAX));
+            throw std::runtime_error(format("array length %u for key %s exceeds max %u", (uint32_t) arr_info.length, found_key.c_str(), (uint32_t) N_MAX));
         }
 
         if constexpr (std::is_same<T, std::string>::value) {
@@ -405,6 +441,8 @@ namespace GGUFMeta {
         return get_arr(llm_kv(kid), result, required);
     }
 
+    template bool llama_model_loader::get_arr<int32_t>(const std::string & key, std::vector<int32_t> & result, bool required);
+
     template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
@@ -417,7 +455,17 @@ namespace GGUFMeta {
         const struct llama_model_kv_override * override =
             it != kv_overrides.end() ? &it->second : nullptr;
 
-        const bool found = GGUFMeta::GKV<T>::set(metadata, key, result, override);
+        bool found = GGUFMeta::GKV<T>::set(metadata, key, result, override);
+
+        if (!found) {
+            std::string compat_key = llama_model_loader_compat_key(key);
+            if (!compat_key.empty()) {
+                auto compat_it = kv_overrides.find(compat_key);
+                const struct llama_model_kv_override * compat_override =
+                    compat_it != kv_overrides.end() ? &compat_it->second : nullptr;
+                found = GGUFMeta::GKV<T>::set(metadata, compat_key, result, compat_override);
+            }
+        }
 
         if (required && !found) {
             throw std::runtime_error(format("key not found in model: %s", key.c_str()));
@@ -451,7 +499,15 @@ namespace GGUFMeta {
     // get array of n <= N_MAX elements, or a single element repeated n times
     template<typename T, size_t N_MAX>
     bool llama_model_loader::get_key_or_arr(const std::string & key, std::array<T, N_MAX> & result, uint32_t n, bool required) {
-        const int kid = gguf_find_key(metadata, key.c_str());
+        std::string found_key = key;
+        int kid = gguf_find_key(metadata, found_key.c_str());
+
+        if (kid < 0) {
+            found_key = llama_model_loader_compat_key(key);
+            if (!found_key.empty()) {
+                kid = gguf_find_key(metadata, found_key.c_str());
+            }
+        }
 
         if (kid < 0) {
             if (required) {
@@ -472,12 +528,12 @@ namespace GGUFMeta {
                 throw std::runtime_error(format("key %s has wrong array length; expected %u, got %u", key.c_str(), n, (uint32_t) arr_info.length));
             }
 
-            return get_arr(key, result, required);
+            return get_arr(found_key, result, required);
         }
 
         T value;
 
-        bool ok = get_key(key, value, required);
+        bool ok = get_key(found_key, value, required);
         if (!ok) {
             return false;
         }
@@ -496,8 +552,15 @@ namespace GGUFMeta {
 
     bool llama_model_loader::get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required) {
         const std::string key = llm_kv(kid);
+        std::string found_key = key;
 
-        const int id = gguf_find_key(metadata, key.c_str());
+        int id = gguf_find_key(metadata, found_key.c_str());
+        if (id < 0) {
+            found_key = llama_model_loader_compat_key(key);
+            if (!found_key.empty()) {
+                id = gguf_find_key(metadata, found_key.c_str());
+            }
+        }
 
         if (id < 0) {
             if (required) {
@@ -1066,6 +1129,32 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    const std::string tn_name = tn.str();
+    std::string load_name = tn_name;
+    if (!files.empty() && get_tensor_meta(load_name.c_str()) == nullptr) {
+        if (load_name.rfind("mtp.", 0) == 0) {
+            std::string compat_name = load_name;
+            compat_name.replace(0, std::string("mtp").size(), "nextn");
+            if (get_tensor_meta(compat_name.c_str()) != nullptr) {
+                load_name = compat_name;
+            }
+        } else if (load_name == "fc.weight" && get_tensor_meta("dflash_fc.weight") != nullptr) {
+            load_name = "dflash_fc.weight";
+        } else if (load_name == "enc.output_norm.weight" && get_tensor_meta("dflash_hidden_norm.weight") != nullptr) {
+            load_name = "dflash_hidden_norm.weight";
+        } else {
+            std::string compat_name = load_name;
+            const std::string from = ".ffn_norm.";
+            const size_t pos = compat_name.find(from);
+            if (pos != std::string::npos) {
+                compat_name.replace(pos, from.size(), ".post_attention_norm.");
+                if (get_tensor_meta(compat_name.c_str()) != nullptr) {
+                    load_name = compat_name;
+                }
+            }
+        }
+    }
+
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
@@ -1101,7 +1190,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (flags & TENSOR_NOT_REQUIRED) {
                 return nullptr;
             }
-            throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
+            throw std::runtime_error(format("missing tensor '%s'", tn_name.c_str()));
         }
 
         // some models use the token embedding tensor as the output, but since these are used in different layers and with different ops
@@ -1116,13 +1205,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         try {
             info = llm_tensor_info_for(tn_tensor);
         } catch (const std::out_of_range & e) {
-            throw std::runtime_error(format("missing tensor info mapping for %s", tn.str().c_str()));
+            throw std::runtime_error(format("missing tensor info mapping for %s", tn_name.c_str()));
         }
 
         // skip unused tensors
         if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
             const size_t nbytes = ggml_nbytes(t_meta);
-            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", load_name.c_str(), nbytes);
 
             size_data -= nbytes;
             n_created++;
@@ -1146,11 +1235,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // sanity checks
         if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
             if (tn.bid != -1) {
-                GGML_ABORT("input/output layer tensor %s used with a layer number", tn.str().c_str());
+                GGML_ABORT("input/output layer tensor %s used with a layer number", tn_name.c_str());
             }
         } else {
             if (tn.bid == -1) {
-                GGML_ABORT("repeating layer tensor %s used without a layer number", tn.str().c_str());
+                GGML_ABORT("repeating layer tensor %s used without a layer number", tn_name.c_str());
             }
         }
 
@@ -1175,7 +1264,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // check overrides
         if (!buft && tensor_buft_overrides) {
-            std::string tensor_name = tn.str();
+            std::string tensor_name = load_name;
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
@@ -1204,7 +1293,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
-                throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
+                throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", load_name.c_str()));
             }
         }
 
@@ -1236,7 +1325,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             return nullptr;
         }
         ggml_type type = GGML_TYPE_F32;
-        const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
+        const int64_t tid = gguf_find_tensor(metadata, load_name.c_str());
         if (tid != -1) {
             type = gguf_get_tensor_type(metadata, tid);
         }
@@ -1259,17 +1348,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             t_meta.nb[dim] = dim == 0 ? ggml_type_size(type) : t_meta.ne[dim-1]*t_meta.nb[dim-1];
             GGML_ASSERT(t_meta.nb[dim] >= 1);
         }
-        ggml_set_name(&t_meta, tn.str().c_str());
+        ggml_set_name(&t_meta, load_name.c_str());
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         GGML_ASSERT(buft != nullptr);
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
-        ggml_set_name(ret, tn.str().c_str());
+        ggml_set_name(ret, load_name.c_str());
         return ret;
     }
 
-    ggml_tensor * t_meta = get_tensor_meta(tn.str().c_str());
+    ggml_tensor * t_meta = get_tensor_meta(load_name.c_str());
     ggml_backend_buffer_type_t buft = buft_for_tensor(t_meta);
     if (buft == nullptr) {
         return nullptr; // return type is ggml_tensor *
@@ -1278,14 +1367,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {
-        ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
+        ggml_tensor * t = ggml_get_tensor(ctx, load_name.c_str());
         if (t) {
             return t;
         }
     }
 
-    LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
-    const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED));
+    LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, load_name.c_str());
+    const struct ggml_tensor * cur = check_tensor_dims(load_name, ne, !(flags & TENSOR_NOT_REQUIRED));
 
     if (cur == NULL) {
         return NULL;

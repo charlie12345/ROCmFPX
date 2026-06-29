@@ -851,7 +851,7 @@ template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_rocmfpx_fp6(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
-    const block_rocmfp6 * K = (const block_rocmfp6 *) K_c;
+    const block_rocmfp6_device * K = (const block_rocmfp6_device *) K_c;
     GGML_UNUSED(Q_v);
 
     float sum = 0.0f;
@@ -863,7 +863,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_rocmfpx_fp6(
         const int ib  = k_KQ / QI_ROCMFP6;
         const int iqs = k_KQ % QI_ROCMFP6;
 
-        const int v = rocmfpx_pack4_fp6_vec_cuda(K[ib].qs, iqs * 4);
+        const int v = rocmfpx_pack4_fp6_device_vec_cuda(&K[ib], iqs * 4);
         const int half_idx = iqs / (QI_ROCMFP6/2);
 
         const float2 * Q_ds = (const float2 *) Q_ds_v;
@@ -949,7 +949,7 @@ static __device__ __forceinline__ void dequantize_V_rocmfpx_fp3(const void * __r
 
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_rocmfpx_fp6(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-    const block_rocmfp6 * x = (const block_rocmfp6 *) vx;
+    const block_rocmfp6_device * x = (const block_rocmfp6_device *) vx;
 
     const int64_t ib  = i0 / QK_ROCMFP6;
     const int     pos = i0 % QK_ROCMFP6;
@@ -959,8 +959,8 @@ static __device__ __forceinline__ void dequantize_V_rocmfpx_fp6(const void * __r
     float vals[ne];
     const int base0 = int((pos / 4) * 4);
     const int base1 = int(((pos + ne - 1) / 4) * 4);
-    const int packed0 = rocmfpx_pack4_fp6_vec_cuda(x[ib].qs, base0);
-    const int packed1 = base1 != base0 ? rocmfpx_pack4_fp6_vec_cuda(x[ib].qs, base1) : packed0;
+    const int packed0 = rocmfpx_pack4_fp6_device_vec_cuda(&x[ib], base0);
+    const int packed1 = base1 != base0 ? rocmfpx_pack4_fp6_device_vec_cuda(&x[ib], base1) : packed0;
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
         const int idx  = pos + l;

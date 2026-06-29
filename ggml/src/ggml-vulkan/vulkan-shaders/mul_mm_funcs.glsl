@@ -22,23 +22,9 @@ vec4 rocmfpx_mm_fp3_vec4(uint ib, uint idx) {
 #endif
 
 #if defined(DATA_A_ROCMFPX_FP6)
-uint rocmfpx_mm_fp6_get_bits(uint ib, uint bit_pos) {
-    uint code = 0u;
-    [[unroll]] for (uint bit = 0u; bit < 6u; ++bit) {
-        const uint src_bit = bit_pos + bit;
-        code |= ((uint(data_a[ib].qs[src_bit >> 3u]) >> (src_bit & 7u)) & 1u) << bit;
-    }
-    return code;
-}
-
-int rocmfpx_mm_fp6_decode(uint code) {
-    const int mag = int(code & 31u);
-    return (code & 32u) != 0u ? -mag : mag;
-}
-
 float rocmfpx_mm_fp6_value(uint ib, uint idx) {
     const float d = ue4m3_to_fp32(data_a[ib].e[idx >= 16u ? 1u : 0u]);
-    return float(rocmfpx_mm_fp6_decode(rocmfpx_mm_fp6_get_bits(ib, idx * 6u))) * d;
+    return float(int(data_a[ib].qs[idx])) * d;
 }
 
 vec4 rocmfpx_mm_fp6_vec4(uint ib, uint idx) {

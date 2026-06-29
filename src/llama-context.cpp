@@ -108,10 +108,10 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3) {
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
-                throw std::runtime_error("EAGLE3 requires ctx_other to be set (this warning is normal during memory fitting)");
+                throw std::runtime_error(std::string(llm_arch_name(model.arch)) + " requires ctx_other to be set (this warning is normal during memory fitting)");
             }
             cparams.ctx_other = params.ctx_other;
         }
@@ -2330,8 +2330,8 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         GGML_ASSERT(n_tokens > 0);
         GGML_ASSERT(nfloats % n_tokens == 0);
 
-        const size_t row_floats = nfloats / n_tokens;
-        const size_t dst_offset = token_offset * row_floats;
+        GGML_UNUSED(token_offset);
+        const size_t dst_offset = 0;
         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);

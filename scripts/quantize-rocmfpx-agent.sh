@@ -52,6 +52,8 @@ Preset mapping:
   rocmfp4 strix-lean -> Q4_0_ROCMFP4_STRIX_LEAN
   rocmfp6 straight -> Q6_0_ROCMFPX
   rocmfp6 agent    -> Q6_0_ROCMFPX_AGENT
+  rocmfp6 lean     -> Q6_0_ROCMFPX_LEAN
+  rocmfp6 agent-lean -> Q6_0_ROCMFPX_AGENT_LEAN
   rocmfp8 straight -> Q8_0_ROCMFPX
   rocmfp8 agent    -> Q8_0_ROCMFPX_AGENT
 EOF
@@ -83,6 +85,9 @@ case "$FORMAT:$PROFILE" in
     rocmfp4:strix_lean) PRESET="Q4_0_ROCMFP4_STRIX_LEAN" ;;
     rocmfp6:straight) PRESET="Q6_0_ROCMFPX" ;;
     rocmfp6:agent)    PRESET="Q6_0_ROCMFPX_AGENT" ;;
+    rocmfp6:lean)     PRESET="Q6_0_ROCMFPX_LEAN" ;;
+    rocmfp6:agent-lean) PRESET="Q6_0_ROCMFPX_AGENT_LEAN" ;;
+    rocmfp6:agent_lean) PRESET="Q6_0_ROCMFPX_AGENT_LEAN" ;;
     rocmfp8:straight) PRESET="Q8_0_ROCMFPX" ;;
     rocmfp8:agent)    PRESET="Q8_0_ROCMFPX_AGENT" ;;
     *)

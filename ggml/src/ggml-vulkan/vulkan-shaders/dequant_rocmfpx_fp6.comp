@@ -7,24 +7,12 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout (binding = 0) readonly buffer A {block_rocmfpx_fp6 data_a[];};
 layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
 
-uint rocmfpx_fp6_get_bits(uint ib, uint bit_pos) {
-    uint code = 0u;
-    [[unroll]] for (uint bit = 0u; bit < 6u; ++bit) {
-        const uint src_bit = bit_pos + bit;
-        code |= ((uint(data_a[ib].qs[src_bit >> 3u]) >> (src_bit & 7u)) & 1u) << bit;
-    }
-    return code;
-}
-
-int rocmfpx_fp6_decode_code(uint code) {
-    const int mag = int(code & 31u);
-    return (code & 32u) != 0u ? -mag : mag;
-}
-
 void main() {
     const uint i = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
 
+#ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
+#endif
 
     const uint tid = gl_LocalInvocationID.x % 64;
     const uint il  = tid/32;
@@ -40,6 +28,6 @@ void main() {
 
     [[unroll]] for (uint l = 0; l < 16; ++l) {
         const uint idx = q_idx + l;
-        data_b[b_idx + l] = D_TYPE(d * float(rocmfpx_fp6_decode_code(rocmfpx_fp6_get_bits(ib, idx * 6u))));
+        data_b[b_idx + l] = D_TYPE(d * float(int(data_a[ib].qs[idx])));
     }
 }

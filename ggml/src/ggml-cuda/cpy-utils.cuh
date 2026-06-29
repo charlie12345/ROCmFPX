@@ -650,6 +650,25 @@ static __device__ void quantize_f32_rocmfpx_fp6_block(const float * __restrict__
     }
 }
 
+static __device__ void quantize_f32_rocmfpx_fp6_expanded_block(const float * __restrict__ x, block_rocmfp6_expanded * __restrict__ y) {
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int offset = half * (QK_ROCMFP6/2);
+        y->e[half] = half == 0 ?
+            rocmfpx_choose_scale_fp6_mse_cuda<0, QK_ROCMFP6/2>(x) :
+            rocmfpx_choose_scale_fp6_mse_cuda<QK_ROCMFP6/2, QK_ROCMFP6/2>(x);
+
+        const float d = rocmfpx_ue4m3_to_fp32_finite(y->e[half]);
+        const float id = d > 0.0f ? 1.0f/d : 0.0f;
+
+#pragma unroll
+        for (int j = 0; j < QK_ROCMFP6/2; ++j) {
+            const int i = offset + j;
+            y->qs[i] = (int8_t) rocmfpx_fp6_decode_value_cuda(rocmfpx_fp6_quantize_code_cuda(x[i], id));
+        }
+    }
+}
+
 static __device__ void quantize_f32_rocmfpx_fp8_block(const float * __restrict__ x, block_rocmfp8 * __restrict__ y) {
     y->e = rocmfpx_nearest_scale_ue4m3_cuda(rocmfpx_max_abs_range_cuda(x, 0, QK_ROCMFP8) / 127.0f);
     const float d = rocmfpx_ue4m3_to_fp32_finite(y->e);
@@ -759,7 +778,11 @@ static __device__ void cpy_blck_scalar_rocmfpx_fp6(const char * cxi, char * cdst
         tmp[j] = ggml_cuda_cast<float>(x[j]);
     }
 
+#if GGML_ROCMFP6_EXPANDED_DEVICE
+    quantize_f32_rocmfpx_fp6_expanded_block(tmp, (block_rocmfp6_expanded *) cdsti);
+#else
     quantize_f32_rocmfpx_fp6_block(tmp, (block_rocmfp6 *) cdsti);
+#endif
 }
 
 static __device__ void cpy_blck_f32_rocmfpx_fp3(const char * cxi, char * cdsti) {

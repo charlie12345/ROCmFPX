@@ -16,7 +16,32 @@ if TYPE_CHECKING:
 
 from .base import LazyTorchTensor, MmprojModel, ModelBase, TextModel, gguf, logger
 
-from .qwen import QwenModel
+try:
+    from .qwen import QwenModel
+except ModuleNotFoundError:
+    class QwenModel:
+        @staticmethod
+        def token_bytes_to_string(b: bytes) -> str:
+            from transformers.models.gpt2.tokenization_gpt2 import bytes_to_unicode  # type: ignore[import-not-found]
+            byte_encoder = bytes_to_unicode()
+            return ''.join([byte_encoder[ord(char)] for char in b.decode('latin-1')])
+
+        @staticmethod
+        def bpe(mergeable_ranks: dict[bytes, int], token: bytes, max_rank: int | None = None) -> list[bytes]:
+            parts = [bytes([b]) for b in token]
+            while True:
+                min_idx = None
+                min_rank = None
+                for i, pair in enumerate(zip(parts[:-1], parts[1:])):
+                    rank = mergeable_ranks.get(pair[0] + pair[1])
+                    if rank is not None and (min_rank is None or rank < min_rank):
+                        min_idx = i
+                        min_rank = rank
+                if min_rank is None or (max_rank is not None and min_rank >= max_rank):
+                    break
+                assert min_idx is not None
+                parts = parts[:min_idx] + [parts[min_idx] + parts[min_idx + 1]] + parts[min_idx + 2:]
+            return parts
 
 
 @ModelBase.register("DeepseekOCRForCausalLM")
@@ -699,10 +724,39 @@ class DeepseekV4Model(TextModel):
             consumed.add(name)
         return consumed
 
+    def _pad_fable_expert_tensor(self, weight: Tensor, wid: str) -> Tensor:
+        n_embd = int(self.hparams["hidden_size"])
+        n_ff_exp = int(self.hparams["moe_intermediate_size"])
+        target_shape = {
+            "w1": (n_ff_exp, n_embd),
+            "w2": (n_embd, n_ff_exp),
+            "w3": (n_ff_exp, n_embd),
+        }[wid]
+
+        if tuple(weight.shape) == target_shape:
+            return weight
+
+        if weight.ndim != 2 or weight.shape[0] > target_shape[0] or weight.shape[1] > target_shape[1]:
+            raise ValueError(
+                f"DeepSeek V4 expert {wid} shape {tuple(weight.shape)} cannot be padded to {target_shape}"
+            )
+
+        # DeepSeek V4 Fable is distributed with half-width routed experts. Zero padding is
+        # only a compatibility fallback so the current runtime graph can load the model.
+        padded = torch.zeros(target_shape, dtype=weight.dtype, device=weight.device)
+        padded[:weight.shape[0], :weight.shape[1]] = weight
+        logger.warning(
+            "DeepSeek V4: zero-padding routed expert %s from %s to %s for loader compatibility",
+            wid,
+            tuple(weight.shape),
+            target_shape,
+        )
+        return padded
+
     def _write_expert_tensors(self) -> set[str]:
         n_experts = self.hparams["n_routed_experts"]
         consumed: set[str] = set()
-        groups: dict[tuple[int, str], dict[int, tuple[str, str]]] = {}
+        groups: dict[tuple[int, str], dict[int, tuple[str, str | None]]] = {}
 
         for name in list(self.model_tensors):
             if self._skip_tensor(name):
@@ -717,27 +771,41 @@ class DeepseekV4Model(TextModel):
             scale_name = f"{name.removesuffix('.weight')}.scale"
             model_scale_name = scale_name if scale_name in self.model_tensors else f"model.{scale_name}"
             if model_scale_name not in self.model_tensors:
-                raise ValueError(f"Missing DeepSeek V4 FP4 scale tensor for {stripped}")
+                model_scale_name = None
 
             groups.setdefault((bid, wid), {})[xid] = (name, model_scale_name)
-            consumed.update((name, model_scale_name))
+            consumed.add(name)
+            if model_scale_name is not None:
+                consumed.add(model_scale_name)
 
         for (bid, wid), group in sorted(groups.items()):
             missing = sorted(set(range(n_experts)).difference(group))
             if missing:
                 raise ValueError(f"Missing DeepSeek V4 expert tensors for layer {bid} {wid}: {missing[:8]}")
 
-            logger.info("DeepSeek V4: preserving blk.%d %s routed experts as MXFP4", bid, wid)
-            experts = []
+            experts: list[np.ndarray] = []
+            has_scales = any(scale_name is not None for _, scale_name in group.values())
+            if has_scales and not all(scale_name is not None for _, scale_name in group.values()):
+                raise ValueError(f"DeepSeek V4 expert tensors mix scaled and unscaled weights in layer {bid} {wid}")
+
             for xid in range(n_experts):
                 weight_name, scale_name = group[xid]
                 weight = LazyTorchTensor.to_eager(self.model_tensors[weight_name]())
-                scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
-                experts.append(self._pack_fp4_as_mxfp4(weight, scale))
+                if scale_name is None:
+                    weight = self._pad_fable_expert_tensor(weight, wid)
+                    experts.append(weight.to(torch.float16).numpy())
+                else:
+                    scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
+                    experts.append(self._pack_fp4_as_mxfp4(weight, scale))
 
             merged = np.stack(experts, axis=0)
             new_name = self.map_tensor_name(f"layers.{bid}.ffn.experts.{wid}.weight")
-            self.gguf_writer.add_tensor(new_name, merged, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
+            if has_scales:
+                logger.info("DeepSeek V4: preserving blk.%d %s routed experts as MXFP4", bid, wid)
+                self.gguf_writer.add_tensor(new_name, merged, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
+            else:
+                logger.info("DeepSeek V4: merging blk.%d %s routed experts as F16", bid, wid)
+                self.gguf_writer.add_tensor(new_name, merged)
 
         return consumed
 

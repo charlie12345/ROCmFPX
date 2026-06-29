@@ -1143,6 +1143,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
                 store_attn_cache_rows(kv_comp, 0, n_comp);
 
+                dsv4_prepare_concat_cache_inputs(ctx0, kv, kv_comp);
                 k_all = ggml_concat(ctx0, kv, kv_comp, 2);
                 v_all = k_all;
 
@@ -1264,6 +1265,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
                 if (n_comp_visible > 0) {
                     ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_visible);
+                    dsv4_prepare_concat_cache_inputs(ctx0, k_raw, kv_comp_cache);
                     k_all = ggml_concat(ctx0, k_raw, kv_comp_cache, 2);
                     v_all = k_all;
 

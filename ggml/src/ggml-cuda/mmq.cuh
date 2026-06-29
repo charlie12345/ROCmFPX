@@ -1147,10 +1147,10 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
             i = min(i, i_max);
         }
 
-        const block_rocmfp6 * bxi = (const block_rocmfp6 *) x + kbx0 + i*stride + kbx;
+        const block_rocmfp6_device * bxi = (const block_rocmfp6_device *) x + kbx0 + i*stride + kbx;
 
-        const int v0 = rocmfpx_pack4_fp6_vec_cuda(bxi[0].qs, kqsx * 4);
-        const int v1 = rocmfpx_pack4_fp6_vec_cuda(bxi[MMQ_TILE_NE_K/QK_ROCMFP6].qs, kqsx * 4);
+        const int v0 = rocmfpx_pack4_fp6_device_vec_cuda(&bxi[0], kqsx * 4);
+        const int v1 = rocmfpx_pack4_fp6_device_vec_cuda(&bxi[MMQ_TILE_NE_K/QK_ROCMFP6], kqsx * 4);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + 0             + txi] = v0;
@@ -1173,7 +1173,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
             i = min(i, i_max);
         }
 
-        const block_rocmfp6 * bxi = (const block_rocmfp6 *) x + kbx0 + i*stride + kbxd;
+        const block_rocmfp6_device * bxi = (const block_rocmfp6_device *) x + kbx0 + i*stride + kbxd;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*MMQ_MMA_TILE_X_K_Q3_K + 2*kbxd + 0] = rocmfpx_ue4m3_to_fp32_finite(bxi->e[0]);

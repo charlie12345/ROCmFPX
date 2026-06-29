@@ -751,8 +751,14 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_Q6_0_ROCMFPX) {
-        set_rows_cuda_quant<idx_t, block_rocmfp6, QK_ROCMFP6, quantize_f32_rocmfpx_fp6_block>(
-            src0_d, src1_d, (block_rocmfp6*)dst->data,
+        set_rows_cuda_quant<idx_t, block_rocmfp6_device, QK_ROCMFP6,
+#if GGML_ROCMFP6_EXPANDED_DEVICE
+            quantize_f32_rocmfpx_fp6_expanded_block
+#else
+            quantize_f32_rocmfpx_fp6_block
+#endif
+        >(
+            src0_d, src1_d, (block_rocmfp6_device*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
             nb01, nb02, nb03,

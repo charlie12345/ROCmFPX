@@ -8,6 +8,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -127,10 +128,10 @@ struct common_sampler {
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
-        const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
-        const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
-        const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+    void set_logits(struct llama_context * ctx, int idx, bool prefer_sampled = true) {
+        const float *       sampled_probs  = prefer_sampled ? llama_get_sampled_probs_ith     (ctx, idx) : nullptr;
+        const float *       sampled_logits = prefer_sampled ? llama_get_sampled_logits_ith    (ctx, idx) : nullptr;
+        const llama_token * sampled_ids    = prefer_sampled ? llama_get_sampled_candidates_ith(ctx, idx) : nullptr;
 
         const llama_model * model = llama_get_model(ctx);
         const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -535,6 +536,40 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+static llama_token common_sampler_validate_or_select_fallback(
+        const char *                  func,
+        struct llama_context *        ctx,
+        llama_token_data_array &      cur_p,
+        llama_token                   id) {
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+    if (id >= 0 && id < n_vocab) {
+        return id;
+    }
+
+    static std::atomic<int> n_warn_invalid_sample { 0 };
+    const int n_warn = n_warn_invalid_sample.fetch_add(1, std::memory_order_relaxed);
+    if (n_warn < 16) {
+        LOG_WRN("%s: sampler selected invalid token %d (n_vocab=%d); selecting a valid fallback candidate\n",
+                func, id, n_vocab);
+    } else {
+        LOG_DBG("%s: sampler selected invalid token %d (n_vocab=%d); selecting a valid fallback candidate\n",
+                func, id, n_vocab);
+    }
+
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        const llama_token id_fallback = cur_p.data[i].id;
+        if (id_fallback >= 0 && id_fallback < n_vocab) {
+            cur_p.selected = i;
+            return id_fallback;
+        }
+    }
+
+    cur_p.selected = -1;
+    return LLAMA_TOKEN_NULL;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -561,14 +596,32 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
+            const llama_token id_backend = id;
+            bool found = false;
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
                     cur_p.selected = i;
+                    found = true;
                     break;
                 }
             }
 
-            return id;
+            id = common_sampler_validate_or_select_fallback(__func__, ctx, cur_p, id);
+            if (found && id == id_backend) {
+                return id;
+            }
+
+            static std::atomic<int> n_warn_backend_sample_invalid { 0 };
+            const int n_warn = n_warn_backend_sample_invalid.fetch_add(1, std::memory_order_relaxed);
+            if (n_warn < 16) {
+                LOG_WRN("%s: backend sampler returned a token outside the current candidates (id=%d, found=%d); falling back to CPU sampler\n",
+                        __func__, id_backend, (int) found);
+            } else {
+                LOG_DBG("%s: backend sampler returned a token outside the current candidates (id=%d, found=%d); falling back to CPU sampler\n",
+                        __func__, id_backend, (int) found);
+            }
+            cur_p.selected = -1;
+            gsmpl->set_logits(ctx, idx, false);
         }
     }
 
@@ -582,6 +635,24 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;
+    id = common_sampler_validate_or_select_fallback(__func__, ctx, cur_p, id);
+    if (id == LLAMA_TOKEN_NULL) {
+        gsmpl->set_logits(ctx, idx, false);
+
+        llama_sampler_apply(rbudget, &cur_p);
+
+        if (grammar_first && grammar_should_apply(gsmpl)) {
+            llama_sampler_apply(grmr, &cur_p);
+        }
+
+        llama_sampler_apply(chain, &cur_p);
+
+        GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+        id = cur_p.data[cur_p.selected].id;
+        id = common_sampler_validate_or_select_fallback(__func__, ctx, cur_p, id);
+        return id;
+    }
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
         return id;
@@ -615,6 +686,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
 
     id = cur_p.data[cur_p.selected].id;
+    id = common_sampler_validate_or_select_fallback(__func__, ctx, cur_p, id);
 
     return id;
 }

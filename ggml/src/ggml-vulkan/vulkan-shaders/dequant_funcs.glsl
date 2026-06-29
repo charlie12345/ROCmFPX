@@ -581,23 +581,9 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 #endif
 
 #if defined(DATA_A_ROCMFPX_FP6)
-uint rocmfpx_fp6_get_bits(uint ib, uint bit_pos, uint a_offset) {
-    uint code = 0u;
-    [[unroll]] for (uint bit = 0u; bit < 6u; ++bit) {
-        const uint src_bit = bit_pos + bit;
-        code |= ((uint(data_a[a_offset + ib].qs[src_bit >> 3u]) >> (src_bit & 7u)) & 1u) << bit;
-    }
-    return code;
-}
-
-int rocmfpx_fp6_decode_code(uint code) {
-    const int mag = int(code & 31u);
-    return (code & 32u) != 0u ? -mag : mag;
-}
-
 float rocmfpx_fp6_dequant(uint ib, uint idx, uint a_offset) {
     const float d = ue4m3_to_fp32(data_a[a_offset + ib].e[idx >= 16u ? 1u : 0u]);
-    return float(rocmfpx_fp6_decode_code(rocmfpx_fp6_get_bits(ib, idx * 6u, a_offset))) * d;
+    return float(int(data_a[a_offset + ib].qs[idx])) * d;
 }
 
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
@@ -616,15 +602,15 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 #if defined(DATA_A_ROCMFPX_FP8)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const float d = ue4m3_to_fp32(data_a[a_offset + ib].e);
-    return vec2(float(data_a[a_offset + ib].qs[iqs + 0u]) * d,
-                float(data_a[a_offset + ib].qs[iqs + 1u]) * d);
+    return vec2(float(int(data_a[a_offset + ib].qs[iqs + 0u])) * d,
+                float(int(data_a[a_offset + ib].qs[iqs + 1u])) * d);
 }
 vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
     const float d = ue4m3_to_fp32(data_a[a_offset + ib].e);
-    return vec4(float(data_a[a_offset + ib].qs[iqs + 0u]) * d,
-                float(data_a[a_offset + ib].qs[iqs + 1u]) * d,
-                float(data_a[a_offset + ib].qs[iqs + 2u]) * d,
-                float(data_a[a_offset + ib].qs[iqs + 3u]) * d);
+    return vec4(float(int(data_a[a_offset + ib].qs[iqs + 0u])) * d,
+                float(int(data_a[a_offset + ib].qs[iqs + 1u])) * d,
+                float(int(data_a[a_offset + ib].qs[iqs + 2u])) * d,
+                float(int(data_a[a_offset + ib].qs[iqs + 3u])) * d);
 }
 #endif
 

@@ -64,6 +64,7 @@ STRICT_BENCH="${STRICT_BENCH:-1}"
 NO_MMPROJ="${NO_MMPROJ:-1}"
 AUTO_DETECT_MTP="${AUTO_DETECT_MTP:-1}"
 REQUIRE_MTP="${REQUIRE_MTP:-0}"
+CHAT_TEMPLATE_FILE="${CHAT_TEMPLATE_FILE:-}"
 
 if [[ -z "$MODEL" ]]; then
     echo "MODEL must point to a ROCmFPX/ROCmFP4 GGUF" >&2
@@ -162,6 +163,15 @@ if [[ "$NO_MMPROJ" == "1" ]]; then
     mmproj_args=(--no-mmproj)
 fi
 
+chat_template_args=()
+if [[ -n "$CHAT_TEMPLATE_FILE" ]]; then
+    if [[ ! -f "$CHAT_TEMPLATE_FILE" ]]; then
+        echo "missing CHAT_TEMPLATE_FILE: $CHAT_TEMPLATE_FILE" >&2
+        exit 1
+    fi
+    chat_template_args=(--chat-template-file "$CHAT_TEMPLATE_FILE")
+fi
+
 perf_args=(
     --poll "$POLL"
     --poll-batch "$POLL_BATCH"
@@ -225,6 +235,7 @@ exec "$BIN" \
     "${fit_args[@]}" \
     "${placement_args[@]}" \
     "${mmproj_args[@]}" \
+    "${chat_template_args[@]}" \
     --metrics \
     --no-webui \
     "${cache_args[@]}" \

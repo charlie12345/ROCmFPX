@@ -63,15 +63,8 @@ fa_v_qs_block8 get_v_qs_block8(uint ib, uint a_offset) {
         return r;
     }
     if (FaTypeV == FA_TYPE_Q6_0_ROCMFPX) {
-        const uint8_t qs[24] = v_packed_rocmfpx_fp6.data[a_offset + ib].qs;
-        const uint qs0 = pack32(u8vec4(qs[0], qs[1], qs[2], qs[3]));
-        const uint qs1 = pack32(u8vec4(qs[4], qs[5], qs[6], qs[7]));
-        const uint qs2 = pack32(u8vec4(qs[8], qs[9], qs[10], qs[11]));
-        const uint qs3 = pack32(u8vec4(qs[12], qs[13], qs[14], qs[15]));
-        const uint qs4 = pack32(u8vec4(qs[16], qs[17], qs[18], qs[19]));
-        const uint qs5 = pack32(u8vec4(qs[20], qs[21], qs[22], qs[23]));
         [[unroll]] for (uint32_t d = 0; d < 8; d++) {
-            r.qs[d] = fa_rocmfpx_fp6_pack4_regs(qs0, qs1, qs2, qs3, qs4, qs5, d * 4u);
+            r.qs[d] = fa_rocmfpx_fp6_pack4_qs(v_packed_rocmfpx_fp6.data[a_offset + ib].qs, d * 4u);
         }
         return r;
     }

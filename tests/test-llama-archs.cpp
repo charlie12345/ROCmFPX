@@ -99,6 +99,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_ff   = 96;
         n_layer = 22; // hparams.n_layer_kv_from_start = 20 is hardcoded
     } else if (arch == LLM_ARCH_DEEPSEEK2
+            || arch == LLM_ARCH_DEEPSEEK32
+            || arch == LLM_ARCH_DEEPSEEK4
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_MISTRAL4) {
@@ -155,6 +157,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
     ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS, 8.0f);
     if (arch == LLM_ARCH_DEEPSEEK2
+            || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_MISTRAL4) {
@@ -196,6 +199,15 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(1));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(64));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,      uint32_t(8));
+    if (arch == LLM_ARCH_DEEPSEEK4) {
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,   uint32_t(32));
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT, uint32_t(1));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,    std::vector<uint32_t>(n_layer, 0));
+        ms.add_kv(LLM_KV_HASH_LAYER_COUNT,             uint32_t(1));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,       uint32_t(1));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERS, uint32_t(1));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPS,         1.0e-6f);
+    }
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
     ms.add_kv(LLM_KV_TOKENIZER_MODEL,         "no_vocab");
     // ms.add_kv(LLM_KV_DENSE_2_FEAT_OUT,     n_embd);
@@ -331,6 +343,8 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_ARCTIC:
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_EXAONE_MOE:
@@ -342,11 +356,13 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_HUNYUAN_MOE:
         case LLM_ARCH_OPENAI_MOE:
+        case LLM_ARCH_HYV3:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_SMALLTHINKER:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_GROVEMOE:
         case LLM_ARCH_MINIMAX_M2:
+        case LLM_ARCH_MINIMAX_M3:
         case LLM_ARCH_RND1:
         case LLM_ARCH_PADDLEOCR:
         case LLM_ARCH_MIMO2:
@@ -447,7 +463,10 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT || arch == LLM_ARCH_DIFFUSION_GEMMA) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
         }
-        if (arch == LLM_ARCH_EAGLE3) {
+        if (arch == LLM_ARCH_DEEPSEEK4) {
+            continue; // FIXME: DeepSeek V4 synthetic fixture needs production FP8/compressor metadata
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
             continue;
         }
         for (bool moe : {false, true}) {
@@ -534,7 +553,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT || arch == LLM_ARCH_DIFFUSION_GEMMA) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
         }
-        if (arch == LLM_ARCH_EAGLE3) {
+        if (arch == LLM_ARCH_DEEPSEEK4) {
+            continue; // FIXME: DeepSeek V4 synthetic fixture needs production FP8/compressor metadata
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
             continue;
         }
 
