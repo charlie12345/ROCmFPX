@@ -415,21 +415,25 @@ static __device__ __forceinline__ int rocmfpx_decode_fp6_code_vec_cuda(const uin
 }
 
 static __device__ __forceinline__ int rocmfpx_pack4_fp3_vec_cuda(const uint8_t * qs, const int base) {
-    const char4 v = make_char4(
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 0)*3, 3)),
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 1)*3, 3)),
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 2)*3, 3)),
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 3)*3, 3)));
-    return *((const int *) &v);
+    const int bit_pos = base*3;
+    const int byte_pos = bit_pos >> 3;
+    const int shift = bit_pos & 7;
+
+    uint32_t window = (uint32_t) qs[byte_pos] | ((uint32_t) qs[byte_pos + 1] << 8);
+    if (shift > 4 && byte_pos + 2 < QS_ROCMFP3) {
+        window |= (uint32_t) qs[byte_pos + 2] << 16;
+    }
+
+    return rocmfpx_pack4_fp3_codes((window >> shift) & 0xFFFu);
 }
 
 static __device__ __forceinline__ int rocmfpx_pack4_fp6_vec_cuda(const uint8_t * qs, const int base) {
-    const char4 v = make_char4(
-        (int8_t) rocmfpx_decode_fp6_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 0)*6, 6)),
-        (int8_t) rocmfpx_decode_fp6_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 1)*6, 6)),
-        (int8_t) rocmfpx_decode_fp6_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 2)*6, 6)),
-        (int8_t) rocmfpx_decode_fp6_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 3)*6, 6)));
-    return *((const int *) &v);
+    const int byte_pos = (base*6) >> 3;
+
+    uint32_t bits24 = 0;
+    memcpy(&bits24, qs + byte_pos, 3);
+
+    return rocmfpx_pack4_fp6_codes(bits24 & 0xFFFFFFu);
 }
 
 static __device__ __forceinline__ float vec_dot_rocmfp4_q8_1(
