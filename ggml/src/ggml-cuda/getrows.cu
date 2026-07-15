@@ -225,6 +225,10 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK_ROCMFP3, QR_ROCMFP3, dequantize_rocmfpx_fp3>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_Q2_0_ROCMFPX:
+            get_rows_cuda_q<QK_ROCMFP2, QR_ROCMFP2, dequantize_rocmfpx_fp2>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
         case GGML_TYPE_Q6_0_ROCMFPX:
             get_rows_cuda_q<QK_ROCMFP6, QR_ROCMFP6, dequantize_rocmfpx_fp6>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);

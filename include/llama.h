@@ -170,6 +170,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT    = 115, // ROCmFPx 8-bit agent/tool-call coherent routing
         LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN     = 116, // ROCmFPx 6-bit size/speed-biased routing
         LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN = 117, // ROCmFPx 6-bit agent routing without Q8-heavy boosts
+        LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX          = 119, // ROCmFPx 2-bit S40 codebook + dual UE4M3 scales
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

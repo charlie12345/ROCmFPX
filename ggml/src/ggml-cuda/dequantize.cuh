@@ -93,6 +93,10 @@ static __device__ __forceinline__ uint32_t rocmfpx_get_fp3_code_cuda(const uint8
     return (rocmfpx_load_qs_window_cuda<QS_ROCMFP3>(src, byte_pos) >> shift) & 7u;
 }
 
+static __device__ __forceinline__ uint32_t rocmfpx_get_fp2_code_cuda(const uint8_t * src, const int i) {
+    return (src[i >> 2] >> (2 * (i & 3))) & 3u;
+}
+
 static __device__ __forceinline__ uint32_t rocmfpx_get_fp6_code_cuda(const uint8_t * src, const int i) {
     const int bit_pos  = i * 6;
     const int byte_pos = bit_pos >> 3;
@@ -104,6 +108,10 @@ static __device__ __forceinline__ int rocmfpx_decode_fp3_code_cuda(const uint32_
     const uint32_t mag_code = code & 3u;
     const int mag = mag_code == 3u ? 4 : (int) mag_code;
     return (code & 4u) ? -mag : mag;
+}
+
+static __device__ __forceinline__ int rocmfpx_decode_fp2_code_cuda(const uint32_t code) {
+    return code == 0u ? -4 : code == 1u ? -1 : code == 2u ? 1 : 4;
 }
 
 static __device__ __forceinline__ int rocmfpx_decode_fp6_code_cuda(const uint32_t code) {
@@ -121,6 +129,16 @@ static __device__ __forceinline__ void dequantize_rocmfpx_fp3(const void * vx, c
 
     v.x = d0 * (float) rocmfpx_decode_fp3_code_cuda(rocmfpx_get_fp3_code_cuda(x[ib].qs, i0));
     v.y = d1 * (float) rocmfpx_decode_fp3_code_cuda(rocmfpx_get_fp3_code_cuda(x[ib].qs, i1));
+}
+
+static __device__ __forceinline__ void dequantize_rocmfpx_fp2(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_rocmfp2 * x = (const block_rocmfp2 *) vx;
+    const int i0 = iqs + 0;
+    const int i1 = iqs + 1;
+    const float d0 = rocmfpx_ue4m3_to_fp32_finite(x[ib].e[i0 >= QK_ROCMFP2/2]);
+    const float d1 = rocmfpx_ue4m3_to_fp32_finite(x[ib].e[i1 >= QK_ROCMFP2/2]);
+    v.x = d0 * (float) rocmfpx_decode_fp2_code_cuda(rocmfpx_get_fp2_code_cuda(x[ib].qs, i0));
+    v.y = d1 * (float) rocmfpx_decode_fp2_code_cuda(rocmfpx_get_fp2_code_cuda(x[ib].qs, i1));
 }
 
 static __device__ __forceinline__ void dequantize_rocmfpx_fp6(const void * vx, const int64_t ib, const int iqs, float2 & v) {

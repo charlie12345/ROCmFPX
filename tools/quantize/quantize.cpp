@@ -44,6 +44,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q4_0_ROCMFP4_STRIX",    LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX,    " ~4.49 bpw ROCmFP4 Strix Halo attn-K/V quality recipe", },
     { "Q4_0_ROCMFP4_STRIX_LEAN", LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN, " ~4.38 bpw ROCmFP4 Strix K/V + Q5_K token embeddings", },
     { "Q3_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX,          " 3.50 bpw ROCmFPx experimental, ROCm/Vulkan staging", },
+    { "Q2_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX,          " 2.50 bpw ROCmFPx S40 codebook + dual UE4M3 scales", },
     { "Q6_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX,          " 6.50 bpw ROCmFPx experimental, ROCm/Vulkan staging", },
     { "Q8_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX,          " 8.25 bpw ROCmFPx experimental, ROCm/Vulkan staging", },
     { "Q3_0_ROCMFPX_AGENT",    LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX_AGENT,    " agent/tool-call coherent ROCmFPx Q3 routing", },

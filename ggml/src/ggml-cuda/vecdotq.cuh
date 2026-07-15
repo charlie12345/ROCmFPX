@@ -353,6 +353,10 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #define GGML_ROCMFP3_Q8_1_MMVQ_VDR 2
 #endif
 
+#ifndef GGML_ROCMFP2_Q8_1_MMVQ_VDR
+#define GGML_ROCMFP2_Q8_1_MMVQ_VDR 4
+#endif
+
 #ifndef GGML_ROCMFP6_Q8_1_MMVQ_VDR
 #define GGML_ROCMFP6_Q8_1_MMVQ_VDR 4
 #endif
@@ -366,6 +370,13 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
     GGML_ROCMFP3_Q8_1_MMVQ_VDR != 4 && \
     GGML_ROCMFP3_Q8_1_MMVQ_VDR != 8
 #error "GGML_ROCMFP3_Q8_1_MMVQ_VDR must be 1, 2, 4, or 8"
+#endif
+
+#if GGML_ROCMFP2_Q8_1_MMVQ_VDR != 1 && \
+    GGML_ROCMFP2_Q8_1_MMVQ_VDR != 2 && \
+    GGML_ROCMFP2_Q8_1_MMVQ_VDR != 4 && \
+    GGML_ROCMFP2_Q8_1_MMVQ_VDR != 8
+#error "GGML_ROCMFP2_Q8_1_MMVQ_VDR must be 1, 2, 4, or 8"
 #endif
 
 #if GGML_ROCMFP6_Q8_1_MMVQ_VDR != 1 && \
@@ -395,10 +406,12 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #endif
 
 #define VDR_ROCMFP3_Q8_1_MMVQ GGML_ROCMFP3_Q8_1_MMVQ_VDR
+#define VDR_ROCMFP2_Q8_1_MMVQ GGML_ROCMFP2_Q8_1_MMVQ_VDR
 #define VDR_ROCMFP6_Q8_1_MMVQ GGML_ROCMFP6_Q8_1_MMVQ_VDR
 #define VDR_ROCMFP8_Q8_1_MMVQ GGML_ROCMFP8_Q8_1_MMVQ_VDR
 
 #define VDR_ROCMFP3_Q8_1_MMQ 4
+#define VDR_ROCMFP2_Q8_1_MMQ 4
 #ifndef VDR_ROCMFP6_Q8_1_MMQ
 #define VDR_ROCMFP6_Q8_1_MMQ 4
 #endif
@@ -420,6 +433,31 @@ static __device__ __forceinline__ int rocmfpx_decode_fp3_code_vec_cuda(const uin
     const uint32_t mag_code = code & 3u;
     const int mag = mag_code == 3u ? 4 : (int) mag_code;
     return (code & 4u) ? -mag : mag;
+}
+
+static __device__ __forceinline__ int rocmfpx_pack4_fp2_vec_cuda(const uint8_t packed) {
+#if defined(GGML_USE_HIP)
+    // Spread the low and high code bits independently into the low bits of
+    // four byte selectors.  Separating the planes prevents carries between
+    // adjacent two-bit codes during the multiply.
+    constexpr uint32_t byte_lsb = 0x01010101u;
+    const uint32_t lo = (((uint32_t) packed        & 0x55u) * 0x00041041u) & byte_lsb;
+    const uint32_t hi = ((((uint32_t) packed >> 1) & 0x55u) * 0x00041041u) & byte_lsb;
+    const uint32_t selectors = lo | (hi << 1);
+
+    // v_perm_b32 selector bytes 0..3 choose bytes from the second operand.
+    // Packed little-endian table bytes are {-4, -1, +1, +4}.
+    return __builtin_amdgcn_perm(0u, 0x0401fffcu, selectors);
+#else
+    int result = 0;
+#pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+        const uint32_t code = (packed >> (2 * lane)) & 3u;
+        const int value = code == 0u ? -4 : code == 1u ? -1 : code == 2u ? 1 : 4;
+        result |= ((int) (uint8_t) (int8_t) value) << (8 * lane);
+    }
+    return result;
+#endif
 }
 
 static __device__ __forceinline__ int rocmfpx_decode_fp6_code_vec_cuda(const uint32_t code) {
@@ -592,6 +630,39 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp3_q8_1(
 
     const float db = __low2float(bq8_1->ds);
     return db * (rocmfpx_ue4m3_to_fp32_finite(bq3->e[0]) * sumi0 + rocmfpx_ue4m3_to_fp32_finite(bq3->e[1]) * sumi1);
+}
+
+static __device__ __forceinline__ float vec_dot_rocmfpx_fp2_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_rocmfp2 * bq2 = (const block_rocmfp2 *) vbq + kbx;
+    const int * q8 = (const int *) bq8_1->qs;
+#if VDR_ROCMFP2_Q8_1_MMVQ <= 4
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < VDR_ROCMFP2_Q8_1_MMVQ; ++i) {
+        const int group = iqs + i;
+        const int values = rocmfpx_pack4_fp2_vec_cuda(bq2->qs[group]);
+        sumi = ggml_cuda_dp4a(values, q8[group], sumi);
+    }
+    const float db = __low2float(bq8_1->ds);
+    return db * rocmfpx_ue4m3_to_fp32_finite(bq2->e[iqs / 4]) * sumi;
+#else
+    int sumi0 = 0;
+    int sumi1 = 0;
+#pragma unroll
+    for (int i = 0; i < VDR_ROCMFP2_Q8_1_MMVQ; ++i) {
+        const int group = iqs + i;
+        const int values = rocmfpx_pack4_fp2_vec_cuda(bq2->qs[group]);
+        if (group < QI_ROCMFP2/2) {
+            sumi0 = ggml_cuda_dp4a(values, q8[group], sumi0);
+        } else {
+            sumi1 = ggml_cuda_dp4a(values, q8[group], sumi1);
+        }
+    }
+    const float db = __low2float(bq8_1->ds);
+    return db * (rocmfpx_ue4m3_to_fp32_finite(bq2->e[0]) * sumi0 + rocmfpx_ue4m3_to_fp32_finite(bq2->e[1]) * sumi1);
+#endif
 }
 
 static __device__ __forceinline__ float vec_dot_rocmfpx_fp6_q8_1(

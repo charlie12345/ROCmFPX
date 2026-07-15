@@ -178,7 +178,9 @@ struct common_speculative_impl {
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
-    virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+    virtual bool set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) { return true; }
+    virtual bool state_required() const { return false; }
+    virtual void shift_state(llama_seq_id /*seq_id*/, llama_pos /*delta*/) {}
 
     // true if this implementation requires the target context to extract post-norm embeddings
     virtual bool need_embd() const = 0;
@@ -912,15 +914,23 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         return true;
     }
 
-    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
-        if (!need_boundary_stash()) {
-            return;
-        }
+    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-            return;
+            return false;
+        }
+        if (data.empty()) {
+            pending_pos_last[seq_id] = -1;
+            std::fill(pending_g_last[seq_id].begin(), pending_g_last[seq_id].end(), 0.0f);
+            verify_g[seq_id].clear();
+            verify_pos_first[seq_id] = -1;
+            verify_g_rows[seq_id] = 0;
+            return !need_boundary_stash();
+        }
+        if (!need_boundary_stash()) {
+            return true;
         }
         if (data.size() != sizeof(llama_pos) + (size_t) n_embd_dec * sizeof(float)) {
-            return;
+            return false;
         }
 
         llama_pos pos = -1;
@@ -929,6 +939,24 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         pending_pos_last[seq_id] = pos;
         pending_g_last[seq_id].resize(n_embd_dec);
         std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
+        return true;
+    }
+
+    bool state_required() const override {
+        return need_boundary_stash();
+    }
+
+    void shift_state(llama_seq_id seq_id, llama_pos delta) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || delta == 0) {
+            return;
+        }
+
+        if (pending_pos_last[seq_id] >= 0) {
+            pending_pos_last[seq_id] += delta;
+        }
+        if (verify_pos_first[seq_id] >= 0) {
+            verify_pos_first[seq_id] += delta;
+        }
     }
 
     bool need_embd() const override {
@@ -1263,6 +1291,18 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     // The last h-row of one process() call needs the first token of the NEXT
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
+    std::vector<std::vector<float>> pending_h_prev;
+    std::vector<uint8_t> pending_h_valid;
+    std::vector<uint8_t> pending_h_prev_valid;
+    std::vector<llama_pos> pending_h_pos;
+    std::vector<llama_pos> pending_h_prev_pos;
+
+    // Boundary selected for the most recent process() batch. This is needed
+    // when verification accepts row zero, and when a one-token replay advances
+    // the current boundary while retaining the prior one.
+    std::vector<std::vector<float>> process_boundary_h;
+    std::vector<uint8_t> process_boundary_valid;
+    std::vector<llama_pos> process_boundary_pos;
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1271,6 +1311,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
+    std::vector<llama_pos> verify_pos_first;
 
     // Per-seq draft length from the last draft() call, used in accept() to
     // roll back ctx_dft's recurrent state past the AR draft's redundant
@@ -1356,6 +1397,15 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         }
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_h_prev.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_h_valid.assign(n_seq, 0);
+        pending_h_prev_valid.assign(n_seq, 0);
+        pending_h_pos.assign(n_seq, -1);
+        pending_h_prev_pos.assign(n_seq, -1);
+
+        process_boundary_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        process_boundary_valid.assign(n_seq, 0);
+        process_boundary_pos.assign(n_seq, -1);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1366,6 +1416,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
             h.reserve((size_t) std::max<int32_t>(1, this->params.n_max) * n_embd);
         }
         verify_h_rows.assign(n_seq, 0);
+        verify_pos_first.assign(n_seq, -1);
 
         last_n_drafted.assign(n_seq, 0);
         drafting.assign(n_seq, 0);
@@ -1423,6 +1474,9 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
         std::fill(verify_h_rows.begin(), verify_h_rows.end(), 0);
+        std::fill(verify_pos_first.begin(), verify_pos_first.end(), -1);
+        std::fill(process_boundary_valid.begin(), process_boundary_valid.end(), 0);
+        std::fill(process_boundary_pos.begin(), process_boundary_pos.end(), -1);
 
         for (int k = 0; k < n_tokens; ++k) {
             GGML_ASSERT(batch_in.n_seq_id[k] == 1);
@@ -1478,7 +1532,37 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+            const llama_pos pos_needed = batch_in.pos[i_batch_beg[seq_id]] - 1;
+            const float * h_boundary = nullptr;
+            if (pending_h_valid[seq_id] && pending_h_pos[seq_id] == pos_needed) {
+                h_boundary = pending_h[seq_id].data();
+            } else if (pending_h_prev_valid[seq_id] && pending_h_prev_pos[seq_id] == pos_needed) {
+                h_boundary = pending_h_prev[seq_id].data();
+            } else if (pos_needed < 0) {
+                // A new request can reach BOS without prompt_clear(), notably
+                // through an explicit id_slot or with prompt caching disabled.
+                // Never reuse the prior request's deferred MTP boundary there.
+                std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+                std::fill(pending_h_prev[seq_id].begin(), pending_h_prev[seq_id].end(), 0.0f);
+                pending_h_valid[seq_id] = 0;
+                pending_h_prev_valid[seq_id] = 0;
+                pending_h_pos[seq_id] = -1;
+                pending_h_prev_pos[seq_id] = -1;
+                h_boundary = pending_h[seq_id].data();
+            } else {
+                LOG_ERR("%s: missing MTP boundary for seq_id=%d pos=%d (current=%d/%d previous=%d/%d)\n",
+                        __func__, (int) seq_id, (int) pos_needed,
+                        (int) pending_h_pos[seq_id], (int) pending_h_valid[seq_id],
+                        (int) pending_h_prev_pos[seq_id], (int) pending_h_prev_valid[seq_id]);
+                return false;
+            }
+
+            set_h(i_batch_beg[seq_id], h_boundary);
+            if (pos_needed >= 0) {
+                std::memcpy(process_boundary_h[seq_id].data(), h_boundary, row_bytes);
+                process_boundary_valid[seq_id] = 1;
+                process_boundary_pos[seq_id] = pos_needed;
+            }
         }
 
         auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1523,13 +1607,33 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             const float * h_seq = h_tgt + (size_t) i_batch_beg[seq_id] * n_embd;
+            const llama_pos pos_last = batch_in.pos[i_batch_end[seq_id]];
+
+            if (n_rows > 1) {
+                const float * h_prev = h_seq + (size_t) (n_rows - 2) * n_embd;
+                std::memcpy(pending_h_prev[seq_id].data(), h_prev, row_bytes);
+                pending_h_prev_valid[seq_id] = 1;
+                pending_h_prev_pos[seq_id] = batch_in.pos[i_batch_end[seq_id] - 1];
+            } else if (process_boundary_valid[seq_id]) {
+                std::memcpy(pending_h_prev[seq_id].data(), process_boundary_h[seq_id].data(), row_bytes);
+                pending_h_prev_valid[seq_id] = 1;
+                pending_h_prev_pos[seq_id] = process_boundary_pos[seq_id];
+            } else {
+                std::fill(pending_h_prev[seq_id].begin(), pending_h_prev[seq_id].end(), 0.0f);
+                pending_h_prev_valid[seq_id] = 0;
+                pending_h_prev_pos[seq_id] = -1;
+            }
+
             if (last_n_drafted[seq_id] == 0) {
                 const float * h_last = h_seq + (size_t) (n_rows - 1) * n_embd;
                 std::memcpy(pending_h[seq_id].data(), h_last, row_bytes);
+                pending_h_valid[seq_id] = 1;
+                pending_h_pos[seq_id] = pos_last;
                 continue;
             }
 
             verify_h_rows[seq_id] = n_rows;
+            verify_pos_first[seq_id] = batch_in.pos[i_batch_beg[seq_id]];
             const size_t n_verify_floats = (size_t) (n_rows - 1) * n_embd;
             if (verify_h[seq_id].size() < n_verify_floats) {
                 verify_h[seq_id].resize(n_verify_floats);
@@ -1540,6 +1644,8 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
             const float * h_last = h_seq + (size_t) (n_rows - 1) * n_embd;
             std::memcpy(pending_h[seq_id].data(), h_last, row_bytes);
+            pending_h_valid[seq_id] = 1;
+            pending_h_pos[seq_id] = pos_last;
         }
 
         return true;
@@ -1564,6 +1670,15 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
             }
 
             last_n_drafted[seq_id] = 0;
+
+            const llama_pos pos_needed = dp.n_past - 1;
+            if (!pending_h_valid[seq_id] || pending_h_pos[seq_id] != pos_needed) {
+                LOG_WRN("%s: disabling MTP draft for seq_id=%d: boundary pos=%d/%d, needed=%d\n",
+                        __func__, (int) seq_id, (int) pending_h_pos[seq_id],
+                        (int) pending_h_valid[seq_id], (int) pos_needed);
+                dp.drafting = false;
+                continue;
+            }
 
             n_drafting++;
             drafting[seq_id] = 1;
@@ -1724,11 +1839,149 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
         if (i_h != n_rows - 1) {
-            const size_t row_bytes = (size_t) n_embd * sizeof(float);
             std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
         }
+        pending_h_valid[seq_id] = 1;
+        pending_h_pos[seq_id] = verify_pos_first[seq_id] + i_h;
+
+        if (i_h == 0) {
+            if (process_boundary_valid[seq_id]) {
+                std::memcpy(pending_h_prev[seq_id].data(), process_boundary_h[seq_id].data(), row_bytes);
+                pending_h_prev_valid[seq_id] = 1;
+                pending_h_prev_pos[seq_id] = process_boundary_pos[seq_id];
+            } else {
+                std::fill(pending_h_prev[seq_id].begin(), pending_h_prev[seq_id].end(), 0.0f);
+                pending_h_prev_valid[seq_id] = 0;
+                pending_h_prev_pos[seq_id] = -1;
+            }
+        } else {
+            std::memcpy(pending_h_prev[seq_id].data(), verify_h[seq_id].data() + (size_t) (i_h - 1) * n_embd, row_bytes);
+            pending_h_prev_valid[seq_id] = 1;
+            pending_h_prev_pos[seq_id] = verify_pos_first[seq_id] + i_h - 1;
+        }
         last_n_drafted[seq_id] = 0;
+    }
+
+    static constexpr uint32_t MTP_STATE_MAGIC       = 0x3250544d; // "MTP2" in little-endian byte order
+    static constexpr uint16_t MTP_STATE_VERSION     = 2;
+    static constexpr uint16_t MTP_STATE_CURRENT     = 1u << 0;
+    static constexpr uint16_t MTP_STATE_PREVIOUS    = 1u << 1;
+    static constexpr size_t   MTP_STATE_HEADER      = sizeof(uint32_t) + 2*sizeof(uint16_t) + sizeof(uint32_t) + 2*sizeof(llama_pos);
+
+    void reset_seq_state(llama_seq_id seq_id) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        std::fill(pending_h_prev[seq_id].begin(), pending_h_prev[seq_id].end(), 0.0f);
+        pending_h_valid[seq_id] = 0;
+        pending_h_prev_valid[seq_id] = 0;
+        pending_h_pos[seq_id] = -1;
+        pending_h_prev_pos[seq_id] = -1;
+        std::fill(process_boundary_h[seq_id].begin(), process_boundary_h[seq_id].end(), 0.0f);
+        process_boundary_valid[seq_id] = 0;
+        process_boundary_pos[seq_id] = -1;
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        verify_pos_first[seq_id] = -1;
+        last_n_drafted[seq_id] = 0;
+        drafting[seq_id] = 0;
+        i_last[seq_id] = -1;
+        if (chain_heads) {
+            chain_h[seq_id].clear();
+        }
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        data.clear();
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || !pending_h_valid[seq_id]) {
+            return false;
+        }
+
+        const uint16_t flags = MTP_STATE_CURRENT |
+            (pending_h_prev_valid[seq_id] ? MTP_STATE_PREVIOUS : 0);
+        const uint32_t width = (uint32_t) n_embd;
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        data.resize(MTP_STATE_HEADER + 2*row_bytes);
+
+        size_t off = 0;
+        std::memcpy(data.data() + off, &MTP_STATE_MAGIC,   sizeof(MTP_STATE_MAGIC));   off += sizeof(MTP_STATE_MAGIC);
+        std::memcpy(data.data() + off, &MTP_STATE_VERSION, sizeof(MTP_STATE_VERSION)); off += sizeof(MTP_STATE_VERSION);
+        std::memcpy(data.data() + off, &flags,             sizeof(flags));             off += sizeof(flags);
+        std::memcpy(data.data() + off, &width,             sizeof(width));             off += sizeof(width);
+        std::memcpy(data.data() + off, &pending_h_pos[seq_id],      sizeof(llama_pos)); off += sizeof(llama_pos);
+        std::memcpy(data.data() + off, &pending_h_prev_pos[seq_id], sizeof(llama_pos)); off += sizeof(llama_pos);
+        std::memcpy(data.data() + off, pending_h[seq_id].data(), row_bytes); off += row_bytes;
+        std::memcpy(data.data() + off, pending_h_prev[seq_id].data(), row_bytes);
+        return true;
+    }
+
+    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        reset_seq_state(seq_id);
+        if (data.empty() || data.size() < MTP_STATE_HEADER) {
+            return false;
+        }
+
+        uint32_t magic = 0;
+        uint16_t version = 0;
+        uint16_t flags = 0;
+        uint32_t width = 0;
+        llama_pos pos_current = -1;
+        llama_pos pos_previous = -1;
+        size_t off = 0;
+        std::memcpy(&magic,   data.data() + off, sizeof(magic));   off += sizeof(magic);
+        std::memcpy(&version, data.data() + off, sizeof(version)); off += sizeof(version);
+        std::memcpy(&flags,   data.data() + off, sizeof(flags));   off += sizeof(flags);
+        std::memcpy(&width,   data.data() + off, sizeof(width));   off += sizeof(width);
+        std::memcpy(&pos_current,  data.data() + off, sizeof(pos_current));  off += sizeof(pos_current);
+        std::memcpy(&pos_previous, data.data() + off, sizeof(pos_previous)); off += sizeof(pos_previous);
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (magic != MTP_STATE_MAGIC || version != MTP_STATE_VERSION ||
+            (flags & MTP_STATE_CURRENT) == 0 || (flags & ~(MTP_STATE_CURRENT | MTP_STATE_PREVIOUS)) != 0 ||
+            width != (uint32_t) n_embd || pos_current < 0 ||
+            ((flags & MTP_STATE_PREVIOUS) != 0 && pos_previous < 0) ||
+            data.size() != MTP_STATE_HEADER + 2*row_bytes) {
+            return false;
+        }
+
+        std::memcpy(pending_h[seq_id].data(), data.data() + off, row_bytes); off += row_bytes;
+        std::memcpy(pending_h_prev[seq_id].data(), data.data() + off, row_bytes);
+        pending_h_valid[seq_id] = 1;
+        pending_h_prev_valid[seq_id] = (flags & MTP_STATE_PREVIOUS) != 0;
+        pending_h_pos[seq_id] = pos_current;
+        pending_h_prev_pos[seq_id] = pending_h_prev_valid[seq_id] ? pos_previous : -1;
+        return true;
+    }
+
+    bool state_required() const override {
+        return true;
+    }
+
+    void shift_state(llama_seq_id seq_id, llama_pos delta) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || delta == 0) {
+            return;
+        }
+
+        if (pending_h_valid[seq_id]) {
+            pending_h_pos[seq_id] += delta;
+        }
+        if (pending_h_prev_valid[seq_id]) {
+            pending_h_prev_pos[seq_id] += delta;
+        }
+        if (process_boundary_valid[seq_id]) {
+            process_boundary_pos[seq_id] += delta;
+        }
+        if (verify_h_rows[seq_id] > 0 && verify_pos_first[seq_id] >= 0) {
+            verify_pos_first[seq_id] += delta;
+        }
     }
 
     bool need_embd() const override {
@@ -2610,13 +2863,45 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
     return false;
 }
 
-void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
     if (spec == nullptr) {
+        return true;
+    }
+
+    bool ok = true;
+    for (auto & impl : spec->impls) {
+        const bool restored = impl->set_state(seq_id, data);
+        ok = ok && (!impl->state_required() || restored);
+    }
+
+    if (seq_id >= 0 && seq_id < (llama_seq_id) spec->dparams.size()) {
+        spec->dparams[seq_id].drafting = false;
+    }
+
+    return ok;
+}
+
+bool common_speculative_state_required(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (impl->state_required()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void common_speculative_shift_state(common_speculative * spec, llama_seq_id seq_id, llama_pos delta) {
+    if (spec == nullptr || delta == 0) {
         return;
     }
 
     for (auto & impl : spec->impls) {
-        impl->set_state(seq_id, data);
+        impl->shift_state(seq_id, delta);
     }
 }
 

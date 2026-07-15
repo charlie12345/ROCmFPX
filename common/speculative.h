@@ -70,7 +70,11 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
-void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+bool common_speculative_state_required(const common_speculative * spec);
+
+// rebase per-sequence positions after the corresponding target/draft contexts shift
+void common_speculative_shift_state(common_speculative * spec, llama_seq_id seq_id, llama_pos delta);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

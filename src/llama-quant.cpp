@@ -425,6 +425,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q4_0_ROCMFP4:
             case GGML_TYPE_Q4_0_ROCMFP4_FAST: return_type = GGML_TYPE_Q4_0; break;
             case GGML_TYPE_Q3_0_ROCMFPX:
+            case GGML_TYPE_Q2_0_ROCMFPX:
             case GGML_TYPE_Q6_0_ROCMFPX:
             case GGML_TYPE_Q8_0_ROCMFPX: return_type = GGML_TYPE_Q8_0; break;
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
@@ -1197,6 +1198,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX: return GGML_TYPE_Q4_0_ROCMFP4_FAST;
         case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN: return GGML_TYPE_Q4_0_ROCMFP4_FAST;
         case LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX: return GGML_TYPE_Q3_0_ROCMFPX;
+        case LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX: return GGML_TYPE_Q2_0_ROCMFPX;
         case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX: return GGML_TYPE_Q6_0_ROCMFPX;
         case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN: return GGML_TYPE_Q6_0_ROCMFPX;
         case LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX: return GGML_TYPE_Q8_0_ROCMFPX;
@@ -1590,6 +1592,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const int64_t nelements = ggml_nelements(tensor);
 
                 const float * imatrix = nullptr;
+                std::vector<float> neutral_imatrix;
                 if (imatrix_data) {
                     auto it = imatrix_data->find(tm.remapped_imatrix_name);
                     if (it == imatrix_data->end()) {
@@ -1611,6 +1614,16 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                             }
                         }
                     }
+                }
+                if (!imatrix && params->pure &&
+                    (new_type == GGML_TYPE_IQ2_XXS || new_type == GGML_TYPE_IQ2_XS || new_type == GGML_TYPE_IQ2_S)) {
+                    // A literal-pure IQ2 artifact cannot use the normal protected-tensor
+                    // fallback. Treat tensors absent from a partial calibration matrix as
+                    // unweighted by assigning equal importance to every input column.
+                    // Calibrated tensors continue to use their published importance values.
+                    neutral_imatrix.assign((size_t) tensor->ne[0] * tensor->ne[2], 1.0f);
+                    imatrix = neutral_imatrix.data();
+                    LLAMA_LOG_WARN("Using neutral uniform importance weights for missing pure-IQ2 tensor %s\n", tensor->name);
                 }
                 if (!imatrix && tm.requires_imatrix) {
                     LLAMA_LOG_ERROR("\n\n============================================================\n");

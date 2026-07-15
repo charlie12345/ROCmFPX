@@ -128,21 +128,41 @@ struct server_slot {
         SRV_WRN(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
-        if (cur == nullptr) {
+        std::vector<uint8_t> state_spec;
+        const bool spec_state_required = common_speculative_state_required(spec);
+        const bool have_spec_state = common_speculative_get_state(spec, id, state_spec);
+        if (spec_state_required && !have_spec_state) {
+            SLT_WRN(*this, "%s", "skipping prompt cache save: required speculative state is unavailable\n");
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        }
-
-        return true;
+        return prompt_cache.save(prompt, ctx_tgt, ctx_dft, id, state_spec);
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        const bool spec_state_required = common_speculative_state_required(spec);
+        bool cache_hit = false;
+        uint64_t disk_entry_id = 0;
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, spec_state_required, &cache_hit, &disk_entry_id);
+        if (res && cache_hit) {
+            if (spec_state_required && prompt.data.spec.empty()) {
+                SLT_WRN(*this, "%s", "failed to load required speculative state from prompt cache\n");
+                res = false;
+            } else if (!prompt.data.spec.empty() && !common_speculative_set_state(spec, id, prompt.data.spec)) {
+                SLT_WRN(*this, "%s", "failed to validate speculative state from prompt cache\n");
+                res = false;
+            }
+
+            prompt.data.spec.clear();
+            prompt.data.spec.shrink_to_fit();
+        }
+        if (disk_entry_id != 0) {
+            if (res) {
+                prompt_cache.accept_disk_load(disk_entry_id);
+            } else {
+                prompt_cache.reject_disk_load(disk_entry_id, "spec-state-rejected");
+            }
+        }
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -161,6 +181,7 @@ struct server_slot {
         if (ctx_dft) {
             common_context_seq_rm(ctx_dft, id, -1, -1);
         }
+        common_speculative_set_state(spec, id, {});
 
         prompt.tokens.clear();
     }
@@ -1008,17 +1029,29 @@ private:
             batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
         }
 
-        if (params_base.cache_ram_mib != 0) {
-            if (params_base.cache_ram_mib < 0) {
-                SRV_INF("prompt cache is enabled, size limit: %s\n", "no limit");
-            } else {
-                SRV_INF("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
-            }
-            SRV_INF("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+        const bool cache_disk_enabled = !params_base.cache_disk_path.empty() && params_base.cache_disk_limit_mib > 0;
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+        if (params_base.cache_ram_mib != 0 || cache_disk_enabled) {
+            if (params_base.cache_ram_mib < 0) {
+                SRV_INF("prompt cache RAM enabled: limit=%s\n", "unlimited");
+            } else if (params_base.cache_ram_mib > 0) {
+                SRV_INF("prompt cache RAM enabled: limit_mib=%d\n", params_base.cache_ram_mib);
+            } else {
+                SRV_INF("%s", "prompt cache RAM disabled: limit_mib=0\n");
+            }
+
+            if (cache_disk_enabled) {
+                SRV_INF("prompt cache SSD enabled: path=%s limit_mib=%d target_and_draft=true\n",
+                        params_base.cache_disk_path.c_str(), params_base.cache_disk_limit_mib);
+            }
+
+            prompt_cache = std::make_unique<server_prompt_cache>(
+                params_base.cache_ram_mib,
+                n_ctx,
+                params_base.cache_disk_path,
+                params_base.cache_disk_limit_mib);
         } else {
-            SRV_INF("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+            SRV_INF("%s", "prompt cache is disabled - use `--cache-ram N` or `--cache-disk PATH` to enable it\n");
         }
         SRV_INF("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1067,8 +1100,8 @@ private:
         metrics.init();
 
         if (params_base.cache_idle_slots) {
-            if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
+            if (!prompt_cache) {
+                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram or --cache-disk, disabling\n");
                 params_base.cache_idle_slots = false;
             } else {
                 if (params_base.kv_unified) {
@@ -1235,6 +1268,8 @@ private:
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear(false);
+                    SRV_INF("prompt cache cold fallback: slot=%d reason=target-draft-restore-rejected target_and_draft_cleared=true\n",
+                            ret->id);
                 }
 
                 prompt_cache->update();
@@ -1983,14 +2018,17 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_INF(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                const bool safe_to_clear = slot.prompt_save(*prompt_cache);
+                                if (safe_to_clear) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
-                                }
 
-                                if (params_base.kv_unified) {
-                                    // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear(false);
+                                    if (params_base.kv_unified) {
+                                        // [TAG_IDLE_SLOT_CLEAR]
+                                        slot.prompt_clear(false);
+                                    }
+                                } else if (!slot.prompt.tokens.empty()) {
+                                    SLT_WRN(slot, "%s", "preserving idle slot because prompt cache save was not safe\n");
                                 }
                             }
                         }
@@ -2286,6 +2324,8 @@ private:
                     common_context_seq_rm (ctx_dft.get(), slot.id, n_keep            , n_keep + n_discard);
                     common_context_seq_add(ctx_dft.get(), slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
                 }
+
+                common_speculative_shift_state(spec.get(), slot.id, -n_discard);
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -2635,6 +2675,20 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                            }
+
+                            // MTP carries only the endpoint and immediately preceding target hidden
+                            // boundaries. Arbitrary partial-prefix rollback cannot be reconstructed
+                            // from target/draft KV state, so reprocess cold instead of pairing a token
+                            // with the wrong hidden row. Full-prefix extension and the exact-hit
+                            // one-token replay below remain supported.
+                            if (common_speculative_state_required(spec.get()) &&
+                                n_past > 0 && n_past < slot.prompt.n_tokens()) {
+                                SLT_INF(slot,
+                                        "prompt cache cold fallback: reason=spec-boundary-mismatch lcp=%d cached_tokens=%d request_tokens=%d\n",
+                                        n_past, slot.prompt.n_tokens(), slot.task->n_tokens());
+                                n_past = 0;
+                                common_speculative_set_state(spec.get(), slot.id, {});
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);

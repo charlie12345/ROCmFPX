@@ -10,6 +10,22 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <cerrno>
+#include <cinttypes>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <limits>
+#include <system_error>
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
 using json = nlohmann::ordered_json;
 
 //
@@ -1962,6 +1978,319 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+namespace {
+
+namespace fs = std::filesystem;
+
+constexpr const char * SERVER_PROMPT_CACHE_DISK_NAMESPACE = ".llama-prompt-cache-v1";
+constexpr const char * SERVER_PROMPT_CACHE_OWNER_MAGIC = "llama.cpp automatic prompt cache v1";
+
+static bool server_prompt_cache_disk_owned(const fs::path & path) {
+    std::ifstream owner(path / ".owner");
+    std::string magic;
+    return owner.good() && std::getline(owner, magic) && magic == SERVER_PROMPT_CACHE_OWNER_MAGIC;
+}
+
+static bool server_prompt_cache_disk_remove_file(const std::string & path) {
+    if (path.empty()) {
+        return true;
+    }
+
+    std::error_code ec;
+    fs::remove(path, ec);
+    if (ec) {
+        SRV_WRN("prompt cache disk cleanup failed: path=%s error=%s\n", path.c_str(), ec.message().c_str());
+        return false;
+    }
+
+    // A missing file already satisfies the desired postcondition. This also
+    // lets a later retry finish a pair after an earlier partial removal.
+    return true;
+}
+
+static bool server_prompt_cache_disk_size_exact(
+        const std::string & path,
+                    size_t expected,
+                    size_t * actual_out = nullptr) {
+    if (path.empty()) {
+        if (actual_out != nullptr) {
+            *actual_out = 0;
+        }
+        return expected == 0;
+    }
+
+    std::error_code ec;
+    const uintmax_t actual = fs::file_size(path, ec);
+    if (ec || actual > std::numeric_limits<size_t>::max()) {
+        if (actual_out != nullptr) {
+            *actual_out = 0;
+        }
+        return false;
+    }
+
+    if (actual_out != nullptr) {
+        *actual_out = (size_t) actual;
+    }
+    return (size_t) actual == expected;
+}
+
+// llama_state_seq_save_file() closes the file before returning. Reopen it to
+// force dirty pages to stable storage and immediately mark the cold state as
+// reclaimable. This avoids replacing anonymous cache pressure with several GiB
+// of sticky buffered page cache on UMA systems.
+static bool server_prompt_cache_disk_flush_and_drop(const std::string & path, bool durable) {
+#if !defined(_WIN32)
+    const int fd = open(path.c_str(), (durable ? O_RDWR : O_RDONLY) | O_CLOEXEC);
+    if (fd < 0) {
+        SRV_ERR("prompt cache disk open failed: path=%s error=%s\n", path.c_str(), std::strerror(errno));
+        return false;
+    }
+
+    bool ok = true;
+    if (durable && fdatasync(fd) != 0) {
+        SRV_ERR("prompt cache disk fdatasync failed: path=%s error=%s\n", path.c_str(), std::strerror(errno));
+        ok = false;
+    }
+
+#if defined(POSIX_FADV_DONTNEED)
+    const int err = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    if (err != 0) {
+        SRV_WRN("prompt cache disk fadvise failed: path=%s error=%s\n", path.c_str(), std::strerror(err));
+    }
+#endif
+
+    close(fd);
+    return ok;
+#else
+    GGML_UNUSED(path);
+    GGML_UNUSED(durable);
+    return true;
+#endif
+}
+
+static bool server_prompt_cache_disk_sync_dir(const std::string & path) {
+#if !defined(_WIN32)
+    const int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        SRV_ERR("prompt cache disk directory open failed: path=%s error=%s\n", path.c_str(), std::strerror(errno));
+        return false;
+    }
+
+    const bool ok = fsync(fd) == 0;
+    if (!ok) {
+        SRV_ERR("prompt cache disk directory fsync failed: path=%s error=%s\n", path.c_str(), std::strerror(errno));
+    }
+    close(fd);
+    return ok;
+#else
+    GGML_UNUSED(path);
+    return true;
+#endif
+}
+
+static bool server_prompt_cache_tokens_equal(const server_tokens & expected, const llama_tokens & actual) {
+    return expected.get_tokens() == actual;
+}
+
+} // namespace
+
+server_prompt_cache::server_prompt_cache(
+        int32_t limit_size_mib,
+         size_t limit_tokens,
+    const std::string & disk_base_path,
+        int32_t disk_limit_size_mib) {
+    ram_enabled       = limit_size_mib != 0;
+    limit_size        = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+    this->limit_tokens = limit_tokens;
+
+    if (disk_base_path.empty() || disk_limit_size_mib <= 0) {
+        return;
+    }
+
+    disk_limit_size = 1024ull*1024ull*disk_limit_size_mib;
+
+    std::error_code ec;
+    fs::path base = fs::absolute(disk_base_path, ec);
+    if (ec) {
+        throw std::runtime_error("unable to resolve prompt cache disk path '" + disk_base_path + "': " + ec.message());
+    }
+
+    fs::create_directories(base, ec);
+    if (ec || !fs::is_directory(base)) {
+        throw std::runtime_error("unable to create prompt cache disk path '" + base.string() + "': " + ec.message());
+    }
+
+    const fs::path cache_root = base / SERVER_PROMPT_CACHE_DISK_NAMESPACE;
+    fs::create_directories(cache_root, ec);
+    if (ec || !fs::is_directory(cache_root)) {
+        throw std::runtime_error("unable to create prompt cache namespace '" + cache_root.string() + "': " + ec.message());
+    }
+    fs::permissions(cache_root, fs::perms::owner_all, fs::perm_options::replace, ec);
+    if (ec) {
+        throw std::runtime_error("unable to secure prompt cache namespace '" + cache_root.string() + "': " + ec.message());
+    }
+
+    // An OOM/SIGKILL cannot run the destructor. Each run therefore holds an
+    // advisory lock in a magic-marked directory. A later server removes only
+    // marked run-* directories whose lock is no longer held.
+    for (const auto & entry : fs::directory_iterator(cache_root, ec)) {
+        if (ec) {
+            break;
+        }
+        const auto name = entry.path().filename().string();
+        const bool is_run_dir      = name.rfind("run-", 0) == 0;
+        const bool is_deleting_dir = name.rfind(".deleting-run-", 0) == 0;
+        if (!entry.is_directory() || (!is_run_dir && !is_deleting_dir) || !server_prompt_cache_disk_owned(entry.path())) {
+            continue;
+        }
+
+#if !defined(_WIN32)
+        const fs::path lock_path = entry.path() / ".lock";
+        const int fd = open(lock_path.c_str(), O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            continue;
+        }
+        const bool stale = flock(fd, LOCK_EX | LOCK_NB) == 0;
+        if (stale) {
+            flock(fd, LOCK_UN);
+        }
+        close(fd);
+        if (!stale) {
+            continue;
+        }
+#else
+        // Without an advisory-lock primitive, preserve old directories rather
+        // than risk deleting a live cache owned by another process.
+        continue;
+#endif
+
+        const auto stale_path = entry.path().string();
+        std::error_code rm_ec;
+        const auto removed = fs::remove_all(entry.path(), rm_ec);
+        if (!rm_ec) {
+            SRV_INF("prompt cache disk stale cleanup: path=%s files=%zu\n", stale_path.c_str(), (size_t) removed);
+        }
+    }
+
+    const auto stamp = (uint64_t) std::chrono::high_resolution_clock::now().time_since_epoch().count();
+#if !defined(_WIN32)
+    const auto pid = (uint64_t) getpid();
+#else
+    const uint64_t pid = 0;
+#endif
+
+    fs::path owned;
+    for (uint32_t suffix = 0; suffix < 1000; ++suffix) {
+        owned = cache_root / ("run-" + std::to_string(pid) + "-" + std::to_string(stamp) + "-" + std::to_string(suffix));
+        if (fs::create_directory(owned, ec)) {
+            break;
+        }
+        if (ec && ec != std::errc::file_exists) {
+            throw std::runtime_error("unable to create owned prompt cache directory '" + owned.string() + "': " + ec.message());
+        }
+        ec.clear();
+        owned.clear();
+    }
+    if (owned.empty() || !fs::is_directory(owned)) {
+        throw std::runtime_error("unable to allocate a unique prompt cache run directory below '" + cache_root.string() + "'");
+    }
+
+    fs::permissions(owned, fs::perms::owner_all, fs::perm_options::replace, ec);
+    if (ec) {
+        fs::remove_all(owned);
+        throw std::runtime_error("unable to secure owned prompt cache directory '" + owned.string() + "': " + ec.message());
+    }
+
+#if !defined(_WIN32)
+    // Publish and hold the lock before publishing .owner. Stale cleanup only
+    // considers magic-marked directories, so another startup can never see an
+    // owned directory in the window before this process has acquired its lock.
+    const fs::path lock_path = owned / ".lock";
+    disk_lock_fd = open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (disk_lock_fd < 0 || flock(disk_lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        if (disk_lock_fd >= 0) {
+            close(disk_lock_fd);
+            disk_lock_fd = -1;
+        }
+        fs::remove_all(owned);
+        throw std::runtime_error("unable to lock owned prompt cache directory '" + owned.string() + "'");
+    }
+#else
+    {
+        std::ofstream lock(owned / ".lock", std::ios::out | std::ios::trunc);
+        if (!lock.good()) {
+            fs::remove_all(owned);
+            throw std::runtime_error("unable to create prompt cache lock file in '" + owned.string() + "'");
+        }
+    }
+#endif
+
+    {
+        std::ofstream owner(owned / ".owner", std::ios::out | std::ios::trunc);
+        owner << SERVER_PROMPT_CACHE_OWNER_MAGIC << '\n'
+              << "pid=" << pid << '\n'
+              << "created=" << stamp << '\n';
+        owner.flush();
+        if (!owner.good()) {
+#if !defined(_WIN32)
+            flock(disk_lock_fd, LOCK_UN);
+            close(disk_lock_fd);
+            disk_lock_fd = -1;
+#endif
+            fs::remove_all(owned);
+            throw std::runtime_error("unable to write prompt cache ownership manifest in '" + owned.string() + "'");
+        }
+    }
+    fs::permissions(owned / ".owner", fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
+    if (ec) {
+#if !defined(_WIN32)
+        flock(disk_lock_fd, LOCK_UN);
+        close(disk_lock_fd);
+        disk_lock_fd = -1;
+#endif
+        fs::remove_all(owned);
+        throw std::runtime_error("unable to secure prompt cache ownership manifest in '" + owned.string() + "': " + ec.message());
+    }
+
+    this->disk_base_path  = base.string();
+    this->disk_owned_path = owned.string();
+
+    SRV_INF("prompt cache disk enabled: path=%s owned_path=%s limit_mib=%d\n",
+            this->disk_base_path.c_str(), this->disk_owned_path.c_str(), disk_limit_size_mib);
+}
+
+server_prompt_cache::~server_prompt_cache() {
+    if (disk_owned_path.empty()) {
+        return;
+    }
+
+    SRV_INF("prompt cache disk cleanup: path=%s entries=%zu bytes=%zu saves=%" PRIu64 " loads=%" PRIu64 " evictions=%" PRIu64 "\n",
+            disk_owned_path.c_str(), disk_states.size(), disk_size_total, disk_saves, disk_loads, disk_evictions);
+
+    fs::path cleanup_path = disk_owned_path;
+    std::error_code ec;
+    const fs::path trash_path = cleanup_path.parent_path() / (".deleting-" + cleanup_path.filename().string());
+    fs::rename(cleanup_path, trash_path, ec);
+    if (!ec) {
+        cleanup_path = trash_path;
+    } else {
+        ec.clear();
+    }
+
+#if !defined(_WIN32)
+    if (disk_lock_fd >= 0) {
+        flock(disk_lock_fd, LOCK_UN);
+        close(disk_lock_fd);
+        disk_lock_fd = -1;
+    }
+#endif
+
+    fs::remove_all(cleanup_path, ec);
+    if (ec) {
+        SRV_WRN("prompt cache disk cleanup failed: path=%s error=%s\n", cleanup_path.string().c_str(), ec.message().c_str());
+    }
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1982,27 +2311,403 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+size_t server_prompt_cache::disk_size() const {
+    return disk_size_total;
+}
+
+size_t server_prompt_cache::disk_n_tokens() const {
+    size_t res = 0;
+    for (const auto & state : disk_states) {
+        res += state.n_tokens();
+    }
+    return res;
+}
+
+void server_prompt_cache::disable_disk_saves(const char * reason, const std::string & path) {
+    disk_save_failures++;
+    if (disk_save_disabled) {
+        return;
+    }
+
+    disk_save_disabled = true;
+    SRV_ERR("prompt cache disk writes disabled: reason=%s failures=%" PRIu64 " entries=%zu accounted_bytes=%zu path=%s cache_path=%s\n",
+            reason, disk_save_failures, disk_states.size(), disk_size_total,
+            path.empty() ? "-" : path.c_str(), disk_owned_path.c_str());
+}
+
+bool server_prompt_cache::save(
+        const server_prompt & prompt,
+              llama_context * ctx_main,
+              llama_context * ctx_drft,
+               llama_seq_id   id_slot,
+        const std::vector<uint8_t> & state_spec) {
+    bool saved = false;
+
+    if (!disk_owned_path.empty()) {
+        saved = save_disk(prompt, ctx_main, ctx_drft, id_slot, state_spec) || saved;
+    }
+
+    if (!ram_enabled) {
+        return saved;
+    }
+
+    const size_t state_size_main = llama_state_seq_get_size_ext(ctx_main, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const size_t state_size_drft = ctx_drft ? llama_state_seq_get_size_ext(ctx_drft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+    auto * cur = alloc(prompt, state_size_main, state_size_drft, state_spec);
+    if (cur == nullptr) {
+        return saved;
+    }
+
+    const size_t n_main = llama_state_seq_get_data_ext(
+        ctx_main, cur->data.main.data(), state_size_main, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    if (n_main != state_size_main) {
+        SRV_ERR("failed to save RAM prompt cache target state: expected=%zu saved=%zu\n", state_size_main, n_main);
+        states.pop_back();
+        return saved;
+    }
+
+    if (ctx_drft) {
+        const size_t n_drft = llama_state_seq_get_data_ext(
+            ctx_drft, cur->data.drft.data(), state_size_drft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (n_drft != state_size_drft) {
+            SRV_ERR("failed to save RAM prompt cache draft state: expected=%zu saved=%zu\n", state_size_drft, n_drft);
+            states.pop_back();
+            return saved;
+        }
+    }
+
+    return true;
+}
+
+bool server_prompt_cache::save_disk(
+        const server_prompt & prompt,
+              llama_context * ctx_main,
+              llama_context * ctx_drft,
+               llama_seq_id   id_slot,
+        const std::vector<uint8_t> & state_spec) {
+    if (disk_owned_path.empty() || disk_limit_size == 0 || prompt.tokens.empty()) {
+        return false;
+    }
+
+    if (prompt.tokens.has_mtmd) {
+        SRV_WRN("prompt cache disk skip: reason=multimodal tokens=%zu path=%s\n",
+                prompt.tokens.size(), disk_owned_path.c_str());
+        return false;
+    }
+
+    // If a usable cached prompt already contains the current stateless prompt,
+    // retain the more useful state without rewriting the SSD. Stateful MTP
+    // blobs are valid only at their exact token boundary, so they may touch an
+    // equal-token entry but never a longer containing entry.
+    for (auto it = disk_states.begin(); it != disk_states.end();) {
+        if (!it->usable) {
+            ++it;
+            continue;
+        }
+
+        const int lcp = it->tokens.get_common_prefix(prompt.tokens);
+        const bool exact_tokens = lcp == (int) prompt.tokens.size() && it->tokens.size() == prompt.tokens.size();
+        const bool can_touch = state_spec.empty()
+            ? lcp == (int) prompt.tokens.size()
+            : exact_tokens;
+        if (!can_touch) {
+            ++it;
+            continue;
+        }
+
+        const bool pair_shape_ok = !it->path_main.empty() && it->size_main > 0 &&
+            ((ctx_drft != nullptr) == (!it->path_drft.empty() && it->size_drft > 0));
+        const bool spec_shape_ok = state_spec.empty() || !it->spec.empty();
+        size_t actual_main = 0;
+        size_t actual_drft = 0;
+        const bool files_ok = pair_shape_ok && spec_shape_ok &&
+            server_prompt_cache_disk_size_exact(it->path_main, it->size_main, &actual_main) &&
+            server_prompt_cache_disk_size_exact(it->path_drft, it->size_drft, &actual_drft);
+        if (!files_ok) {
+            SRV_WRN("prompt cache disk touch rejected: entry=%" PRIu64 " reason=unusable-pair target_bytes=%zu target_actual=%zu draft_bytes=%zu draft_actual=%zu spec_bytes=%zu path=%s\n",
+                    it->id, it->size_main, actual_main, it->size_drft, actual_drft, it->spec.size(), disk_owned_path.c_str());
+            auto bad = it++;
+            bad->usable = false;
+            if (!erase_disk_state(bad, false, "touch-unusable")) {
+                disable_disk_saves("touch-unusable-removal", disk_owned_path);
+            }
+            continue;
+        }
+
+        {
+            const auto id = it->id;
+            disk_states.splice(disk_states.end(), disk_states, it);
+            SRV_INF("prompt cache disk touch: entry=%" PRIu64 " lcp=%d tokens=%zu exact=%s stateful=%s safe_to_clear=true path=%s\n",
+                    id, lcp, prompt.tokens.size(), exact_tokens ? "true" : "false",
+                    state_spec.empty() ? "false" : "true", disk_owned_path.c_str());
+            return true;
+        }
+    }
+
+    if (disk_save_disabled) {
+        SRV_DBG("prompt cache disk save skip: reason=circuit-open tokens=%zu path=%s\n",
+                prompt.tokens.size(), disk_owned_path.c_str());
+        return false;
+    }
+
+    const auto & tokens = prompt.tokens.get_tokens();
+    const size_t token_bytes = tokens.size()*sizeof(llama_token);
+    const size_t file_overhead = 3*sizeof(uint32_t) + token_bytes;
+    const size_t state_size_main = llama_state_seq_get_size_ext(ctx_main, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const size_t state_size_drft = ctx_drft ? llama_state_seq_get_size_ext(ctx_drft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+    const size_t predicted_main = state_size_main + file_overhead;
+    const size_t predicted_drft = ctx_drft ? state_size_drft + file_overhead : 0;
+    const size_t predicted_total = predicted_main + predicted_drft;
+
+    if (predicted_total > disk_limit_size) {
+        SRV_WRN("prompt cache disk skip: reason=oversize target_bytes=%zu draft_bytes=%zu total_bytes=%zu limit_bytes=%zu tokens=%zu path=%s\n",
+                predicted_main, predicted_drft, predicted_total, disk_limit_size, tokens.size(), disk_owned_path.c_str());
+        return false;
+    }
+
+    const uint64_t entry_id = disk_next_id++;
+    const fs::path owned = disk_owned_path;
+    const std::string stem = "state-" + std::to_string(entry_id);
+    const fs::path path_main_tmp = owned / (stem + "-target.bin.tmp");
+    const fs::path path_main     = owned / (stem + "-target.bin");
+    const fs::path path_drft_tmp = owned / (stem + "-draft.bin.tmp");
+    const fs::path path_drft     = owned / (stem + "-draft.bin");
+
+    const auto cleanup_temps = [&]() -> bool {
+        const bool main_ok = server_prompt_cache_disk_remove_file(path_main_tmp.string());
+        const bool drft_ok = server_prompt_cache_disk_remove_file(path_drft_tmp.string());
+        return main_ok && drft_ok;
+    };
+    const auto fail_io = [&](const char * reason, const std::string & path) -> bool {
+        const bool cleanup_ok = cleanup_temps();
+        disable_disk_saves(reason, path);
+        if (!cleanup_ok) {
+            disable_disk_saves("temporary-cleanup", disk_owned_path);
+        }
+        return false;
+    };
+
+    const int64_t t_start = ggml_time_us();
+
+    const size_t n_main = llama_state_seq_save_file(
+        ctx_main, path_main_tmp.c_str(), id_slot, tokens.data(), tokens.size());
+    size_t actual_main = 0;
+    if (n_main == 0 ||
+        !server_prompt_cache_disk_size_exact(path_main_tmp.string(), n_main, &actual_main) ||
+        !server_prompt_cache_disk_flush_and_drop(path_main_tmp.string(), true)) {
+        SRV_ERR("prompt cache disk save failed: entry=%" PRIu64 " component=target path=%s\n",
+                entry_id, path_main_tmp.c_str());
+        return fail_io("target-save", path_main_tmp.string());
+    }
+
+    size_t n_drft = 0;
+    if (ctx_drft) {
+        n_drft = llama_state_seq_save_file(
+            ctx_drft, path_drft_tmp.c_str(), id_slot, tokens.data(), tokens.size());
+        size_t actual_drft = 0;
+        if (n_drft == 0 ||
+            !server_prompt_cache_disk_size_exact(path_drft_tmp.string(), n_drft, &actual_drft) ||
+            !server_prompt_cache_disk_flush_and_drop(path_drft_tmp.string(), true)) {
+            SRV_ERR("prompt cache disk save failed: entry=%" PRIu64 " component=draft path=%s\n",
+                    entry_id, path_drft_tmp.c_str());
+            return fail_io("draft-save", path_drft_tmp.string());
+        }
+    }
+
+    const size_t actual_total = n_main + n_drft;
+    if (actual_total > disk_limit_size) {
+        const bool cleanup_ok = cleanup_temps();
+        SRV_WRN("prompt cache disk skip: reason=actual-oversize entry=%" PRIu64 " target_bytes=%zu draft_bytes=%zu total_bytes=%zu limit_bytes=%zu path=%s\n",
+                entry_id, n_main, n_drft, actual_total, disk_limit_size, disk_owned_path.c_str());
+        if (!cleanup_ok) {
+            disable_disk_saves("actual-oversize-cleanup", disk_owned_path);
+        }
+        return false;
+    }
+
+    std::error_code ec;
+    fs::permissions(path_main_tmp, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
+    if (ec) {
+        SRV_ERR("prompt cache disk permissions failed: entry=%" PRIu64 " component=target path=%s error=%s\n",
+                entry_id, path_main_tmp.string().c_str(), ec.message().c_str());
+        return fail_io("target-permissions", path_main_tmp.string());
+    }
+    if (ctx_drft) {
+        fs::permissions(path_drft_tmp, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
+        if (ec) {
+            SRV_ERR("prompt cache disk permissions failed: entry=%" PRIu64 " component=draft path=%s error=%s\n",
+                    entry_id, path_drft_tmp.string().c_str(), ec.message().c_str());
+            return fail_io("draft-permissions", path_drft_tmp.string());
+        }
+    }
+
+    // The complete target/draft temporary pair is durable. Commit it before
+    // touching older entries so a rename or directory-sync failure cannot
+    // destroy a previously usable cache. This permits one incoming entry of
+    // transient staging headroom above the configured payload limit.
+    ec.clear();
+    fs::rename(path_main_tmp, path_main, ec);
+    if (ec) {
+        SRV_ERR("prompt cache disk atomic rename failed: entry=%" PRIu64 " component=target path=%s error=%s\n",
+                entry_id, path_main.string().c_str(), ec.message().c_str());
+        return fail_io("target-rename", path_main.string());
+    }
+
+    if (ctx_drft) {
+        ec.clear();
+        fs::rename(path_drft_tmp, path_drft, ec);
+        if (ec) {
+            const bool main_cleanup_ok = server_prompt_cache_disk_remove_file(path_main.string());
+            const bool temp_cleanup_ok = cleanup_temps();
+            SRV_ERR("prompt cache disk atomic rename failed: entry=%" PRIu64 " component=draft path=%s error=%s\n",
+                    entry_id, path_drft.string().c_str(), ec.message().c_str());
+            disable_disk_saves("draft-rename", path_drft.string());
+            if (!main_cleanup_ok || !temp_cleanup_ok) {
+                disable_disk_saves("draft-rename-cleanup", disk_owned_path);
+            }
+            return false;
+        }
+    }
+
+    if (!server_prompt_cache_disk_sync_dir(disk_owned_path) ||
+        !server_prompt_cache_disk_flush_and_drop(path_main.string(), false) ||
+        (ctx_drft && !server_prompt_cache_disk_flush_and_drop(path_drft.string(), false))) {
+        const bool main_cleanup_ok = server_prompt_cache_disk_remove_file(path_main.string());
+        const bool drft_cleanup_ok = server_prompt_cache_disk_remove_file(path_drft.string());
+        disable_disk_saves("commit-sync", disk_owned_path);
+        if (!main_cleanup_ok || !drft_cleanup_ok) {
+            disable_disk_saves("commit-sync-cleanup", disk_owned_path);
+        }
+        return false;
+    }
+
+    server_prompt_disk_state state;
+    state.tokens    = prompt.tokens.clone();
+    state.path_main = path_main.string();
+    state.path_drft = ctx_drft ? path_drft.string() : std::string();
+    state.size_main = n_main;
+    state.size_drft = n_drft;
+    state.spec      = state_spec;
+    state.id        = entry_id;
+    state.usable    = true;
+    state.checkpoints.reserve(prompt.checkpoints.size());
+    for (const auto & ckpt : prompt.checkpoints) {
+        state.checkpoints.push_back({ckpt.n_tokens, ckpt.pos_min, ckpt.pos_max});
+    }
+
+    disk_states.push_back(std::move(state));
+    disk_size_total    += actual_total;
+    disk_saves++;
+    disk_bytes_written += actual_total;
+
+    auto new_entry = std::prev(disk_states.end());
+    bool reclaim_ok = true;
+
+    // Stateless entries can supersede shorter prefixes. Stateful MTP blobs
+    // remain independently useful exact-boundary states.
+    if (state_spec.empty()) {
+        for (auto it = disk_states.begin(); it != new_entry;) {
+            const int lcp = it->tokens.get_common_prefix(prompt.tokens);
+            if (lcp == (int) it->tokens.size()) {
+                auto obsolete = it++;
+                if (!erase_disk_state(obsolete, false, "obsolete-prefix")) {
+                    disable_disk_saves("obsolete-reclaim", disk_owned_path);
+                    reclaim_ok = false;
+                    break;
+                }
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    while (reclaim_ok && disk_size_total > disk_limit_size) {
+        if (disk_states.begin() == new_entry) {
+            SRV_ERR("prompt cache disk reclaim failed: entry=%" PRIu64 " reason=no-old-victim accounted_bytes=%zu limit_bytes=%zu path=%s\n",
+                    entry_id, disk_size_total, disk_limit_size, disk_owned_path.c_str());
+            disable_disk_saves("room-not-reclaimed", disk_owned_path);
+            reclaim_ok = false;
+            break;
+        }
+        if (!erase_disk_state(disk_states.begin(), true, "lru-limit")) {
+            disable_disk_saves("lru-reclaim", disk_owned_path);
+            reclaim_ok = false;
+            break;
+        }
+    }
+
+    if (!reclaim_ok) {
+        SRV_WRN("prompt cache disk committed over limit: entry=%" PRIu64 " accounted_bytes=%zu limit_bytes=%zu save_disabled=true path=%s\n",
+                entry_id, disk_size_total, disk_limit_size, disk_owned_path.c_str());
+    }
+
+    const double t_ms = (ggml_time_us() - t_start)/1000.0;
+    SRV_INF("prompt cache disk save: entry=%" PRIu64 " tokens=%zu checkpoints=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu save_ms=%.2f path=%s\n",
+            entry_id, tokens.size(), prompt.checkpoints.size(), n_main, n_drft, state_spec.size(), actual_total, t_ms, disk_owned_path.c_str());
+    log_disk_state();
+
+    return true;
+}
+
+server_prompt * server_prompt_cache::alloc(
+        const server_prompt & prompt,
+                    size_t state_size_tgt,
+                    size_t state_size_dft,
+        const std::vector<uint8_t> & state_spec) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->tokens.get_common_prefix(prompt.tokens);
+        const bool exact_tokens = cur_lcp_len == (int) prompt.tokens.size() &&
+            it->tokens.size() == prompt.tokens.size();
+        const bool cached_boundary = state_spec.empty()
+            ? cur_lcp_len == (int) prompt.tokens.size()
+            : exact_tokens && !it->data.spec.empty();
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
+        if (cached_boundary) {
             SRV_INF("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
     }
 
-    // next, remove any cached prompts that are fully contained in the current prompt
-    for (auto it = states.begin(); it != states.end();) {
-        const int len = it->tokens.get_common_prefix(prompt.tokens);
+    // calculate checkpoints size to see if it will fit with the prompt
+    size_t checkpoints_size = 0;
+    for (const auto & ckpt : prompt.checkpoints) {
+        checkpoints_size += ckpt.size();
+    }
 
-        if (len == (int) it->tokens.size()) {
-            SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
+    const size_t state_size_new = state_size_tgt + state_size_dft + state_spec.size() + checkpoints_size;
 
-            it = states.erase(it);
-        } else {
-            ++it;
+    // skip over-limit entries to avoid disturbing the cache
+    if (limit_size > 0 && state_size_new > limit_size) {
+        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
+                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        return nullptr;
+    }
+
+    // Stateful speculative blobs are exact-boundary states. Keep shorter
+    // boundaries instead of treating them as obsolete prefixes.
+    if (state_spec.empty()) {
+        for (auto it = states.begin(); it != states.end();) {
+            const int len = it->tokens.get_common_prefix(prompt.tokens);
+
+            if (len == (int) it->tokens.size()) {
+                SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
+
+                it = states.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    if (limit_size > 0) {
+        // make room before allocating the new vectors to avoid breaching the limit
+        while (!states.empty() && size() + state_size_new > limit_size) {
+            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                    states.front().size() / (1024.0 * 1024.0));
+
+            states.pop_front();
         }
     }
 
@@ -2030,6 +2735,7 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         /*.data        =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
+            /*.spec =*/ state_spec,
         },
         /*.checkpoints =*/ prompt.checkpoints,
     });
@@ -2037,41 +2743,357 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load_disk(
+        std::list<server_prompt_disk_state>::iterator it,
+        server_prompt & prompt,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+         llama_seq_id   id_slot,
+              size_t   lcp,
+            uint64_t * entry_id_out) {
+    if (entry_id_out != nullptr) {
+        *entry_id_out = 0;
+    }
+
+    const uint64_t entry_id = it->id;
+    const size_t target_bytes = it->size_main;
+    const size_t draft_bytes  = it->size_drft;
+    const size_t spec_bytes   = it->spec.size();
+    const size_t total_bytes  = it->size();
+    const size_t n_tokens_expected = it->tokens.size();
+    const size_t n_checkpoints = it->checkpoints.size();
+    const std::string path_main = it->path_main;
+    const std::string path_drft = it->path_drft;
+
+    const auto reject_entry = [&](const char * reason) -> bool {
+        it->usable = false;
+        if (!erase_disk_state(it, false, reason)) {
+            disable_disk_saves("invalid-entry-removal", disk_owned_path);
+        }
+        log_disk_state();
+        return false;
+    };
+
+    // Validate the entire pair before mutating either context.
+    size_t actual_main = 0;
+    size_t actual_drft = 0;
+    if (path_main.empty() || target_bytes == 0 ||
+        !server_prompt_cache_disk_size_exact(path_main, target_bytes, &actual_main)) {
+        SRV_ERR("prompt cache disk load failed: entry=%" PRIu64 " component=target reason=size-mismatch expected_bytes=%zu actual_bytes=%zu path=%s\n",
+                entry_id, target_bytes, actual_main, path_main.c_str());
+        return reject_entry("target-size-mismatch");
+    }
+    if (!path_drft.empty()) {
+        if (ctx_dft == nullptr || draft_bytes == 0 ||
+            !server_prompt_cache_disk_size_exact(path_drft, draft_bytes, &actual_drft)) {
+            SRV_ERR("prompt cache disk load failed: entry=%" PRIu64 " component=draft reason=size-mismatch expected_bytes=%zu actual_bytes=%zu path=%s\n",
+                    entry_id, draft_bytes, actual_drft, path_drft.c_str());
+            return reject_entry("draft-size-mismatch");
+        }
+    } else if (ctx_dft != nullptr || draft_bytes != 0) {
+        SRV_ERR("prompt cache disk load failed: entry=%" PRIu64 " component=draft reason=missing-draft-file expected_bytes=%zu path=%s\n",
+                entry_id, draft_bytes, disk_owned_path.c_str());
+        return reject_entry("missing-draft-file");
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    llama_tokens tokens_main(n_tokens_expected);
+    size_t n_tokens_main = 0;
+    const size_t nread_main = llama_state_seq_load_file(
+        ctx_tgt, path_main.c_str(), id_slot,
+        tokens_main.data(), tokens_main.size(), &n_tokens_main);
+    tokens_main.resize(n_tokens_main);
+    server_prompt_cache_disk_flush_and_drop(path_main, false);
+
+    if (nread_main != target_bytes || !server_prompt_cache_tokens_equal(it->tokens, tokens_main)) {
+        SRV_ERR("prompt cache disk load failed: entry=%" PRIu64 " component=target expected_bytes=%zu read_bytes=%zu expected_tokens=%zu restored_tokens=%zu path=%s\n",
+                entry_id, target_bytes, nread_main, n_tokens_expected, n_tokens_main, path_main.c_str());
+        return reject_entry("corrupt-target");
+    }
+
+    size_t nread_drft = 0;
+    if (!path_drft.empty()) {
+        llama_tokens tokens_drft(n_tokens_expected);
+        size_t n_tokens_drft = 0;
+        nread_drft = llama_state_seq_load_file(
+            ctx_dft, path_drft.c_str(), id_slot,
+            tokens_drft.data(), tokens_drft.size(), &n_tokens_drft);
+        tokens_drft.resize(n_tokens_drft);
+        server_prompt_cache_disk_flush_and_drop(path_drft, false);
+
+        if (nread_drft != draft_bytes ||
+            !server_prompt_cache_tokens_equal(it->tokens, tokens_drft) ||
+            tokens_drft != tokens_main) {
+            SRV_ERR("prompt cache disk load failed: entry=%" PRIu64 " component=draft expected_bytes=%zu read_bytes=%zu expected_tokens=%zu restored_tokens=%zu path=%s\n",
+                    entry_id, draft_bytes, nread_drft, n_tokens_expected, n_tokens_drft, path_drft.c_str());
+            return reject_entry("corrupt-draft");
+        }
+    }
+
+    server_prompt restored;
+    restored.tokens = it->tokens.clone();
+    restored.data.spec = it->spec;
+    // Intentionally do not recreate common_prompt_checkpoint payloads. The
+    // disk entry retained only their small positions, not cloned host/device
+    // state. Fresh checkpoints are created as processing continues.
+    prompt = std::move(restored);
+
+    disk_bytes_read += nread_main + nread_drft;
+
+    const double t_ms = (ggml_time_us() - t_start)/1000.0;
+    SRV_INF("prompt cache disk load: entry=%" PRIu64 " lcp=%zu tokens=%zu checkpoints=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu read_bytes=%zu load_ms=%.2f path=%s\n",
+            entry_id, lcp, n_tokens_expected, n_checkpoints, target_bytes, draft_bytes, spec_bytes, total_bytes,
+            nread_main + nread_drft, t_ms, disk_owned_path.c_str());
+
+    if (entry_id_out != nullptr) {
+        *entry_id_out = entry_id;
+    }
+    return true;
+}
+
+bool server_prompt_cache::erase_disk_state(
+        std::list<server_prompt_disk_state>::iterator it,
+        bool eviction,
+        const char * reason) {
+    const uint64_t entry_id    = it->id;
+    const size_t target_bytes  = it->size_main;
+    const size_t draft_bytes   = it->size_drft;
+    const size_t spec_bytes    = it->spec.size();
+    const size_t total_bytes   = it->size();
+    const size_t tokens        = it->tokens.size();
+    const std::string path_main = it->path_main;
+    const std::string path_drft = it->path_drft;
+
+    // Quarantine before touching either component. If only one unlink works,
+    // retain the full conservative accounting and metadata for a later retry.
+    it->usable = false;
+    const bool main_ok = server_prompt_cache_disk_remove_file(path_main);
+    const bool drft_ok = server_prompt_cache_disk_remove_file(path_drft);
+    if (!main_ok || !drft_ok) {
+        SRV_ERR("prompt cache disk removal failed: entry=%" PRIu64 " reason=%s target_removed=%s draft_removed=%s accounted_bytes=%zu path=%s\n",
+                entry_id, reason, main_ok ? "true" : "false", drft_ok ? "true" : "false",
+                disk_size_total, disk_owned_path.c_str());
+        return false;
+    }
+
+    if (total_bytes > disk_size_total) {
+        SRV_ERR("prompt cache disk accounting invariant failed: entry=%" PRIu64 " entry_bytes=%zu accounted_bytes=%zu path=%s\n",
+                entry_id, total_bytes, disk_size_total, disk_owned_path.c_str());
+        return false;
+    }
+    disk_size_total -= total_bytes;
+
+    if (eviction) {
+        disk_evictions++;
+        disk_bytes_evicted += total_bytes;
+        SRV_INF("prompt cache disk eviction: entry=%" PRIu64 " reason=%s tokens=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu remaining_bytes=%zu path=%s\n",
+                entry_id, reason, tokens, target_bytes, draft_bytes, spec_bytes, total_bytes, disk_size_total, disk_owned_path.c_str());
+    } else {
+        SRV_INF("prompt cache disk remove: entry=%" PRIu64 " reason=%s tokens=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu remaining_bytes=%zu path=%s\n",
+                entry_id, reason, tokens, target_bytes, draft_bytes, spec_bytes, total_bytes, disk_size_total, disk_owned_path.c_str());
+    }
+
+    disk_states.erase(it);
+    return true;
+}
+
+void server_prompt_cache::accept_disk_load(uint64_t entry_id) {
+    if (entry_id == 0) {
+        return;
+    }
+
+    for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
+        if (it->id != entry_id || !it->usable) {
+            continue;
+        }
+
+        disk_loads++;
+        disk_states.splice(disk_states.end(), disk_states, it);
+        SRV_INF("prompt cache disk load accepted: entry=%" PRIu64 " reusable=true path=%s\n",
+                entry_id, disk_owned_path.c_str());
+        log_disk_state();
+        return;
+    }
+}
+
+void server_prompt_cache::reject_disk_load(uint64_t entry_id, const char * reason) {
+    if (entry_id == 0) {
+        return;
+    }
+
+    for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
+        if (it->id != entry_id) {
+            continue;
+        }
+
+        it->usable = false;
+        SRV_WRN("prompt cache disk load rejected: entry=%" PRIu64 " reason=%s reusable=false path=%s\n",
+                entry_id, reason, disk_owned_path.c_str());
+        if (!erase_disk_state(it, false, reason)) {
+            disable_disk_saves("rejected-load-removal", disk_owned_path);
+        }
+        log_disk_state();
+        return;
+    }
+}
+
+void server_prompt_cache::update_disk() {
+    while (!disk_states.empty() && disk_size_total > disk_limit_size) {
+        if (!erase_disk_state(disk_states.begin(), true, "lru-update-limit")) {
+            disable_disk_saves("update-limit-removal", disk_owned_path);
+            break;
+        }
+    }
+
+    log_disk_state();
+}
+
+void server_prompt_cache::log_disk_state() const {
+    if (disk_owned_path.empty()) {
+        return;
+    }
+
+    const size_t unusable = std::count_if(disk_states.begin(), disk_states.end(),
+        [](const server_prompt_disk_state & state) { return !state.usable; });
+    SRV_INF("prompt cache disk state: entries=%zu unusable=%zu bytes=%zu limit_bytes=%zu over_limit=%s tokens=%zu saves=%" PRIu64 " loads=%" PRIu64 " evictions=%" PRIu64 " save_disabled=%s save_failures=%" PRIu64 " bytes_written=%" PRIu64 " bytes_read=%" PRIu64 " bytes_evicted=%" PRIu64 " path=%s\n",
+            disk_states.size(), unusable, disk_size_total, disk_limit_size,
+            disk_size_total > disk_limit_size ? "true" : "false", disk_n_tokens(),
+            disk_saves, disk_loads, disk_evictions, disk_save_disabled ? "true" : "false", disk_save_failures,
+            disk_bytes_written, disk_bytes_read, disk_bytes_evicted,
+            disk_owned_path.c_str());
+}
+
+bool server_prompt_cache::load(
+              server_prompt & prompt,
+        const server_tokens & tokens_new,
+              llama_context * ctx_tgt,
+              llama_context * ctx_dft,
+                    int32_t   id_slot,
+                       bool   spec_state_required,
+                       bool * cache_hit,
+                   uint64_t * disk_entry_id) {
+    if (cache_hit != nullptr) {
+        *cache_hit = false;
+    }
+    if (disk_entry_id != nullptr) {
+        *disk_entry_id = 0;
+    }
+
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float sim_best    = float(lcp_best) / tokens_new.size();
+    const bool base_boundary_valid = !spec_state_required ||
+        lcp_best == (int) prompt.tokens.size();
+    float f_keep_best = base_boundary_valid && prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    float sim_best    = base_boundary_valid ? float(lcp_best) / std::max<size_t>(1, tokens_new.size()) : -1.0f;
+
+    if (spec_state_required && !prompt.tokens.empty() && !base_boundary_valid) {
+        SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=slot lcp=%d cached_tokens=%zu request_tokens=%zu\n",
+                lcp_best, prompt.tokens.size(), tokens_new.size());
+    }
 
     SRV_INF(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
-    auto it_best = states.end();
+    auto it_best_ram  = states.end();
+    auto it_best_disk = disk_states.end();
+    size_t lcp_selected = 0;
+    size_t spec_boundary_best = base_boundary_valid ? prompt.tokens.size() : 0;
+    bool ram_loaded = false;
 
-    // find the most similar cached prompt, that would also preserve the most context
+    // Find the most similar RAM prompt first. On an equal match, the hot RAM
+    // copy wins and avoids SSD I/O.
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
 
-        const float f_keep_cur = float(lcp_cur) / it->tokens.size();
-        const float sim_cur    = float(lcp_cur) / tokens_new.size();
+        if (spec_state_required &&
+            lcp_cur != (int) it->tokens.size()) {
+            SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=ram lcp=%d cached_tokens=%zu request_tokens=%zu spec_bytes=%zu\n",
+                    lcp_cur, it->tokens.size(), tokens_new.size(), it->data.spec.size());
+            continue;
+        }
+        if (spec_state_required && it->data.spec.empty()) {
+            SRV_INF("prompt cache skip: reason=spec-state-missing source=ram cached_tokens=%zu request_tokens=%zu\n",
+                    it->tokens.size(), tokens_new.size());
+            continue;
+        }
+
+        const float f_keep_cur = float(lcp_cur) / std::max<size_t>(1, it->tokens.size());
+        const float sim_cur    = float(lcp_cur) / std::max<size_t>(1, tokens_new.size());
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
+        const bool is_better = spec_state_required
+            ? it->tokens.size() > spec_boundary_best
+            : f_keep_best < f_keep_cur && sim_best < sim_cur;
+        if (is_better) {
             f_keep_best = f_keep_cur;
             sim_best    = sim_cur;
+            spec_boundary_best = it->tokens.size();
 
-            it_best = it;
+            it_best_ram  = it;
+            it_best_disk = disk_states.end();
+            lcp_selected = lcp_cur;
         }
     }
 
-    if (it_best != states.end()) {
+    for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
+        if (!it->usable) {
+            continue;
+        }
+
+        const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+
+        if (spec_state_required &&
+            lcp_cur != (int) it->tokens.size()) {
+            SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=disk entry=%" PRIu64 " lcp=%d cached_tokens=%zu request_tokens=%zu spec_bytes=%zu\n",
+                    it->id, lcp_cur, it->tokens.size(), tokens_new.size(), it->spec.size());
+            continue;
+        }
+        if (spec_state_required && it->spec.empty()) {
+            SRV_INF("prompt cache skip: reason=spec-state-missing source=disk entry=%" PRIu64 " cached_tokens=%zu request_tokens=%zu\n",
+                    it->id, it->tokens.size(), tokens_new.size());
+            continue;
+        }
+
+        const float f_keep_cur = float(lcp_cur) / std::max<size_t>(1, it->tokens.size());
+        const float sim_cur    = float(lcp_cur) / std::max<size_t>(1, tokens_new.size());
+
+        if (f_keep_cur < 0.25f) {
+            continue;
+        }
+
+        const bool is_better = spec_state_required
+            ? it->tokens.size() > spec_boundary_best
+            : f_keep_best < f_keep_cur && sim_best < sim_cur;
+        if (is_better) {
+            f_keep_best = f_keep_cur;
+            sim_best    = sim_cur;
+            spec_boundary_best = it->tokens.size();
+
+            it_best_ram  = states.end();
+            it_best_disk = it;
+            lcp_selected = lcp_cur;
+        }
+    }
+
+    if (it_best_disk != disk_states.end()) {
+        SRV_INF(" - found better disk prompt with f_keep = %.3f, sim = %.3f, lcp = %zu\n",
+                f_keep_best, sim_best, lcp_selected);
+        const bool loaded = load_disk(it_best_disk, prompt, ctx_tgt, ctx_dft, id_slot, lcp_selected, disk_entry_id);
+        if (loaded && cache_hit != nullptr) {
+            *cache_hit = true;
+        }
+        return loaded;
+    }
+
+    if (it_best_ram != states.end()) {
         SRV_INF(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
         {
-            auto & data = it_best->data.main;
+            auto & data = it_best_ram->data.main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
@@ -2086,7 +3108,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         {
-            auto & data = it_best->data.drft;
+            auto & data = it_best_ram->data.drft;
 
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);
@@ -2104,22 +3126,22 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
 
-        prompt = std::move(*it_best);
+        prompt = std::move(*it_best_ram);
 
-        states.erase(it_best);
+        states.erase(it_best_ram);
+
+        if (cache_hit != nullptr) {
+            *cache_hit = true;
+        }
+        ram_loaded = true;
     }
 
-    return true;
+    return base_boundary_valid || ram_loaded;
 }
 
 void server_prompt_cache::update() {
     if (limit_size > 0) {
-        // always keep at least one state, regardless of the limits
-        while (states.size() > 1 && size() > limit_size) {
-            if (states.empty()) {
-                break;
-            }
-
+        while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
@@ -2133,11 +3155,7 @@ void server_prompt_cache::update() {
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
-        while (states.size() > 1 && n_tokens() > limit_tokens_cur) {
-            if (states.empty()) {
-                break;
-            }
-
+        while (!states.empty() && n_tokens() > limit_tokens_cur) {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
@@ -2152,4 +3170,6 @@ void server_prompt_cache::update() {
         SRV_INF("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+
+    update_disk();
 }

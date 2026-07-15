@@ -568,9 +568,10 @@ struct server_task_result_apply_lora : server_task_result {
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
+    std::vector<uint8_t> spec;
 
     size_t size() const {
-        return main.size() + drft.size();
+        return main.size() + drft.size() + spec.size();
     }
 };
 
@@ -606,13 +607,55 @@ struct server_prompt {
     }
 };
 
-struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
+// The context checkpoint payloads may contain large host vectors and cloned
+// backend buffers. Disk-cache entries keep only the small scheduling metadata;
+// a restored disk state starts with an empty live checkpoint list and creates
+// fresh checkpoints as prompt processing continues.
+struct server_prompt_checkpoint_meta {
+    int64_t   n_tokens = 0;
+    llama_pos pos_min  = 0;
+    llama_pos pos_max  = 0;
+};
+
+struct server_prompt_disk_state {
+    server_tokens tokens;
+    std::vector<server_prompt_checkpoint_meta> checkpoints;
+    std::vector<uint8_t> spec;
+
+    std::string path_main;
+    std::string path_drft;
+
+    size_t size_main = 0;
+    size_t size_drft = 0;
+
+    uint64_t id = 0;
+    bool usable = true;
+
+    size_t size() const {
+        return size_main + size_drft;
     }
 
+    int n_tokens() const {
+        return tokens.size();
+    }
+};
+
+struct server_prompt_cache {
+    server_prompt_cache(
+            int32_t limit_size_mib,
+             size_t limit_tokens,
+        const std::string & disk_base_path = {},
+            int32_t disk_limit_size_mib = 0);
+
+    ~server_prompt_cache();
+
     std::list<server_prompt> states;
+
+    // Cold automatic cache. Entries own only token/checkpoint metadata in RAM;
+    // target and draft context payloads live in owner-only files.
+    std::list<server_prompt_disk_state> disk_states;
+
+    bool ram_enabled = false;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -620,13 +663,88 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // Disk fields are disabled when disk_owned_path is empty.
+    std::string disk_base_path;
+    std::string disk_owned_path;
+    size_t disk_limit_size = 0;
+    size_t disk_size_total = 0;
+    int disk_lock_fd = -1;
+
+    uint64_t disk_next_id       = 1;
+    uint64_t disk_saves         = 0;
+    uint64_t disk_loads         = 0;
+    uint64_t disk_evictions     = 0;
+    uint64_t disk_bytes_written = 0;
+    uint64_t disk_bytes_read    = 0;
+    uint64_t disk_bytes_evicted = 0;
+    uint64_t disk_save_failures = 0;
+
+    // A durable write/removal failure opens this run-level circuit breaker.
+    // Existing valid entries remain readable, but no further state files are
+    // created for this server process.
+    bool disk_save_disabled = false;
+
     size_t size() const;
 
     size_t n_tokens() const;
 
-    server_prompt * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    size_t disk_size() const;
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
+    size_t disk_n_tokens() const;
+
+    bool save(
+        const server_prompt & prompt,
+              llama_context * ctx_main,
+              llama_context * ctx_drft,
+               llama_seq_id   id_slot,
+        const std::vector<uint8_t> & state_spec);
+
+    server_prompt * alloc(
+        const server_prompt & prompt,
+                    size_t state_size_main,
+                    size_t state_size_drft,
+        const std::vector<uint8_t> & state_spec);
+
+    bool load(
+              server_prompt & prompt,
+        const server_tokens & tokens_new,
+              llama_context * ctx_main,
+              llama_context * ctx_drft,
+                    int32_t   id_slot,
+                       bool   spec_state_required,
+                       bool * cache_hit,
+                   uint64_t * disk_entry_id);
+
+    // Called when a stateful speculative implementation rejects a blob after
+    // the target/draft files themselves restored successfully.
+    void accept_disk_load(uint64_t entry_id);
+
+    void reject_disk_load(uint64_t entry_id, const char * reason);
 
     void update();
+
+private:
+    bool save_disk(
+        const server_prompt & prompt,
+              llama_context * ctx_main,
+              llama_context * ctx_drft,
+               llama_seq_id   id_slot,
+        const std::vector<uint8_t> & state_spec);
+
+    bool load_disk(
+        std::list<server_prompt_disk_state>::iterator it,
+        server_prompt & prompt,
+        llama_context * ctx_main,
+        llama_context * ctx_drft,
+         llama_seq_id   id_slot,
+              size_t   lcp,
+            uint64_t * entry_id_out);
+
+    bool erase_disk_state(std::list<server_prompt_disk_state>::iterator it, bool eviction, const char * reason);
+
+    void disable_disk_saves(const char * reason, const std::string & path);
+
+    void update_disk();
+
+    void log_disk_state() const;
 };
