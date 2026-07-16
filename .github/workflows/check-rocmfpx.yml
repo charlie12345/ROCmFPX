@@ -11,8 +11,10 @@ on:
       - 'src/llama-quant.cpp'
       - 'include/llama.h'
       - 'scripts/check-rocmfpx-*.sh'
+      - 'scripts/check-release-recipe-map.py'
       - 'scripts/sweep-rocmfpx-*.sh'
       - 'scripts/build-rocmfpx-*.sh'
+      - 'docs/recipes/**'
       - '.github/workflows/check-rocmfpx.yml'
   pull_request:
     paths:
@@ -20,8 +22,10 @@ on:
       - 'src/llama-quant.cpp'
       - 'include/llama.h'
       - 'scripts/check-rocmfpx-*.sh'
+      - 'scripts/check-release-recipe-map.py'
       - 'scripts/sweep-rocmfpx-*.sh'
       - 'scripts/build-rocmfpx-*.sh'
+      - 'docs/recipes/**'
       - '.github/workflows/check-rocmfpx.yml'
 
 concurrency:
@@ -51,6 +55,9 @@ jobs:
           for s in scripts/check-rocmfpx-*.sh scripts/sweep-rocmfpx-*.sh scripts/build-rocmfpx-*.sh; do
             bash -n "$s"
           done
+
+      - name: Released model recipe map
+        run: python3 scripts/check-release-recipe-map.py
 
       - name: Dependencies
         run: |

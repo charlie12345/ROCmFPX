@@ -38,7 +38,10 @@ Current status (June 16, 2026):
 - ROCm/HIP and Vulkan kernels support `CPY`, `GET_ROWS`, `SET_ROWS`, and
   `MUL_MAT`/`MUL_MAT_ID` for all three formats.
 - Qwen3-0.6B BF16 smoke tests pass on CPU, ROCm0, and Vulkan0.
-- Default quant presets now include lean coherency routing:
+- Generic baseline quant presets now include lean coherency routing. These
+  preset names are not release recipe identities; released artifact mappings
+  and architecture-qualified recipe IDs live in
+  [`docs/recipes/`](../../docs/recipes/README.md):
   - `Q3_0_ROCMFPX`: selective `Q5_K` on attention Q/O and early K/V, boosted
     FFN-down at `Q5_K`, selective FFN-gate at `Q6_0_ROCMFPX`, bulk FFN-up on
     `Q3_0_ROCMFPX`, embeddings/output at `Q4_0_ROCMFP4_FAST`.

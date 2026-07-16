@@ -1,0 +1,15 @@
+hf_repo	artifact	implementation_family	topology	release_recipe_label	internal_recipe_id
+jcbtc/Step-3.7-Flash-ROCmFPX-Q3-QualityPlus	Step-3.7-Flash-ROCmFPX-Q3-QualityPlus-*.gguf	step35	moe	ROCmFPX Q3 QualityPlus	rocmfpx-q3.step35.moe.qualityplus.v1
+jcbtc/chadrock-35b-ace-saber-rocmfp4-mtp	Qwen3.6-35B-A3B-NSC-ACE-SABER-MTP-F16-to-ROCmFP4-STRIX_LEAN.gguf	qwen35moe	moe	ROCmFP4 Strix Lean	rocmfp4.qwen35.moe.strix-lean.v1
+jcbtc/chadrock-35b-ace-saber-rocmfp4-mtp	CHADROCK-35B-Ace-Saber-MTP-ROCmFPX-MoEQuality-7.07BPW.gguf	qwen35moe	moe	ROCmFPX MoEQuality	rocmfpx.qwen35.moe.moequality.v1
+jcbtc/Qwable-27B-Chadrock-ROCmFPX-ULTRAQUALITY-7.61BPW	Qwable-27B-Chadrock-ROCmFPX-ULTRAQUALITY-7.61BPW.gguf	qwen35	dense	ROCmFPX UltraQuality	rocmfpx.qwen35.dense.ultraquality.v1
+jcbtc/qwen3.6-35b-a3b-crown-halo-mtp-dynamic	Qwen3.6-35B-A3B-HaloStrix-Dyn-MTP-v7.gguf	qwen35moe	moe	Crown Halo Dynamic MTP v7	crown.qwen35.moe.halo-dynamic.v7
+jcbtc/qwopus3.6-27b-v2-chadrock-rocmfp4-mtp	Qwopus3.6-27B-v2-MTP-BF16-to-ROCmFP4-STRIX_LEAN.gguf	qwen35	dense	ROCmFP4 Strix Lean	rocmfp4.qwen35.dense.strix-lean.v1
+jcbtc/CHADROCK3.6-35B-UNCENSORED-MTP-STRIX-LEAN	CHADROCK3.6-35B-UNCENSORED-MTP-STRIX-LEAN.gguf	qwen35moe	moe	ROCmFP4 Strix Lean	rocmfp4.qwen35.moe.strix-lean.v1
+jcbtc/chadrock3.6-27b-coder-rocmfp4-mtp	CHADROCK3.6-27B-Coder-MTP-ROCmFP4-STRIX_LEAN.gguf	qwen35	dense	ROCmFP4 Strix Lean	rocmfp4.qwen35.dense.strix-lean.v1
+jcbtc/chadrock3.6-27b-coder-rocmfp4-mtp	CHADROCK3.6-35B-A3B-Coder-MTP-ROCmFPX-MoEQuality-7.08BPW.gguf	qwen35moe	moe	ROCmFPX MoEQuality	rocmfpx.qwen35.moe.moequality.v1
+jcbtc/chadrock3.6-40b-opus-deckard-uncensored-thinking-neo-code-di-imatrix-rocmfp4	CHADROCK3.6-40B-Opus-Deckard-Uncensored-Thinking-NEO-CODE-Di-IMatrix-ROCmFP4.gguf	qwen35	dense	ROCmFP4 Strix Lean	rocmfp4.qwen35.dense.strix-lean.v1
+jcbtc/chadrock3.6-27b-pi-agent-rocmfp4-mtp	CHADROCK3.6-27B-Pi-Agent-MTP-ROCmFP4-STRIX_LEAN.gguf	qwen35	dense	ROCmFP4 Strix Lean	rocmfp4.qwen35.dense.strix-lean.v1
+jcbtc/qwable-5-27b-chadrock-v2-rocmfp4	Qwable-5-27B-Chadrock-v2-ROCmFP4.gguf	qwen35	dense	ROCmFP4 Strix Lean	rocmfp4.qwen35.dense.strix-lean.v1
+jcbtc/Chadrockv2-Qwen3.6-27B-ROCmFP6-STRIX-QUALITY	Chadrockv2-Qwen3.6-27B-ROCmFP6-STRIX-QUALITY.gguf	qwen35	dense	ROCmFP6 Strix Quality	rocmfpx-q6.qwen35.dense.strix-quality.v1
+jcbtc/Qwable-5-27B-Chadrock-v2-ROCmFP6-QUALITY	Qwable-5-27B-Chadrock-v2-ROCmFP6-QUALITY.gguf	qwen35	dense	ROCmFP6 Strix Quality	rocmfpx-q6.qwen35.dense.strix-quality.v1
