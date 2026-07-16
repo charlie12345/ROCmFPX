@@ -174,6 +174,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--warmup, --no-warmup` | whether to perform warmup with an empty run (default: enabled) |
 | `--spm-infill` | use Suffix/Prefix/Middle pattern for infill (instead of Prefix/Suffix/Middle) as some models prefer this. (default: disabled) |
 | `--pooling {none,mean,cls,last,rank}` | pooling type for embeddings, use model default if unspecified<br/>(env: LLAMA_ARG_POOLING) |
+| `--max-concurrent-per-user N` | per-user_id concurrency cap on in-flight slots (default: 0, 0 = unlimited). also applies to the `_anonymous` bucket<br/>(env: LLAMA_ARG_MAX_CONCURRENT_PER_USER) |
 | `-np, --parallel N` | number of server slots (default: -1, -1 = auto)<br/>(env: LLAMA_ARG_N_PARALLEL) |
 | `-cb, --cont-batching, -nocb, --no-cont-batching` | whether to enable continuous batching (a.k.a dynamic batching) (default: enabled)<br/>(env: LLAMA_ARG_CONT_BATCHING) |
 | `-mm, --mmproj FILE` | path to a multimodal projector file. see tools/mtmd/README.md<br/>note: if -hf is used, this argument can be omitted<br/>(env: LLAMA_ARG_MMPROJ) |
@@ -324,6 +325,166 @@ For more details, please refer to [multimodal documentation](../../docs/multimod
 The server includes a set of built-in tools that enable the LLM to access the local file system directly from the Web UI.
 
 To use this feature, start the server with `--tools all`. You can also enable only specific tools by passing a comma-separated list: `--tools name1,name2,...`. Run `--help` for the full list of available tool names.
+
+## SSD-backed KV cache
+
+Passing `--cache-ssd PATH` persists KV cache checkpoints to disk so a
+conversation survives server restarts: on the next request with a
+matching prompt prefix, the server restores the KV state from disk and
+only reprocesses the tail instead of the whole prompt.
+
+Checkpoints move through three tiers:
+
+- **hot** - a copy kept in RAM for instant re-restore
+- **warm** - RAM parking for demoted hot entries
+- **cold** - on disk only (always; disk is the durable copy)
+
+| Argument | Explanation |
+| -------- | ----------- |
+| `-ssd, --cache-ssd PATH` | enable the cache, storing checkpoints under PATH |
+| `-ssd-cp, --cache-ssd-checkpoints N` | max checkpoints per slot (default: 64) |
+| `-ssd-hot-ram, --cache-ssd-hot-ram N` | hot tier RAM budget in MiB (default: auto) |
+| `-ssd-warm-ram, --cache-ssd-warm-ram N` | warm tier RAM budget in MiB (default: auto) |
+| `-ssd-mc, --cache-ssd-max-cold N` | max cold checkpoints before oldest-first eviction (default: unlimited) |
+| `--cache-ssd-max-conversations N` | max conversation directories kept on disk (default: 16) |
+| `--cache-ssd-system-prompts N` | max system prompts cached for reuse across conversations (default: 8) |
+| `-ssd-ps, --cache-ssd-page-size N` | tokens per page: 512, 1024 or 2048 (default: 1024) |
+| `--cache-ssd-no-fsync` | skip fsync on checkpoint writes (faster, may lose the last checkpoint on power loss) |
+
+Checkpoint size scales with context depth: a 122B MoE at ~50k tokens of
+q8_0 KV produces ~1-1.5 GiB per checkpoint. Use `--cache-ssd-max-cold`
+to bound disk growth.
+
+### Unified-memory machines (Strix Halo and similar)
+
+The hot/warm auto-sizer assumes host RAM and GPU memory are separate
+pools, which holds for discrete GPUs and traditional APUs with a small
+fixed carve-out. On unified-memory machines like the Ryzen AI Max
+("Strix Halo"), the BIOS carve-out can dedicate most of the physical
+RAM to the iGPU - a 128 GB machine may leave Windows only 32 GB of
+host RAM - and "VRAM", host RAM and the hot/warm tiers all drain that
+same silicon.
+
+On such machines a large RAM tier is pure overhead: it duplicates data
+that is already on disk, and every MiB it holds is taken from the KV
+cache, prefill staging buffers and the checkpoint serialization spikes
+(which need transient host memory roughly equal to one full checkpoint).
+The only thing the tiers buy is skipping an NVMe read on restore -
+around a second for even the largest checkpoints, versus minutes of
+prompt reprocessing that the disk copy already saves you.
+
+Suggested values for unified-memory machines:
+
+```
+--cache-ssd-hot-ram 256 --cache-ssd-warm-ram 128
+```
+
+Checkpoints larger than the hot budget skip RAM retention entirely and
+go straight to disk, so at long contexts these small budgets cost
+nothing. If the host has plenty of headroom (small carve-out, short
+contexts, many small conversations), `512`/`256` keeps the fast path
+for more of them.
+
+The server detects unified-memory systems automatically (an integrated
+GPU with no discrete GPU present) and caps the auto-sizer at 1 GiB hot
+/ 512 MiB warm there, logging
+`SSD cache: unified-memory (iGPU) system detected` at startup. On
+machines with a discrete GPU the auto-sizer keeps its original
+behavior and scales the tiers with free host RAM. Explicit
+`-ssd-hot-ram` / `-ssd-warm-ram` values always win over auto-sizing
+on either kind of machine.
+
+## User Isolation
+
+`llama-server` carries a first-class `user_id` that, when set on a request,
+isolates that request's KV cache on disk and caps its concurrency.
+The field is empty by default - the deployment runs the original
+content-derived (conv_hash) behaviour and the feature is opt-in.
+
+### Request body
+
+OpenAI chat / completions / responses endpoints:
+
+```json
+{
+  "model": "...",
+  "messages": [...],
+  "llama_user_id": "tenant-42-user-7"
+}
+```
+
+OpenAI SDK callers use `extra_body` to pass it through:
+
+```python
+client.chat.completions.create(
+    model="...",
+    messages=[...],
+    extra_body={"llama_user_id": "tenant-42-user-7"},
+)
+```
+
+Anthropic messages endpoint: the user_id is read from the existing
+`metadata.user_id` field. No change to the Anthropic request body.
+
+### Validation
+
+`user_id` is matched against `^[a-zA-Z0-9\-_]+$` and capped at 512
+characters. Empty values are accepted and treated as the anonymous
+bucket (still isolated on disk and still subject to the concurrency
+cap). Invalid values are rejected with HTTP 400.
+
+### KV cache routing
+
+When `user_id` is set, KV cache checkpoints land in
+`{SSD_PATH}/u/{fnv1a(user_id)}/`. The anonymous bucket remains
+keyed by the content-derived `conv_hash` at
+`{SSD_PATH}/{fnv1a(conv_hash)}/`. The two namespaces are isolated
+on disk and the global scanner (continuation matching) only walks
+the anonymous directory.
+
+This means:
+
+- Two requests with the same `user_id` always share a cache bucket,
+  even if their prompts differ.
+- A request with a `user_id` cannot accidentally land in another
+  user's cache. The lookup is restricted to the requesting user's
+  own directory.
+- A request without a `user_id` is unaffected - it still uses
+  `conv_hash` and content-derived continuation matching.
+
+Existing deployments are not migrated. The `u/` namespace is a
+new subdirectory; existing `conv_hash` directories are untouched.
+
+### Per-user concurrency cap
+
+Set the cap on the server with `--max-concurrent-per-user N` (0 =
+unlimited, the default). When the cap is set, requests with a given
+`user_id` (or with no `user_id`, in the `_anonymous` bucket) are
+rejected with HTTP 429 if the in-flight count is at or above `N`.
+
+Error envelope (matches the existing server error format):
+
+```json
+{
+  "error": {
+    "code": 429,
+    "message": "per-user concurrency cap reached for user_id=tenant-42-user-7",
+    "type": "rate_limit_error"
+  }
+}
+```
+
+The cap is enforced twice: once synchronously in the HTTP handler
+(returns 429 immediately) and once in the slot allocator
+(deferred tasks are re-checked). The race window is benign - if
+the cap frees up between the two checks, the task proceeds
+normally.
+
+### Reference
+
+See `docs/development/user-isolation-design.md` for the design
+rationale, file-by-file change list, and the precedence rules
+for KV cache routing.
 
 ## Build
 

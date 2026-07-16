@@ -132,6 +132,11 @@ struct server_task {
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
 
+    // explicit, operator-declared user identity. empty = anonymous bucket.
+    // validated against ^[a-zA-Z0-9\-_]+$ and <= 512 chars at request time.
+    // drives SSD cache routing (u/ namespace) and per-user concurrency cap.
+    std::string user_id;
+
     // used by SERVER_TASK_TYPE_CANCEL
     int id_target = -1;
     int id_slot   = -1;
@@ -212,6 +217,11 @@ struct server_task {
         const int n_ctx_slot,
         const std::vector<llama_logit_bias> & logit_bias_eog,
         const json & data);
+
+    // validate a user_id against the allowed character set and length.
+    // returns the input on success, throws std::invalid_argument on failure.
+    // empty string is valid (anonymous bucket).
+    static std::string validate_user_id(std::string user_id);
 
     // utility function
     static std::unordered_set<int> get_list_id(const std::vector<server_task> & tasks) {
@@ -581,6 +591,9 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // timestamp of last access (used for smarter cache eviction)
+    int64_t t_last_used = 0;
+
     size_t size() const {
         size_t res = 0;
 
@@ -628,5 +641,19 @@ struct server_prompt_cache {
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
-    void update();
+    // update cache, evicting entries that exceed memory limits
+    // tokens_ref: the incoming task tokens, used to compute overlap for smarter eviction
+    void update(const server_tokens * tokens_ref = nullptr);
+
+    // Force eviction of the least valuable checkpoint to free up KV cache space.
+    // tokens_ref: if provided, overlap with this is used to avoid evicting useful entries
+    // Returns true if an entry was evicted, false if cache is empty.
+    bool evict(const server_tokens * tokens_ref = nullptr);
+
+private:
+    // Find the least valuable cache entry to evict.
+    // Scores entries by: recency (older = more evictable), size (larger = more evictable),
+    // and overlap with tokens_ref (less overlap = more evictable).
+    // Returns iterator to the worst entry.
+    std::list<server_prompt>::iterator find_eviction_candidate(const server_tokens * tokens_ref = nullptr);
 };

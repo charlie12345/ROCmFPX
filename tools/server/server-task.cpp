@@ -2033,6 +2033,7 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         },
         /*.checkpoints =*/ prompt.checkpoints,
     });
+    states.back().t_last_used = ggml_time_us();
 
     return &states.back();
 }
@@ -2112,17 +2113,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
-void server_prompt_cache::update() {
+void server_prompt_cache::update(const server_tokens * tokens_ref) {
     if (limit_size > 0) {
-        // always keep at least one state, regardless of the limits
+        // evict least valuable entries until we're under the size limit
         while (states.size() > 1 && size() > limit_size) {
             if (states.empty()) {
                 break;
             }
 
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+            auto it_worst = find_eviction_candidate(tokens_ref);
+            SRV_WRN(" - cache size limit reached, evicting entry (size = %.3f MiB, tokens = %d)\n",
+                    it_worst->size() / (1024.0 * 1024.0), it_worst->n_tokens());
 
-            states.pop_front();
+            states.erase(it_worst);
         }
     }
 
@@ -2138,10 +2141,11 @@ void server_prompt_cache::update() {
                 break;
             }
 
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+            auto it_worst = find_eviction_candidate(tokens_ref);
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, evicting entry (size = %.3f MiB, tokens = %d)\n",
+                    limit_tokens, limit_tokens_cur, it_worst->size() / (1024.0 * 1024.0), it_worst->n_tokens());
 
-            states.pop_front();
+            states.erase(it_worst);
         }
     }
 
@@ -2152,4 +2156,74 @@ void server_prompt_cache::update() {
         SRV_INF("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+}
+
+bool server_prompt_cache::evict(const server_tokens * tokens_ref) {
+    if (states.empty()) {
+        return false;
+    }
+
+    auto it_worst = find_eviction_candidate(tokens_ref);
+    SRV_WRN(" - evicting cache entry: %d tokens, checkpoints: %d, size: %.3f MiB\n",
+            (int)it_worst->n_tokens(), (int)it_worst->checkpoints.size(), it_worst->size() / (1024.0 * 1024.0));
+    states.erase(it_worst);
+
+    return true;
+}
+
+std::list<server_prompt>::iterator server_prompt_cache::find_eviction_candidate(const server_tokens * tokens_ref) {
+    GGML_ASSERT(!states.empty());
+
+    const int64_t now = ggml_time_us();
+
+    auto it_worst = states.begin();
+    float score_worst = -1e30f;
+
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const auto & entry = *it;
+
+        // compute eviction score: higher = more evictable
+        float score = 0.0f;
+
+        // age factor: older entries are more evictable (microseconds -> seconds)
+        const float age_s = (now - entry.t_last_used) / 1e6f;
+        score += age_s * 0.1f;  // 1 point per 10 seconds of age
+
+        // size factor: larger entries are more evictable (MiB)
+        const float size_mib = entry.size() / (1024.0f * 1024.0f);
+        score += size_mib * 2.0f;  // 2 points per MiB
+
+        // overlap penalty: entries with high overlap to current task are less evictable
+        if (tokens_ref && !tokens_ref->empty() && !entry.tokens.empty()) {
+            const int lcp = entry.tokens.get_common_prefix(*tokens_ref);
+            const float overlap = float(lcp) / tokens_ref->size();
+            score -= overlap * 50.0f;  // strong penalty for high overlap
+        }
+
+        if (score > score_worst) {
+            score_worst = score;
+            it_worst = it;
+        }
+    }
+
+    return it_worst;
+}
+
+std::string server_task::validate_user_id(std::string user_id) {
+    constexpr size_t MAX_USER_ID_LEN = 512;
+    if (user_id.size() > MAX_USER_ID_LEN) {
+        throw std::invalid_argument(
+            "llama_user_id exceeds maximum length of " + std::to_string(MAX_USER_ID_LEN));
+    }
+    for (char c : user_id) {
+        const bool ok = (c >= 'a' && c <= 'z') ||
+                        (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') ||
+                        c == '-' || c == '_';
+        if (!ok) {
+            throw std::invalid_argument(
+                "llama_user_id must match ^[a-zA-Z0-9\\-_]+$ (empty = anonymous)");
+        }
+    }
+    return user_id;
 }

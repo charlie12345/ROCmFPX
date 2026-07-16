@@ -55,6 +55,7 @@ enum error_type {
     ERROR_TYPE_PERMISSION,
     ERROR_TYPE_UNAVAILABLE, // custom error
     ERROR_TYPE_NOT_SUPPORTED, // custom error
+    ERROR_TYPE_RATE_LIMIT, // custom error - per-user concurrency cap
     ERROR_TYPE_EXCEED_CONTEXT_SIZE, // custom error
 };
 

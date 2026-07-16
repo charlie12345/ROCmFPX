@@ -2068,6 +2068,7 @@ common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoin
     pos_max(other.pos_max),
     data_tgt(other.data_tgt),
     data_dft(other.data_dft),
+    data_spec(other.data_spec),
     storage_tgt(llama_state_seq_storage_clone(other.storage_tgt)),
     storage_dft(llama_state_seq_storage_clone(other.storage_dft)) {
 }
@@ -2083,6 +2084,7 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(const common_prom
 
     data_tgt = other.data_tgt;
     data_dft = other.data_dft;
+    data_spec = other.data_spec;
 
     llama_state_seq_storage_free(storage_tgt);
     llama_state_seq_storage_free(storage_dft);
@@ -2098,6 +2100,7 @@ common_prompt_checkpoint::common_prompt_checkpoint(common_prompt_checkpoint && o
     pos_max(other.pos_max),
     data_tgt(std::move(other.data_tgt)),
     data_dft(std::move(other.data_dft)),
+    data_spec(std::move(other.data_spec)),
     storage_tgt(other.storage_tgt),
     storage_dft(other.storage_dft) {
     other.storage_tgt = nullptr;
@@ -2118,6 +2121,7 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_che
 
     data_tgt = std::move(other.data_tgt);
     data_dft = std::move(other.data_dft);
+    data_spec = std::move(other.data_spec);
 
     storage_tgt = other.storage_tgt;
     storage_dft = other.storage_dft;
@@ -2131,6 +2135,7 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_che
 size_t common_prompt_checkpoint::size() const {
     return data_tgt.size() +
            data_dft.size() +
+           data_spec.size() +
            llama_state_seq_storage_size(storage_tgt) +
            llama_state_seq_storage_size(storage_dft);
 }
@@ -2147,6 +2152,7 @@ void common_prompt_checkpoint::clear() {
 
     data_tgt.clear();
     data_dft.clear();
+    data_spec.clear();
 
     llama_state_seq_storage_free(storage_tgt);
     llama_state_seq_storage_free(storage_dft);
@@ -2269,6 +2275,7 @@ void common_prompt_checkpoint::clear_tgt() {
 
 void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
+    data_spec.clear();
     llama_state_seq_storage_free(storage_dft);
     storage_dft = nullptr;
 }

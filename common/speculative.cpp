@@ -1371,6 +1371,27 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         drafting.assign(n_seq, 0);
     }
 
+    // Serialize pending_h so it survives SSD cold-start restore.
+    // Without this, the cross-token carry-over embedding is zeroed after
+    // restart, causing one wrong KV cell in ctx_dft for the entire session.
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (is_mem_shared) return false; // shared-memory MTP has no separate pending_h
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) return false;
+
+        const auto & h = pending_h[seq_id];
+        data.resize(h.size() * sizeof(float));
+        std::memcpy(data.data(), h.data(), data.size());
+        return !data.empty();
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (is_mem_shared) return;
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) return;
+        if (data.size() != (size_t) n_embd * sizeof(float)) return;
+
+        std::memcpy(pending_h[seq_id].data(), data.data(), data.size());
+    }
+
     ~common_speculative_state_draft_mtp() override {
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {

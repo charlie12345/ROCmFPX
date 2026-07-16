@@ -1,0 +1,212 @@
+name: Build Packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - rocmFPX-cachyllama
+    paths: [
+      '.github/workflows/build-packages.yml',
+      '**/CMakeLists.txt',
+      '**/.cmake',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp',
+      '**/*.cu',
+      '**/*.cuh'
+    ]
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: [
+      '.github/workflows/build-packages.yml',
+      '**/CMakeLists.txt',
+      '**/.cmake',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp',
+      '**/*.cu',
+      '**/*.cuh'
+    ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  VULKAN_VERSION: 1.4.313.2
+
+jobs:
+  windows-msvc-vulkan:
+    runs-on: windows-2025
+    name: Windows x64 MSVC Vulkan
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: windows-x64-msvc-vulkan
+          variant: ccache
+          evict-old-files: 1d
+          save: ${{ github.event_name == 'push' }}
+
+      - name: Install Vulkan SDK
+        id: get_vulkan
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Install Ninja
+        id: install_ninja
+        run: |
+          choco install ninja
+
+      - name: Setup MSVC
+        id: setup_msvc
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build (x64 MSVC Vulkan)
+        id: cmake_build
+        run: |
+          cmake -B build `
+            -G "Ninja Multi-Config" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_NATIVE=OFF `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_WEBUI=OFF `
+            -DLLAMA_USE_PREBUILT_WEBUI=OFF `
+            -DLLAMA_OPENSSL=OFF `
+            -DGGML_RPC=ON `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_VULKAN=ON
+          cmake --build build --config Release
+
+      - name: Test
+        id: cmake_test
+        run: |
+          cd build
+          ctest -L main -C Release --verbose --timeout 900
+
+      - name: Create artifact archive
+        run: |
+          cd build
+          mkdir -p artifacts
+          copy bin\Release\*.exe artifacts\ 2>nul || true
+          copy bin\Release\*.dll artifacts\ 2>nul || true
+          7z a llama-windows-msvc-vulkan.7z artifacts\
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-windows-x64-msvc-vulkan
+          path: build/llama-windows-msvc-vulkan.7z
+          retention-days: 7
+
+  windows-hip:
+    runs-on: windows-2022
+    name: Windows x64 HIP Radeon
+
+    env:
+      # Make sure this is in sync with build.yml / build-cache.yml
+      HIPSDK_INSTALLER_VERSION: "26.Q1"
+      # RDNA2 / RDNA3 / RDNA3.5 (Strix Halo gfx1151) / RDNA4
+      HIP_GPU_TARGETS: "gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201"
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: Grab rocWMMA package
+        id: grab_rocwmma
+        run: |
+          curl -o rocwmma.deb "https://repo.radeon.com/rocm/apt/7.2.1/pool/main/r/rocwmma-dev/rocwmma-dev_2.2.0.70201-81~24.04_amd64.deb"
+          7z x rocwmma.deb
+          7z x data.tar
+
+      - name: Use ROCm Installation Cache
+        uses: actions/cache@v5
+        id: cache-rocm
+        with:
+          path: C:\Program Files\AMD\ROCm
+          key: rocm-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ runner.os }}
+
+      - name: Setup ROCm
+        if: steps.cache-rocm.outputs.cache-hit != 'true'
+        uses: ./.github/actions/windows-setup-rocm
+        with:
+          version: ${{ env.HIPSDK_INSTALLER_VERSION }}
+
+      - name: Verify ROCm
+        id: verify
+        run: |
+          $clangPath = Get-ChildItem 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | Select-Object -First 1
+          if (-not $clangPath) {
+            Write-Error "ROCm installation not found"
+            exit 1
+          }
+          & $clangPath.FullName --version
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: windows-x64-hip-radeon
+          variant: ccache
+          evict-old-files: 1d
+          save: ${{ github.event_name == 'push' }}
+
+      - name: Build (x64 HIP)
+        id: cmake_build
+        run: |
+          $env:HIP_PATH=$(Resolve-Path 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | split-path | split-path)
+          $env:CMAKE_PREFIX_PATH="${env:HIP_PATH}"
+          cmake -G "Unix Makefiles" -B build -S . `
+            -DCMAKE_C_COMPILER="${env:HIP_PATH}\bin\clang.exe" `
+            -DCMAKE_CXX_COMPILER="${env:HIP_PATH}\bin\clang++.exe" `
+            -DCMAKE_CXX_FLAGS="-I$($PWD.Path.Replace('\', '/'))/opt/rocm-7.2.1/include/ -Wno-ignored-attributes -Wno-nested-anon-types" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_NATIVE=OFF `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_WEBUI=OFF `
+            -DLLAMA_USE_PREBUILT_WEBUI=OFF `
+            -DLLAMA_OPENSSL=OFF `
+            -DGGML_RPC=ON `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_HIP=ON `
+            -DGGML_HIP_ROCWMMA_FATTN=ON `
+            -DROCM_DIR="${env:HIP_PATH}" `
+            -DGPU_TARGETS="${env:HIP_GPU_TARGETS}"
+          cmake --build build -j ${env:NUMBER_OF_PROCESSORS}
+
+      - name: Bundle ROCm runtime DLLs
+        run: |
+          $env:HIP_PATH=$(Resolve-Path 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | split-path | split-path)
+          md "build\bin\rocblas\library\"
+          md "build\bin\hipblaslt\library"
+          cp "${env:HIP_PATH}\bin\libhipblas.dll" "build\bin\"
+          cp "${env:HIP_PATH}\bin\libhipblaslt.dll" "build\bin\"
+          cp "${env:HIP_PATH}\bin\rocblas.dll" "build\bin\"
+          cp "${env:HIP_PATH}\bin\rocblas\library\*" "build\bin\rocblas\library\"
+          cp "${env:HIP_PATH}\bin\hipblaslt\library\*" "build\bin\hipblaslt\library\"
+
+      - name: Create artifact archive
+        run: |
+          cd build
+          7z a llama-windows-hip-radeon.7z .\bin\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-windows-x64-hip-radeon
+          path: build/llama-windows-hip-radeon.7z
+          retention-days: 7

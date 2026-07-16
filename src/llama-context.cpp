@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -4028,6 +4029,25 @@ bool llama_memory_seq_rm(
         return true;
     }
 
+    return mem->seq_rm(seq_id, p0, p1);
+}
+
+bool llama_memory_seq_rm_attn_only(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return true;
+    }
+
+    // For hybrid models, use the attention-only removal that preserves recurrent state
+    auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    if (mem_hybrid) {
+        return mem_hybrid->seq_rm_attn_only(seq_id, p0, p1);
+    }
+
+    // For non-hybrid models, fall back to regular seq_rm
     return mem->seq_rm(seq_id, p0, p1);
 }
 

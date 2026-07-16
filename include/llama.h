@@ -752,6 +752,16 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Remove attention-only tokens from the specified sequence [p0, p1)
+    // For hybrid models, this clears KV cache entries without affecting recurrent state.
+    // For non-hybrid models, this is equivalent to llama_memory_seq_rm.
+    // Returns true if successful, false if the operation is not supported.
+    LLAMA_API bool llama_memory_seq_rm_attn_only(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)

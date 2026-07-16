@@ -444,6 +444,7 @@ struct common_params {
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
+    int32_t max_concurrent_per_user = 0;    // 0 = unlimited. cap on in-flight slots per user_id (also applies to the anonymous bucket).
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
@@ -610,6 +611,19 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_every_nt = 8192;  // make a checkpoint every n tokens during prefill
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    std::string cache_ssd_path = "";       // path for SSD-backed KV cache (empty = disabled)
+    int32_t cache_ssd_max_checkpoints = 64;  // max checkpoints to store on SSD per slot
+    size_t cache_ssd_hot_window_tokens = 16384;  // always-keep window in tokens
+    size_t cache_ssd_warm_window_tokens = 32768;  // keep-in-RAM window in tokens
+    size_t cache_ssd_page_size_tokens = 1024;     // tokens per page (512/1024/2048)
+    int32_t cache_ssd_max_cold = 0;         // max cold tier checkpoints (0=unlimited)
+    int32_t cache_ssd_max_conversations = 16; // max conversation directories
+    int32_t cache_ssd_hot_ram_mib = 0;       // hot tier RAM budget in MiB (0=auto-size)
+    int32_t cache_ssd_warm_ram_mib = 0;      // warm tier RAM budget in MiB (0=auto-size)
+    int32_t prompt_cache_max = 8;           // max prompt buffer entries (deduplicated system prompts)
+    int32_t cache_ssd_system_prompts = 8;   // max global system prompts to cache (0=disabled)
+    int32_t cache_ssd_system_max_days = 30; // expire system prompts unused for N days (0=never)
+    bool cache_ssd_no_fsync = false;      // skip fsync on SSD checkpoint writes (trade durability for latency)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -1067,6 +1081,10 @@ struct common_prompt_checkpoint {
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
+
+    // (optional) speculative-decoding implementation state stashed with the checkpoint
+    // (e.g. eagle3's deferred-boundary g_embd row)
+    std::vector<uint8_t> data_spec;
 
     llama_state_seq_storage * storage_tgt = nullptr;
     llama_state_seq_storage * storage_dft = nullptr;

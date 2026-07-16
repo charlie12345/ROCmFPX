@@ -16,6 +16,10 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-context-page-manager.cpp
+    server-context-page-manager.h
+    server-context-ssd-cache.cpp
+    server-context-ssd-cache.h
     server-tools.cpp
     server-tools.h
 )

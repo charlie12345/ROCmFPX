@@ -141,6 +141,13 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_hybrid::seq_rm_attn_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // Remove cells from attention cache only, without touching recurrent cache.
+    // This is needed for hybrid models where partial removal of recurrent state
+    // is not allowed, but we still want to clear stale attention cache cells.
+    return mem_attn->seq_rm(seq_id, p0, p1);
+}
+
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);

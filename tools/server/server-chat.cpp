@@ -1,4 +1,5 @@
 #include "server-chat.h"
+#include "server-task.h"
 #include "server-common.h"
 
 #include <sstream>
@@ -540,8 +541,16 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         json metadata = json_value(body, "metadata", json::object());
         std::string user_id = json_value(metadata, "user_id", std::string());
         if (!user_id.empty()) {
-            oai_body["__metadata_user_id"] = user_id;
+            // Promote to the canonical llama_user_id field. server_task
+            // validates and uses it for KV cache routing and scheduling.
+            oai_body["llama_user_id"] = server_task::validate_user_id(std::move(user_id));
         }
+    }
+
+    // OpenAI: top-level llama_user_id (or via extra_body in the SDK)
+    if (body.contains("llama_user_id")) {
+        std::string user_id = json_value(body, "llama_user_id", std::string());
+        oai_body["llama_user_id"] = server_task::validate_user_id(std::move(user_id));
     }
 
     return oai_body;
