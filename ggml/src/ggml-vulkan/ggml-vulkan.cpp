@@ -49,6 +49,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -141,7 +142,7 @@ typedef struct VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE {
 #endif
 
 #define ROUNDUP_POW2(M, N) (((M) + (N) - 1) & ~((N) - 1))
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+#define CEIL_DIV(M, N) (((M) / (N)) + (((M) % (N)) != 0))
 static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 
 static bool ggml_vk_is_turbo_type(ggml_type type) {
@@ -319,7 +320,7 @@ static ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
 class vk_memory_logger;
 class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
-static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
+static bool ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
@@ -697,6 +698,15 @@ struct vk_device_struct {
 
     bool add_rms_fusion;
     uint32_t partials_binding_alignment;
+    uint32_t max_nodes_per_submit;
+    uint32_t fa_max_workgroups_x_per_dispatch;
+    std::atomic<bool> device_lost {};
+    std::mutex device_lost_mutex;
+    std::string device_lost_where;
+    std::string device_lost_what;
+    std::atomic<int> active_graph_node {-1};
+    std::atomic<int> active_graph_nodes {0};
+    std::atomic<const char *> active_graph_op {nullptr};
 
     bool shader_64b_indexing;
 
@@ -984,6 +994,28 @@ struct vk_device_struct {
         device.destroy();
     }
 };
+
+static void ggml_vk_mark_device_lost(const vk_device & device, const char * where, const char * what) noexcept {
+    std::lock_guard<std::mutex> guard(device->device_lost_mutex);
+    if (device->device_lost.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    device->device_lost_where = where != nullptr ? where : "unknown";
+    device->device_lost_what  = what  != nullptr ? what  : "unknown";
+    device->device_lost.store(true, std::memory_order_release);
+
+    const char * op = device->active_graph_op.load(std::memory_order_relaxed);
+    fprintf(stderr,
+            "ggml_vulkan: fatal DeviceLost on %s at %s: %s "
+            "(graph node %d/%d, op=%s); refusing further submissions\n",
+            device->name.c_str(),
+            device->device_lost_where.c_str(),
+            device->device_lost_what.c_str(),
+            device->active_graph_node.load(std::memory_order_relaxed),
+            device->active_graph_nodes.load(std::memory_order_relaxed),
+            op != nullptr ? op : "unknown");
+}
 
 void vk_command_pool::init(vk_device& device, vk_queue *q_) {
     cmd_buffers.clear();
@@ -1828,6 +1860,38 @@ static bool vk_enable_sync_logger = false;
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
 
+static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        const uint64_t m     = node->ne[0];
+        const uint64_t n     = node->ne[1];
+        const uint64_t k     = node->src[1]->ne[0];
+        const uint64_t batch = node->ne[2] * node->ne[3];
+        return m * n * (k + (k - 1)) * batch;
+    }
+    if (node->op == GGML_OP_CONV_2D || node->op == GGML_OP_CONV_TRANSPOSE_2D) {
+        const ggml_tensor * knl = node->src[0];
+        const uint64_t Cout   = node->ne[2];
+        const uint64_t size_K = node->src[1]->ne[2] * knl->ne[0] * knl->ne[1];
+        const uint64_t size_N = node->ne[3] * node->ne[0] * node->ne[1];
+        return Cout * size_N * (size_K + (size_K - 1));
+    }
+    if (node->op == GGML_OP_CONV_3D) {
+        const ggml_tensor * knl = node->src[0];
+        const uint64_t OC     = ggml_get_op_params_i32(node, 11);
+        const uint64_t IC     = ggml_get_op_params_i32(node, 9);
+        const uint64_t size_K = IC * knl->ne[0] * knl->ne[1] * knl->ne[2];
+        const uint64_t size_N = node->ne[3] / OC * node->ne[0] * node->ne[1] * node->ne[2];
+        return OC * size_N * (size_K + (size_K - 1));
+    }
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        const ggml_tensor * q = node->src[0];
+        const ggml_tensor * k = node->src[1];
+        const ggml_tensor * v = node->src[2];
+        return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * k->ne[1] * q->ne[3];
+    }
+    return 0;
+}
+
 class vk_perf_logger {
   public:
     void print_timings(bool force = false) {
@@ -1876,7 +1940,7 @@ class vk_perf_logger {
     }
 
     std::string get_node_fusion_name(const ggml_tensor * node, const char *fusion_name, uint64_t *n_flops) {
-        *n_flops = 0;
+        *n_flops = ggml_vk_get_node_flops(node);
         std::string fusion_str;
         if (fusion_name) {
             fusion_str = fusion_name + std::string(" ");
@@ -1903,35 +1967,22 @@ class vk_perf_logger {
             if (batch > 1) {
                 name += " batch=" + std::to_string(batch);
             }
-            name = fusion_str + name;
-            *n_flops = m * n * (k + (k - 1)) * batch;
-            return name;
+            return fusion_str + name;
         }
         if (node->op == GGML_OP_CONV_2D || node->op == GGML_OP_CONV_TRANSPOSE_2D) {
             std::string   name    = ggml_op_name(node->op);
-            ggml_tensor * knl     = node->src[0];
-            uint64_t      OW      = node->ne[0];
-            uint64_t      OH      = node->ne[1];
-            uint64_t      N       = node->ne[3];
-            uint64_t      Cout    = node->ne[2];
-            uint64_t      KW      = knl->ne[0];
-            uint64_t      KH      = knl->ne[1];
-            uint64_t      Cin     = node->src[1]->ne[2];
-            // KxCRS @ CRSxNPQ = KxNPQ -> M=K, K=CRS, N=NPQ
-            uint64_t      size_M  = Cout;
-            uint64_t      size_K  = Cin * KW * KH;
-            uint64_t      size_N  = N * OW * OH;
-            *n_flops = size_M * size_N * (size_K + (size_K - 1));
-            name += " M=Cout=" + std::to_string(size_M) + ", K=Cin*KW*KH=" + std::to_string(size_K) +
+            const ggml_tensor * knl = node->src[0];
+            uint64_t      Cout      = node->ne[2];
+            uint64_t      size_K    = node->src[1]->ne[2] * knl->ne[0] * knl->ne[1];
+            uint64_t      size_N    = node->ne[3] * node->ne[0] * node->ne[1];
+            name += " M=Cout=" + std::to_string(Cout) + ", K=Cin*KW*KH=" + std::to_string(size_K) +
                     ", N=N*OW*OH=" + std::to_string(size_N);
-            name = fusion_str + name;
-            return name;
+            return fusion_str + name;
         }
         if (node->op == GGML_OP_RMS_NORM) {
             std::string   name    = ggml_op_name(node->op);
             name += "(" + std::to_string(node->ne[0]) + "," + std::to_string(node->ne[1]) + "," + std::to_string(node->ne[2]) + "," + std::to_string(node->ne[3]) + ")";
-            name = fusion_str + name;
-            return name;
+            return fusion_str + name;
         }
         if (node->op == GGML_OP_FLASH_ATTN_EXT) {
             const ggml_tensor * dst = node;
@@ -1947,7 +1998,6 @@ class vk_perf_logger {
                 " k(" << k->ne[0] << "," << k->ne[1] << "," << k->ne[2] << "," << k->ne[3] << "), " <<
                 " v(" << v->ne[0] << "," << v->ne[1] << "," << v->ne[2] << "," << v->ne[3] << "), " <<
                 " m(" << (m?m->ne[0]:0) << "," << (m?m->ne[1]:0) << "," << (m?m->ne[2]:0) << "," << (m?m->ne[3]:0) << ")";
-            *n_flops = 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * k->ne[1] * q->ne[3];
             return name.str();
         }
         if (node->op == GGML_OP_TOP_K) {
@@ -2011,7 +2061,7 @@ struct ggml_backend_vk_context {
     bool do_add_rms_partials_offset_calculation;
     bool do_add_rms_partials;
 
-    uint64_t last_total_mul_mat_bytes {};
+    uint64_t last_total_flops {UINT64_MAX};
 
     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
     vk_pipeline_struct * prealloc_y_last_pipeline_used {};
@@ -2208,12 +2258,27 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
     return range;
 }
 
-// Wait for ctx->fence to be signaled.
-static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+// Wait for ctx->fence to be signaled. A lost Vulkan device is fatal to this
+// backend instance; callers must stop submitting and let the process restart.
+static bool ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+    if (ctx->device->device_lost.load(std::memory_order_acquire)) {
+        return false;
+    }
+
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
     if (ctx->almost_ready_fence_pending) {
-        VK_CHECK(ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX), "almost_ready_fence");
+        const vk::Result result =
+            ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX);
+        if (result != vk::Result::eSuccess) {
+            if (result == vk::Result::eErrorDeviceLost) {
+                ggml_vk_mark_device_lost(ctx->device, "almost_ready_fence", to_string(result).c_str());
+            } else {
+                fprintf(stderr, "ggml_vulkan: almost_ready_fence error %s at %s:%d\n",
+                        to_string(result).c_str(), __FILE__, __LINE__);
+            }
+            return false;
+        }
         ctx->device->device.resetFences({ ctx->almost_ready_fence });
         ctx->almost_ready_fence_pending = false;
     }
@@ -2222,8 +2287,13 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     vk::Result result;
     while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
         if (result != vk::Result::eNotReady) {
-            fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
-            exit(1);
+            if (result == vk::Result::eErrorDeviceLost) {
+                ggml_vk_mark_device_lost(ctx->device, "graph fence", to_string(result).c_str());
+            } else {
+                fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n",
+                        to_string(result).c_str(), __FILE__, __LINE__);
+            }
+            return false;
         }
         for (uint32_t i = 0; i < 100; ++i) {
             YIELD();
@@ -2239,6 +2309,7 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         }
     }
     ctx->device->device.resetFences({ ctx->fence });
+    return true;
 }
 
 static constexpr uint32_t kSpvOpCooperativeMatrixLoadTensorNV = 5367;
@@ -5841,6 +5912,48 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_vote = (vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eCompute) &&
                                 (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote);
 
+        // Keep individual Vulkan submissions below the driver's compute-ring timeout.
+        // The default preserves existing behavior; AMD APU users can lower the ceiling.
+        device->max_nodes_per_submit = 100;
+        const char * max_nodes_per_submit_env = getenv("GGML_VK_MAX_NODES_PER_SUBMIT");
+        if (max_nodes_per_submit_env != nullptr) {
+            try {
+                size_t parsed_chars = 0;
+                const unsigned long parsed = std::stoul(max_nodes_per_submit_env, &parsed_chars);
+                if (parsed_chars != strlen(max_nodes_per_submit_env) ||
+                    parsed > std::numeric_limits<uint32_t>::max()) {
+                    throw std::out_of_range("invalid max nodes per submit");
+                }
+                device->max_nodes_per_submit = std::max((uint32_t)parsed, 1u);
+            } catch (const std::exception &) {
+                GGML_ABORT("GGML_VK_MAX_NODES_PER_SUBMIT must be a positive integer, got: %s",
+                           max_nodes_per_submit_env);
+            }
+        }
+        VK_LOG_DEBUG("ggml_vulkan: max nodes per submit = " << device->max_nodes_per_submit);
+
+        // Split large Flash Attention grids into multiple dispatch commands.
+        // This preserves workgroup IDs via vkCmdDispatchBase while giving GPU
+        // watchdogs a progress boundary between query-row chunks.
+        device->fa_max_workgroups_x_per_dispatch = 0;
+        const char * fa_max_workgroups_env = getenv("GGML_VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH");
+        if (fa_max_workgroups_env != nullptr) {
+            try {
+                size_t parsed_chars = 0;
+                const unsigned long parsed = std::stoul(fa_max_workgroups_env, &parsed_chars);
+                if (parsed_chars != strlen(fa_max_workgroups_env) ||
+                    parsed > std::numeric_limits<uint32_t>::max()) {
+                    throw std::out_of_range("invalid FA workgroup limit");
+                }
+                device->fa_max_workgroups_x_per_dispatch = (uint32_t) parsed;
+            } catch (const std::exception &) {
+                GGML_ABORT("GGML_VK_FA_MAX_WORKGROUPS_X_PER_DISPATCH must be a non-negative integer, got: %s",
+                           fa_max_workgroups_env);
+            }
+        }
+        VK_LOG_DEBUG("ggml_vulkan: FA max workgroups x per dispatch = "
+                     << device->fa_max_workgroups_x_per_dispatch);
+
         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
 
         device->fp16 = !force_disable_f16 && fp16_storage && fp16_compute;
@@ -7483,7 +7596,7 @@ template <typename T, uint32_t N> const T *push_constant_data(const std::array<T
 }
 
 template <typename T>
-static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& subctx, vk_pipeline& pipeline, std::initializer_list<vk::DescriptorBufferInfo> const& descriptor_buffer_infos, const T &push_constants, std::array<uint32_t, 3> elements) {
+static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& subctx, vk_pipeline& pipeline, std::initializer_list<vk::DescriptorBufferInfo> const& descriptor_buffer_infos, const T &push_constants, std::array<uint32_t, 3> elements, uint32_t max_workgroups_x_per_dispatch = 0) {
     const uint32_t wg0 = CEIL_DIV(elements[0], pipeline->wg_denoms[0]);
     const uint32_t wg1 = CEIL_DIV(elements[1], pipeline->wg_denoms[1]);
     const uint32_t wg2 = CEIL_DIV(elements[2], pipeline->wg_denoms[2]);
@@ -7511,7 +7624,14 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
                                 0,
                                 { descriptor_set },
                                 {});
-    subctx->s->buffer->buf.dispatch(wg0, wg1, wg2);
+    if (max_workgroups_x_per_dispatch != 0 && wg0 > max_workgroups_x_per_dispatch) {
+        for (uint32_t base_x = 0; base_x < wg0; base_x += max_workgroups_x_per_dispatch) {
+            const uint32_t count_x = std::min(max_workgroups_x_per_dispatch, wg0 - base_x);
+            subctx->s->buffer->buf.dispatchBase(base_x, 0, 0, count_x, wg1, wg2);
+        }
+    } else {
+        subctx->s->buffer->buf.dispatch(wg0, wg1, wg2);
+    }
 }
 
 static void ggml_vk_end_submission(vk_submission& s, std::vector<vk_semaphore> wait_semaphores, std::vector<vk_semaphore> signal_semaphores) {
@@ -10341,7 +10461,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
-    bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16;
+    bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+                        && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, k_fa_type, v_fa_type);
 
@@ -10528,7 +10649,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_mask_opt,
                                   { mask_buf, mask_opt_buf }, opt_pc,
-                                  { mask_opt_num_dwords, CEIL_DIV(nem1, Br), nem2 * nem3 });
+                                  { mask_opt_num_dwords, CEIL_DIV(nem1, Br), nem2 * nem3 },
+                                  ctx->device->fa_max_workgroups_x_per_dispatch == 0
+                                      ? 0u
+                                      : std::max(ctx->device->fa_max_workgroups_x_per_dispatch, 64u));
         ggml_vk_sync_buffers(ctx, subctx);
         ctx->prealloc_y_last_pipeline_used = nullptr;
         ctx->prealloc_y_last_tensor_used = nullptr;
@@ -10573,7 +10697,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                                     {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf},
-                                    pc, { dispatch_x, workgroups_y, workgroups_z });
+                                    pc, { dispatch_x, workgroups_y, workgroups_z },
+                                    ctx->device->fa_max_workgroups_x_per_dispatch);
 
         ggml_vk_sync_buffers(ctx, subctx);
         const uint32_t split_k_flags = (turbo_fused && v_turbo) ? 1u : 0u;
@@ -10589,7 +10714,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                                     {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf},
-                                    pc, { workgroups_x, workgroups_y, workgroups_z });
+                                    pc, { workgroups_x, workgroups_y, workgroups_z },
+                                    ctx->device->fa_max_workgroups_x_per_dispatch);
     }
 }
 
@@ -14975,10 +15101,22 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
     // discard any unsubmitted command buffers
     ctx->compute_ctx.reset();
-    // wait for any pending command buffers to finish
-    ggml_vk_synchronize(ctx);
-
-    ggml_vk_graph_cleanup(ctx);
+    // A lost Vulkan context cannot be synchronized or reset. Teardown below
+    // destroys owned handles without submitting more work.
+    if (!ctx->device->device_lost.load(std::memory_order_acquire)) {
+        try {
+            if (ggml_vk_synchronize(ctx)) {
+                ggml_vk_graph_cleanup(ctx);
+            }
+        } catch (const vk::DeviceLostError & err) {
+            ggml_vk_mark_device_lost(ctx->device, "backend cleanup", err.what());
+        }
+    } else {
+        ctx->submit_pending = false;
+        ctx->almost_ready_fence_pending = false;
+        ctx->tensor_ctxs.clear();
+        ctx->gc.contexts.clear();
+    }
 
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
@@ -15611,9 +15749,14 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     return false;
 }
 
-static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+static bool ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
 
+    if (ctx->device->device_lost.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    try {
     bool do_transfer = !ctx->compute_ctx.expired();
 
     if (ggml_vk_submit_transfer_ctx(ctx)) {
@@ -15658,7 +15801,9 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             std::lock_guard<std::mutex> guard(queue_mutex);
             ctx->device->compute_queue.queue.submit({}, ctx->fence);
         }
-        ggml_vk_wait_for_fence(ctx);
+        if (!ggml_vk_wait_for_fence(ctx)) {
+            return false;
+        }
         ctx->submit_pending = false;
         if (cmd_buf) {
             cmd_buf->in_use = false;
@@ -15672,15 +15817,29 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
+    return true;
+    } catch (const vk::DeviceLostError & err) {
+        ggml_vk_mark_device_lost(ctx->device, "synchronize", err.what());
+        ctx->submit_pending = false;
+        return false;
+    }
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
-    ggml_vk_synchronize(ctx);
+    if (ctx->device->device_lost.load(std::memory_order_acquire)) {
+        return;
+    }
 
-    ggml_vk_graph_cleanup(ctx);
+    try {
+        if (ggml_vk_synchronize(ctx)) {
+            ggml_vk_graph_cleanup(ctx);
+        }
+    } catch (const vk::DeviceLostError & err) {
+        ggml_vk_mark_device_lost(ctx->device, "backend synchronize cleanup", err.what());
+    }
 }
 
 static bool ggml_vk_is_empty(ggml_tensor * node) {
@@ -16099,6 +16258,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
+    if (ctx->device->device_lost.load(std::memory_order_acquire)) {
+        return GGML_STATUS_FAILED;
+    }
+
+    ctx->device->active_graph_nodes.store(cgraph->n_nodes, std::memory_order_relaxed);
+    try {
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
         dul.pLabelName = "ggml_backend_vk_graph_compute";
@@ -16169,24 +16334,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     // Submit after enough work has accumulated, to overlap CPU cmdbuffer generation with GPU execution.
-    // Estimate the amount of matmul work by looking at the weight matrix size, and submit every 100MB
-    // (and scaled down based on model size, so smaller models submit earlier).
-    // Also submit at least every 100 nodes, in case there are workloads without as much matmul.
-    int nodes_per_submit = 100;
-    int submitted_nodes = 0;
-    int submit_count = 0;
-    uint64_t mul_mat_bytes = 0;
-    uint64_t total_mul_mat_bytes = 0;
-    uint64_t mul_mat_bytes_per_submit = std::min(uint64_t(100*1000*1000), ctx->last_total_mul_mat_bytes / 40u);
+    // Estimate the amount of compute work using FLOPs, and submit every 200 GFLOP
+    // (scaled down based on total graph FLOPs, so smaller models submit earlier).
+    // The explicit node ceiling remains a second bound for light or uncounted operators.
+    uint32_t submitted_nodes = 0;
+    uint32_t submit_count = 0;
+    uint64_t batch_flops = 0;
+    uint64_t total_flops = 0;
+    uint64_t flops_per_submit = std::min(uint64_t(200'000'000'000), ctx->last_total_flops / 40u);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
             submit_node_idx = i;
         }
 
-        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT || cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
-            auto bytes = ggml_nbytes(cgraph->nodes[i]->src[0]);
-            mul_mat_bytes += bytes;
-            total_mul_mat_bytes += bytes;
+        {
+            const uint64_t node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
+            batch_flops += node_flops;
+            total_flops += node_flops;
         }
 
         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
@@ -16377,11 +16541,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
-        bool submit = (submitted_nodes >= nodes_per_submit) ||
-                      (mul_mat_bytes_per_submit != 0 && mul_mat_bytes >= mul_mat_bytes_per_submit) ||
+        bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
+                      (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
+        ctx->device->active_graph_node.store(i, std::memory_order_relaxed);
+        ctx->device->active_graph_op.store(ggml_op_name(cgraph->nodes[i]->op), std::memory_order_relaxed);
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
         if (vk_perf_logger_enabled && enqueued) {
@@ -16412,9 +16578,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         if (submit && enqueued) {
             first_node_in_batch = true;
             submitted_nodes = 0;
-            mul_mat_bytes = 0;
+            batch_flops = 0;
             if (submit_count < 3) {
-                mul_mat_bytes_per_submit *= 2;
+                flops_per_submit *= 2;
             }
             submit_count++;
         }
@@ -16423,7 +16589,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_ops_write_mask = 0;
     }
 
-    ctx->last_total_mul_mat_bytes = total_mul_mat_bytes;
+    ctx->last_total_flops = total_flops;
 
     if (vk_perf_logger_enabled) {
         // End the command buffer and submit/wait
@@ -16469,10 +16635,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     if (!ctx->device->support_async) {
-        ggml_vk_synchronize(ctx);
+        if (!ggml_vk_synchronize(ctx)) {
+            return GGML_STATUS_FAILED;
+        }
     }
 
+    ctx->device->active_graph_node.store(-1, std::memory_order_relaxed);
+    ctx->device->active_graph_op.store(nullptr, std::memory_order_relaxed);
     return GGML_STATUS_SUCCESS;
+    } catch (const vk::DeviceLostError & err) {
+        ggml_vk_mark_device_lost(ctx->device, "graph compute", err.what());
+        ctx->submit_pending = false;
+        return GGML_STATUS_FAILED;
+    }
 
     UNUSED(backend);
 }
