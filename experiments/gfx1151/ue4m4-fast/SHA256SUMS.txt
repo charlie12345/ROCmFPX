@@ -1,0 +1,2 @@
+b88c59cce0a2950e99bd9849dc3a3bd0e1de81dfc6d31016569bce45bd79ec53  ue4m4fast_deepseek_board.hip
+66824df16ca1c07950cdfe42153b941ffe8a4fee0d0ec6eb980fb369220fedb9  ue4m4fast-source-matched-device-oracle-v1.inc
