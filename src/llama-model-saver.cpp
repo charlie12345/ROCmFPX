@@ -393,6 +393,13 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->output_norm);
     add_tensor(model->output_norm_b);
     add_tensor(model->output);
+    // ModelOpt NVFP4 checkpoints quantize lm_head, so output carries a ".scale"
+    // and ".input_scale". The per-layer loop below walks llama_layer as a flat
+    // pointer array and therefore picks up every layer scale for free, but this
+    // top-level list is hand-written - omitting these two silently dropped the
+    // lm_head scales on save, changing the logits of any round-tripped model.
+    add_tensor(model->output_s);
+    add_tensor(model->output_in_s);
     add_tensor(model->output_b);
     add_tensor(model->output_norm_enc);
     add_tensor(model->cls);
