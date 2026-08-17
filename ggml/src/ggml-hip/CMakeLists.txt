@@ -168,3 +168,5 @@ endif()
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
 
 target_compile_options(ggml-hip PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:-ffast-math>")
+
+# CI control: no-op comment to trigger the same workflows as PR #82.
