@@ -102,9 +102,17 @@ void llama_model_nemotron_h::load_arch_tensors(llama_model_loader &) {
                 layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   moe_n_embd, n_expert}, 0);
                 layer.ffn_up_exps     = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {moe_n_embd, n_ff_exp, n_expert}, 0);
 
+                // NVFP4 per-tensor scale2 for routed experts
+                layer.ffn_up_exps_s   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+
                 // Shared expert branch
                 layer.ffn_down_shexp  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp, n_embd}, 0);
                 layer.ffn_up_shexp    = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp}, 0);
+
+                // NVFP4 per-tensor scale2 for shared expert
+                layer.ffn_up_shexp_s   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
 
             } else {
                 // mlp layers
