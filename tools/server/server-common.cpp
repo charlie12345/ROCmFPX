@@ -1189,7 +1189,10 @@ json oaicompat_chat_params_parse(
             llama_params["reasoning_budget_tokens"] = reasoning_budget;
             llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
             llama_params["reasoning_budget_end_tag"] = chat_params.thinking_end_tag;
-            llama_params["reasoning_budget_message"] = opt.reasoning_budget_message;
+            // the copy-through of remaining body keys below skips keys already set
+            // here, so the per-request message must be read explicitly (CLI default
+            // otherwise, as done for the budget itself)
+            llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
         }
     }
 

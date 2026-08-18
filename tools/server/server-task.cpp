@@ -506,10 +506,14 @@ task_params server_task::params_from_json_cmpl(
         if (!end_tag.empty()) {
             params.sampling.reasoning_budget_end = common_tokenize(vocab, end_tag, false, true);
             // il template re-renderizza un turno assistant passato come
-            // '<think>\n' + reasoning_content + '\n</think>\n\n': il '\n' prima dell'end tag
-            // deve far parte della sequenza forzata, altrimenti un turno tagliato dal budget
-            // non round-trippa nel resend del client e la prompt cache diverge alla chiusura
-            params.sampling.reasoning_budget_forced = common_tokenize(vocab, "\n" + message + end_tag, false, true);
+            // '<think>\n' + reasoning_content|trim + '\n</think>\n\n': la sequenza forzata
+            // deve portare un '\n' PRIMA dell'end tag e, quando c'e' un messaggio di
+            // chiusura, anche un '\n' DOPO il messaggio (il trim dell'estratto rimuove i
+            // whitespace di coda, quindi il resend ricompone esattamente '\n' + messaggio
+            // + '\n' + end_tag); senza di cio' un turno tagliato dal budget non round-trippa
+            // nel resend del client e la prompt cache diverge alla chiusura
+            params.sampling.reasoning_budget_forced = common_tokenize(
+                vocab, "\n" + message + (message.empty() ? "" : "\n") + end_tag, false, true);
 
             SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu toks, forced=%zu toks\n",
                 budget, params.sampling.generation_prompt.c_str(),
