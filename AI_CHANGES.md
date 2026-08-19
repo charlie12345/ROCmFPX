@@ -193,3 +193,29 @@ byte 2: v2[5:4] | v3[5:0]<<2
 *(Repeat per file. Keep entries factual. Do not remove or rewrite earlier sessions.)*
 
 -->
+
+---
+
+## Session 003 — 2026-08-19
+
+**Scope:** Backport upstream llama.cpp #26252 (Qwen3.x tool-call parsing) + dependency APIs into this fork so Qwen3.8-27B does reliable multi-turn tool calling. Reference: upstream ~/llama.cpp @ 1d2869c6e. Fork base 0a59add.
+
+### `common/` — peg-builder + qwen3 chat machinery
+
+| Change | File(s) | Detail |
+|--------|---------|--------|
+| Role enum + message delimiters | chat.h, chat.cpp | Added COMMON_CHAT_ROLE_*, common_chat_msg_delimiters, thinking_end_tags (vector), continuation enum, common_chat_template_generation_prompt[_impl], common_chat_params_init_qwen3_coder + detection |
+| Peg-builder API | chat-peg-parser.h/.cpp, chat-auto-parser.h, peg-parser.h/.cpp | Added common_chat_peg_builder (ac/permute/until_one_of/schema/peek/repeat/tool_arg_string_value), ac-parser (Aho-Corasick), trie.{h,cpp} (new, added to common/CMakeLists.txt) |
+| Multi end-tag budget | reasoning-budget.h/.cpp, sampling.cpp, common.h | Multi end-tag matcher ({" response","<tool_call>"}); replay matched end seq into grammar; COM_TRC macro; reasoning_budget_end → vector<llama_tokens> |
+| Continuation | chat-auto-parser.h, chat.cpp | generation_params::has_continuation/continue_msg/continue_final_message, COMMON_CHAT_CONTINUATION_CONTENT |
+| Jinja + grammar deps | common/jinja/*, json-schema-to-grammar.cpp | AST visitor, caps_apply_preserve_reasoning, upstream space-placement |
+
+### `tools/` — server/cli wiring
+
+| Change | File(s) | Detail |
+|--------|---------|--------|
+| reasoning_budget_end_tags array | server-common.cpp, server-task.cpp, cli.cpp | Emit/parse array form; thinking_end_tags rename sites |
+
+**Why:** fork lazy grammar was suppressed while budget sampler counted, and budget watched only ONE end tag; Qwen3.8 emits <tool_call> inside unclosed thinking → budget never DONE → tool grammar never activated → malformed <function=...> calls. Fix restores multi-turn tool calling.
+
+**Validation:** compiles clean; probe 2 consecutive tool calls across turns parse (3/3 @ temp 0.2, 1/3 @ 0.7); toy edit task 3/3 passes. Uncommitted history: prior stack backed up in engine-bin-backup-pre26262/ + oldlib/.

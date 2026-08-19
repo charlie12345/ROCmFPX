@@ -98,7 +98,7 @@ struct cli_context {
             }
 
             // reasoning budget sampler
-            if (!chat_params.thinking_end_tag.empty()) {
+            if (!chat_params.thinking_end_tags.empty()) {
                 const llama_vocab * vocab = llama_model_get_vocab(
                     llama_get_model(ctx_server.get_llama_context()));
 
@@ -109,13 +109,13 @@ struct cli_context {
                     task.params.sampling.reasoning_budget_start =
                         common_tokenize(vocab, chat_params.thinking_start_tag, false, true);
                 }
-                task.params.sampling.reasoning_budget_end =
-                    common_tokenize(vocab, chat_params.thinking_end_tag, false, true);
+                task.params.sampling.reasoning_budget_end = {
+                    common_tokenize(vocab, chat_params.thinking_end_tags.front(), false, true) };
                 // '\n' before the end tag: chat templates re-render an assistant turn as
                 // '<think>\n' + reasoning_content + '\n</think>\n\n', so without it a
                 // budget-truncated turn does not round-trip on session resend
                 task.params.sampling.reasoning_budget_forced =
-                    common_tokenize(vocab, "\n" + defaults.sampling.reasoning_budget_message + chat_params.thinking_end_tag, false, true);
+                    common_tokenize(vocab, "\n" + defaults.sampling.reasoning_budget_message + chat_params.thinking_end_tags.front(), false, true);
             }
 
             rd.post_task({std::move(task)});
