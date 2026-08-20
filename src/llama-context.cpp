@@ -2073,6 +2073,10 @@ int llama_context::decode(const llama_batch & batch_inp, uint32_t n_ubatch_overr
 
             if (embd_pre_norm.data && t_h_pre_norm && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_pre_norm);
+                if (backend_h == nullptr) {
+                    LLAMA_LOG_ERROR("%s: pre_norm extract null backend: tensor=%s masked=%d n_rows=%lld\n",
+                        __func__, t_h_pre_norm->name, (int) masked, (long long) n_rows);
+                }
                 GGML_ASSERT(backend_h != nullptr);
 
                 const uint32_t n_embd = model.n_embd_pre_norm();

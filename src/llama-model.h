@@ -616,6 +616,7 @@ struct llama_model {
 
     // eagle3
     struct ggml_tensor * fc  = nullptr;  // feature fusion layer
+    struct ggml_tensor * fc_s = nullptr; // DFlash2: optional scale for fc
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
     // dspark
