@@ -2434,6 +2434,17 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_DEEPSEEK4) {
         return std::max<uint32_t>(524288u, n_tokens * 192 + 64u * model.n_tensors());
     }
+    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+        // DFlash2 path selector nodes (ported from upstream PR #27342)
+        const uint32_t selector_tokens = std::min<uint32_t>(
+                n_tokens, model.hparams.dflash_block_size * cparams.n_seq_max);
+        uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+        res += 32*selector_tokens;
+        for (const auto & lora : model.loras) {
+            res += lora->get_n_nodes();
+        }
+        return res;
+    }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
