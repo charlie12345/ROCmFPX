@@ -4088,6 +4088,30 @@ void server_context::on_sleeping_changed(std::function<void(bool)> callback) {
 // server_routes
 //
 
+// Admission control: cap how many requests may sit waiting for a slot.
+//
+// With a small --parallel count a burst of traffic otherwise queues up behind
+// the running request and every client waits. When a fallback server is
+// available it is better to refuse quickly so the caller can go elsewhere,
+// rather than accept work we cannot start for a long time.
+//
+// Counts tasks that are *deferred* (waiting for a free slot); the request(s)
+// currently occupying slots are not counted.
+//
+//   LLAMA_MAX_QUEUED=<n>   reject when n or more requests are already waiting
+//                          (0 or unset = unlimited, i.e. upstream behaviour)
+static int server_max_queued() {
+    static int v = []() {
+        const char * e = getenv("LLAMA_MAX_QUEUED");
+        const int n = e ? atoi(e) : 0;
+        if (n > 0) {
+            SRV_INF("admission control: rejecting requests when %d are already queued\n", n);
+        }
+        return n > 0 ? n : 0;
+    }();
+    return v;
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
@@ -4097,6 +4121,21 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
     auto res = create_response();
+
+    // refuse early, before tokenizing, when the queue is already too deep
+    {
+        const int n_max_queued = server_max_queued();
+        if (n_max_queued > 0) {
+            const size_t n_queued = queue_tasks.queue_tasks_deferred_size();
+            if ((int) n_queued >= n_max_queued) {
+                SRV_WRN("rejecting request: %zu already queued (limit %d)\n", n_queued, n_max_queued);
+                res->error(format_error_response(
+                    "server busy: too many queued requests, try another endpoint",
+                    ERROR_TYPE_UNAVAILABLE));
+                return res;
+            }
+        }
+    }
     auto completion_id = gen_chatcmplid();
     auto & rd = res->rd;
 
