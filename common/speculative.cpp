@@ -2974,6 +2974,115 @@ bool common_speculative_need_embd_pre_norm(common_speculative * spec) {
     return false;
 }
 
+
+// ---------------------------------------------------------------------------
+// Context-lookup draft extension
+//
+// A model drafter (MTP, DFlash2, EAGLE3) proposes k tokens. When the answer is
+// being copied or lightly edited from material already in the prompt - RAG
+// answers, "reproduce this file with one change", quoting a document - the
+// tokens that follow are often sitting verbatim in the context.
+//
+// Those positions are free to fill: we match the tail of (prompt + draft)
+// against the prompt and append whatever followed it there. The target then
+// verifies one wider block instead of stopping at k, so the extra tokens cost
+// no draft compute and only a slightly wider verify batch.
+//
+// This differs from the ngram-* speculative implementations, which *compete*
+// with the model drafter for the sequence (first non-empty draft wins). Here we
+// extend the model drafter's own proposal.
+//
+// Config via env (opt-in, off by default):
+//   LLAMA_SPEC_LOOKUP_EXTEND=1     enable
+//   LLAMA_SPEC_LOOKUP_MATCH=<n>    tail length that must match exactly (default 8)
+//   LLAMA_SPEC_LOOKUP_MAX=<n>      total draft length to extend up to (default 16)
+// ---------------------------------------------------------------------------
+
+struct common_spec_lookup_cfg {
+    bool    enabled = false;
+    int32_t n_match = 8;
+    int32_t n_max   = 16;
+};
+
+static const common_spec_lookup_cfg & common_spec_lookup_get_cfg() {
+    static common_spec_lookup_cfg cfg = []() {
+        common_spec_lookup_cfg c;
+        if (const char * e = getenv("LLAMA_SPEC_LOOKUP_EXTEND")) {
+            c.enabled = atoi(e) != 0;
+        }
+        if (const char * e = getenv("LLAMA_SPEC_LOOKUP_MATCH")) {
+            c.n_match = std::max(2, atoi(e));
+        }
+        if (const char * e = getenv("LLAMA_SPEC_LOOKUP_MAX")) {
+            c.n_max = std::max(1, atoi(e));
+        }
+        if (c.enabled) {
+            LOG_INF("%s: context-lookup draft extension enabled (match=%d, max=%d)\n",
+                    __func__, c.n_match, c.n_max);
+        }
+        return c;
+    }();
+    return cfg;
+}
+
+// Extend `draft` in place using verbatim continuations found in `prompt`.
+// Returns the number of tokens appended.
+static int common_spec_lookup_extend(
+        const llama_tokens & prompt,
+              llama_token    id_last,
+              llama_tokens & draft,
+              int32_t        n_match,
+              int32_t        n_target) {
+    const int32_t n_have = (int32_t) draft.size();
+    if (n_have >= n_target) {
+        return 0;
+    }
+
+    // needle = last n_match tokens of the sequence the target will have seen
+    //          after accepting the whole current draft: [prompt..., id_last, draft...]
+    llama_tokens needle;
+    needle.reserve(n_match);
+    for (int32_t i = n_have - 1; i >= 0 && (int32_t) needle.size() < n_match; --i) {
+        needle.push_back(draft[i]);
+    }
+    if ((int32_t) needle.size() < n_match) {
+        needle.push_back(id_last);
+    }
+    for (int32_t i = (int32_t) prompt.size() - 1; i >= 0 && (int32_t) needle.size() < n_match; --i) {
+        needle.push_back(prompt[i]);
+    }
+    if ((int32_t) needle.size() < n_match) {
+        return 0; // not enough history yet
+    }
+    std::reverse(needle.begin(), needle.end());
+
+    // search the prompt for the most recent occurrence of the needle, skipping
+    // the tail we just built it from
+    const int32_t n_prompt = (int32_t) prompt.size();
+    if (n_prompt <= n_match) {
+        return 0;
+    }
+
+    int32_t found = -1;
+    for (int32_t i = n_prompt - n_match - 1; i >= 0; --i) {
+        bool ok = true;
+        for (int32_t j = 0; j < n_match; ++j) {
+            if (prompt[i + j] != needle[j]) { ok = false; break; }
+        }
+        if (ok) { found = i; break; }
+    }
+    if (found < 0) {
+        return 0;
+    }
+
+    int32_t n_added = 0;
+    for (int32_t i = found + n_match; i < n_prompt && (int32_t) draft.size() < n_target; ++i) {
+        draft.push_back(prompt[i]);
+        ++n_added;
+    }
+    return n_added;
+}
+
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -3040,6 +3149,34 @@ void common_speculative_draft(common_speculative * spec) {
 
         if (n_drafting == 0) {
             break;
+        }
+    }
+
+    // extend model drafts with verbatim continuations found in the prompt
+    {
+        const auto & cfg = common_spec_lookup_get_cfg();
+        if (cfg.enabled) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+                auto & dp = dparams[seq_id];
+
+                if (dp.prompt == nullptr || dp.result == nullptr || dp.result->empty()) {
+                    continue;
+                }
+
+                // respect the caller's cap when it is tighter than ours
+                int32_t n_target = cfg.n_max;
+                if (dp.n_max >= 0) {
+                    n_target = std::min(n_target, dp.n_max);
+                }
+
+                const int n_added = common_spec_lookup_extend(
+                        *dp.prompt, dp.id_last, *dp.result, cfg.n_match, n_target);
+
+                if (n_added > 0) {
+                    LOG_DBG("%s: lookup-extended draft for seq %d by %d tokens (total %zu)\n",
+                            __func__, (int) seq_id, n_added, dp.result->size());
+                }
+            }
         }
     }
 
