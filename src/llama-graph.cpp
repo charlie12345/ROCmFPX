@@ -1962,14 +1962,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
-    // apply per-expert scale2 to down
-    if (down_exps_s) {
-        ggml_tensor * s = ggml_reshape_3d(ctx0, down_exps_s, 1, n_expert, 1);
-        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-        s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
-        experts = ggml_mul(ctx0, experts, s);
-        cb(experts, "ffn_moe_down_scaled", il);
-    }
+    // Note: per-expert scale2 is already applied inside build_lora_mm_id
+    // (the explicit block here was double-applying it)
 
     if (!weight_before_ffn && !weight_before_down) {
         experts = ggml_mul(ctx0, experts, weights);
