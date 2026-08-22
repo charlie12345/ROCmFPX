@@ -195,6 +195,12 @@ struct llama_hparams {
     // output embedding dimension (0 = use n_embd)
     uint32_t n_embd_out_impl = 0;
 
+    uint32_t dflash_block_size       = 0;
+    uint32_t dflash_conv_kernel_size = 0;
+    uint32_t dflash_conv_group_size  = 0;
+    uint32_t dflash_selector_rank    = 0;
+    uint32_t dflash_selector_top_k   = 0;
+
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;
     uint32_t n_no_rope_layer_step    = 4;
@@ -229,6 +235,10 @@ struct llama_hparams {
     uint32_t n_hc                    = 1;
     uint32_t hc_sinkhorn_iters       = 0;
     float    hc_eps                  = 0.0f;
+    // DFlash2 port: DSpark-on-DSv4 draft hparams (dormant for Qwen drafts)
+    uint32_t dsv4_hc_mult            = 0;
+    uint32_t dsv4_o_group_count      = 0;
+    uint32_t dsv4_o_lora_rank        = 0;
     float    compress_rope_freq_base = 0.0f;
     uint32_t dsv4_state_size         = 0;
     std::array<uint32_t, LLAMA_MAX_LAYERS> attn_compress_ratio;

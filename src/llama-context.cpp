@@ -2073,6 +2073,10 @@ int llama_context::decode(const llama_batch & batch_inp, uint32_t n_ubatch_overr
 
             if (embd_pre_norm.data && t_h_pre_norm && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_pre_norm);
+                if (backend_h == nullptr) {
+                    LLAMA_LOG_ERROR("%s: pre_norm extract null backend: tensor=%s masked=%d n_rows=%lld\n",
+                        __func__, t_h_pre_norm->name, (int) masked, (long long) n_rows);
+                }
                 GGML_ASSERT(backend_h != nullptr);
 
                 const uint32_t n_embd = model.n_embd_pre_norm();
@@ -2433,6 +2437,17 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     }
     if (model.arch == LLM_ARCH_DEEPSEEK4) {
         return std::max<uint32_t>(524288u, n_tokens * 192 + 64u * model.n_tensors());
+    }
+    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+        // DFlash2 path selector nodes (ported from upstream PR #27342)
+        const uint32_t selector_tokens = std::min<uint32_t>(
+                n_tokens, model.hparams.dflash_block_size * cparams.n_seq_max);
+        uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+        res += 32*selector_tokens;
+        for (const auto & lora : model.loras) {
+            res += lora->get_n_nodes();
+        }
+        return res;
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     for (const auto & lora : model.loras) {

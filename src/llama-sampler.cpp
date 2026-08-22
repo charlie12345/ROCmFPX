@@ -425,6 +425,26 @@ void llama_sampler_free(struct llama_sampler * smpl) {
     delete smpl;
 }
 
+void llama_sampler_copy(const struct llama_sampler * src, struct llama_sampler * dst) {
+    if (!src || !dst || src == dst) {
+        return;
+    }
+
+    GGML_ASSERT(src->iface == dst->iface && "llama_sampler_copy: cannot copy between different sampler types");
+
+    // ported from upstream DFlash2 PR, minus the copy_state fast path (iface member
+    // does not exist in this tree): clone src, then transplant its state into dst
+    llama_sampler * tmp = llama_sampler_clone(src);
+
+    if (dst->iface->free) {
+        dst->iface->free(dst);
+    }
+
+    dst->ctx = tmp->ctx;
+    tmp->ctx = nullptr;
+    delete tmp;
+}
+
 // empty sampler
 
 struct llama_sampler_empty {
