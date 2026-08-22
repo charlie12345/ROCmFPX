@@ -42,6 +42,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "CodeShellForCausalLM": "codeshell",
     "CogVLMForCausalLM": "cogvlm",
     "Cohere2ForCausalLM": "command_r",
+    "Cohere2MoeForCausalLM": "command_r",
     "CohereForCausalLM": "command_r",
     "DbrxForCausalLM": "dbrx",
     "DeciLMForCausalLM": "deci",

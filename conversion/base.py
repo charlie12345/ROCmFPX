@@ -1505,7 +1505,7 @@ class TextModel(ModelBase):
             res = "command-r"
         if chkhsh == "d772b220ace2baec124bed8cfafce0ead7d6c38a4b65ef11261cf9d5d62246d1":
             # ref: https://huggingface.co/CohereLabs/tiny-aya-base
-            res = "tiny_aya"
+            res = "tiny_aya"  # also used by cohere2moe / North Mini
         if chkhsh == "e636dc30a262dcc0d8c323492e32ae2b70728f4df7dfe9737d9f920a282b8aea":
             # ref: https://huggingface.co/Qwen/Qwen1.5-7B
             res = "qwen2"

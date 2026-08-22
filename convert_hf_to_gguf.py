@@ -1620,7 +1620,7 @@ class TextModel(ModelBase):
             res = "command-r"
         if chkhsh == "d772b220ace2baec124bed8cfafce0ead7d6c38a4b65ef11261cf9d5d62246d1":
             # ref: https://huggingface.co/CohereLabs/tiny-aya-base
-            res = "tiny_aya"
+            res = "tiny_aya"  # also used by cohere2moe / North Mini
         if chkhsh == "e636dc30a262dcc0d8c323492e32ae2b70728f4df7dfe9737d9f920a282b8aea":
             # ref: https://huggingface.co/Qwen/Qwen1.5-7B
             res = "qwen2"
@@ -9153,6 +9153,89 @@ class Cohere2Model(TextModel):
             return
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+
+
+@ModelBase.register("Cohere2MoeForCausalLM")
+class Cohere2MoeModel(TextModel):
+    """Cohere2 MoE (North Mini Code). Ported from mainline conversion/command_r.py.
+    Per-expert FC biases: skipped when zero; ValueError if non-zero (runtime has no bias path required for North GGUFs).
+    """
+    model_arch = gguf.MODEL_ARCH.COHERE2MOE
+    _n_main_layers = None
+    _expert_tensor_re = __import__("re").compile(
+        r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(down_proj|gate_proj|up_proj)\.weight"
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        n_nextn = int(self.hparams.get("num_nextn_predict_layers", 0) or 0)
+        if n_nextn > 0 and not getattr(self, "no_mtp", False):
+            self.block_count += n_nextn
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        self._experts = [{} for _ in range(self.block_count)]
+
+    def set_gguf_parameters(self):
+        hparams = self.hparams
+        expert_intermediate_size = hparams["intermediate_size"]
+        mlp_layer_types = hparams.get("mlp_layer_types")
+        n_dense_lead = hparams.get("first_k_dense_replace", 0)
+        if mlp_layer_types is not None:
+            n_dense_lead = next((i for i, tp in enumerate(mlp_layer_types) if tp != "dense"), len(mlp_layer_types))
+        super().set_gguf_parameters()
+        self.gguf_writer.add_logit_scale(hparams["logit_scale"])
+        self.gguf_writer.add_sliding_window(hparams["sliding_window"])
+        self.gguf_writer.add_sliding_window_pattern([tp == "sliding_attention" for tp in hparams["layer_types"]])
+        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
+        self.gguf_writer.add_expert_feed_forward_length(expert_intermediate_size)
+        self.gguf_writer.add_leading_dense_block_count(n_dense_lead)
+        self.gguf_writer.add_expert_weights_norm(hparams.get("norm_topk_prob", False))
+        if (num_shared_experts := hparams.get("num_shared_experts", 0)) > 0:
+            if hparams.get("shared_expert_combination_strategy", "average") != "average":
+                raise ValueError("Cohere2 MoE only supports average shared expert combination")
+            self.gguf_writer.add_expert_shared_count(num_shared_experts)
+            self.gguf_writer.add_expert_shared_feed_forward_length(expert_intermediate_size * num_shared_experts)
+        n_nextn = hparams.get("num_nextn_predict_layers", 0)
+        if n_nextn > 0 and not getattr(self, "no_mtp", False):
+            self.gguf_writer.add_nextn_predict_layers(n_nextn)
+        self.gguf_writer.add_rope_dimension_count(hparams["head_dim"])
+        self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.NONE)
+
+    def modify_tensors(self, data_torch, name, bid=None):
+        import torch
+        if name.endswith(".bias"):
+            if torch.any(data_torch != 0):
+                raise ValueError(f"Bias tensor {name!r} is not zero.")
+            logger.debug(f"Skipping bias tensor {name!r}.")
+            return
+        m = self._expert_tensor_re.fullmatch(name)
+        if m is not None:
+            n_experts = self.hparams["num_experts"]
+            layer_idx = int(m.group(1))
+            self._experts[layer_idx][name] = data_torch
+            expected = {
+                f"model.layers.{layer_idx}.mlp.experts.{xid}.{w_name}.weight"
+                for xid in range(n_experts)
+                for w_name in ("down_proj", "gate_proj", "up_proj")
+            }
+            if expected.issubset(self._experts[layer_idx]):
+                for w_name in ["down_proj", "gate_proj", "up_proj"]:
+                    datas = []
+                    for xid in range(n_experts):
+                        ename = f"model.layers.{layer_idx}.mlp.experts.{xid}.{w_name}.weight"
+                        datas.append(self._experts[layer_idx][ename])
+                        del self._experts[layer_idx][ename]
+                    data_torch = torch.stack(datas, dim=0)
+                    merged_name = f"model.layers.{layer_idx}.mlp.experts.{w_name}.weight"
+                    yield from super().modify_tensors(data_torch, merged_name, layer_idx)
+            return
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        experts = [k for d in self._experts for k in d.keys()]
+        if len(experts) > 0:
+            raise ValueError(f"Unprocessed experts: {experts}")
 
 
 @ModelBase.register("OlmoForCausalLM")
