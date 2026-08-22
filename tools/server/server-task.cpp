@@ -2412,7 +2412,7 @@ bool server_prompt_cache::save_disk(
         return false;
     }
 
-    if (prompt.tokens.has_mtmd) {
+    if (prompt.tokens.has_media()) {
         SRV_WRN("prompt cache disk skip: reason=multimodal tokens=%zu path=%s\n",
                 prompt.tokens.size(), disk_owned_path.c_str());
         return false;
