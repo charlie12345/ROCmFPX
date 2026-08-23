@@ -1352,3 +1352,211 @@ bool rocmfpx_validate_row_data_fp8(const void * data, size_t nbytes) {
 
     return true;
 }
+
+static int8_t rocmi4_quantize_code(float x, float inv_scale) {
+    if (!isfinite(x) || inv_scale <= 0.0f) {
+        return 0;
+    }
+
+    int q = (int) lroundf(x * inv_scale);
+    if (q > 7) {
+        q = 7;
+    } else if (q < -8) {
+        q = -8;
+    }
+    return (int8_t) q;
+}
+
+static int8_t rocmi4_nibble_to_i8(uint8_t nibble) {
+    return (int8_t) ((nibble & 0x8u) ? (int) (nibble | 0xF0u) : (int) (nibble & 0x7u));
+}
+
+size_t rocmfpx_row_size_i4(int64_t k) {
+    assert(k % QK_ROCMI4 == 0);
+    return (size_t) (k / QK_ROCMI4) * sizeof(block_rocmi4);
+}
+
+// ---------------------------------------------------------------------------
+// Importance-matrix (imatrix) weighted quantisation for Q4_0_ROCMI4.
+//
+// ROCMI4 has exactly one free parameter per block: the UE4M3 scale. The codes
+// then follow by rounding. So imatrix support means choosing the scale that
+// minimises the importance-weighted error over the block, instead of simply
+// taking amax/7. Same approach the FP2/FP3/FP6/FP8 siblings already use.
+// ---------------------------------------------------------------------------
+
+static float rocmfpx_i4_block_weighted_mse_for_scale(const float * x, int n, const float * mse_weights, uint8_t e, float best_err) {
+    const float scale = rocmfpx_scale_lookup(e);
+    const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    float err = 0.0f;
+
+    for (int i = 0; i < n; ++i) {
+        if (!isfinite(x[i])) {
+            continue;
+        }
+        const int8_t code = rocmi4_quantize_code(x[i], inv_scale);
+        const float y = (float) code * scale;
+        const float d = x[i] - y;
+
+        err += mse_weights[i]*d*d;
+        if (err > best_err) {
+            return err;
+        }
+    }
+
+    return err;
+}
+
+static uint8_t rocmfpx_choose_scale_i4_weighted_mse(const float * x, int n, const float * quant_weights, float sigma2) {
+    assert(n <= QK_ROCMI4);
+    float mse_weights[QK_ROCMI4];
+    float max_abs;
+    float max_abs_weight;
+    bool all_finite;
+    rocmfpx_prepare_mse_weights(mse_weights, x, n, quant_weights, sigma2, &max_abs, &max_abs_weight, &all_finite);
+    GGML_UNUSED(all_finite);
+    if (!(max_abs > 0.0f) || !isfinite(max_abs)) {
+        return 0;
+    }
+
+    const uint8_t start_e = rocmfpx_nearest_scale_ue4m3(max_abs / 7.0f);
+    uint8_t best_e = start_e;
+    float best_err = INFINITY;
+    bool lower_done = false;
+
+    for (int delta = 0; delta <= 125; ++delta) {
+        const int e0 = (int) start_e - delta;
+        if (!lower_done && e0 >= 1 && e0 <= 126) {
+            const float scale = rocmfpx_scale_lookup((uint8_t) e0);
+            // Below this scale the largest magnitude clips; once that clipping
+            // error alone exceeds the best seen, no smaller scale can win.
+            const float clip_delta = max_abs - 7.0f*scale;
+            if (clip_delta > 0.0f && max_abs_weight*clip_delta*clip_delta > best_err) {
+                lower_done = true;
+            } else {
+                const float err = rocmfpx_i4_block_weighted_mse_for_scale(x, n, mse_weights, (uint8_t) e0, best_err);
+                if (err < best_err || (err == best_err && e0 < best_e)) {
+                    best_err = err;
+                    best_e = (uint8_t) e0;
+                }
+            }
+        }
+
+        const int e1 = (int) start_e + delta;
+        if (delta != 0 && e1 >= 1 && e1 <= 126) {
+            const float err = rocmfpx_i4_block_weighted_mse_for_scale(x, n, mse_weights, (uint8_t) e1, best_err);
+            if (err < best_err || (err == best_err && e1 < best_e)) {
+                best_err = err;
+                best_e = (uint8_t) e1;
+            }
+        }
+
+        if ((lower_done || e0 <= 1) && e1 >= 126) {
+            break;
+        }
+    }
+
+    return best_e;
+}
+
+static void rocmfpx_quantize_row_i4_weighted(
+        const float * GGML_RESTRICT x, block_rocmi4 * GGML_RESTRICT y, int64_t k, const float * GGML_RESTRICT quant_weights) {
+    assert(k % QK_ROCMI4 == 0);
+
+    float sum_x2 = 0.0f;
+    for (int64_t i = 0; i < k; ++i) {
+        sum_x2 += isfinite(x[i]) ? x[i]*x[i] : 0.0f;
+    }
+    const float sigma2 = sum_x2 / (float) k;
+
+    const int64_t nb = k / QK_ROCMI4;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib * QK_ROCMI4;
+        const float * qw = quant_weights ? quant_weights + ib * QK_ROCMI4 : NULL;
+        block_rocmi4 * yb = y + ib;
+
+        yb->e = qw ? rocmfpx_choose_scale_i4_weighted_mse(xb, QK_ROCMI4, qw, sigma2) :
+                     rocmfpx_nearest_scale_ue4m3(rocmfpx_max_abs(xb, QK_ROCMI4) / 7.0f);
+
+        const float scale = rocmfpx_scale_lookup(yb->e);
+        const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+
+        for (int j = 0; j < QS_ROCMI4; ++j) {
+            const int8_t q0 = rocmi4_quantize_code(xb[j], inv_scale);
+            const int8_t q1 = rocmi4_quantize_code(xb[j + QS_ROCMI4], inv_scale);
+            yb->qs[j] = (uint8_t) ((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+        }
+    }
+}
+
+void rocmfpx_quantize_row_i4_ref(const float * GGML_RESTRICT x, block_rocmi4 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_ROCMI4 == 0);
+
+    const int64_t nb = k / QK_ROCMI4;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib * QK_ROCMI4;
+        block_rocmi4 * yb = y + ib;
+
+        const float max_abs = rocmfpx_max_abs(xb, QK_ROCMI4);
+        yb->e = rocmfpx_nearest_scale_ue4m3(max_abs / 7.0f);
+
+        const float scale = rocmfpx_scale_lookup(yb->e);
+        const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+
+        for (int j = 0; j < QS_ROCMI4; ++j) {
+            const int8_t q0 = rocmi4_quantize_code(xb[j], inv_scale);
+            const int8_t q1 = rocmi4_quantize_code(xb[j + QS_ROCMI4], inv_scale);
+            yb->qs[j] = (uint8_t) ((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+        }
+    }
+}
+
+void rocmfpx_dequantize_row_i4(const block_rocmi4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_ROCMI4 == 0);
+
+    const int64_t nb = k / QK_ROCMI4;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const block_rocmi4 * xb = x + ib;
+        float * yb = y + ib * QK_ROCMI4;
+        const float scale = rocmfpx_scale_lookup(xb->e);
+        for (int j = 0; j < QS_ROCMI4; ++j) {
+            yb[j]              = (float) rocmi4_nibble_to_i8(xb->qs[j] & 0x0Fu) * scale;
+            yb[j + QS_ROCMI4]  = (float) rocmi4_nibble_to_i8(xb->qs[j] >> 4) * scale;
+        }
+    }
+}
+
+void rocmfpx_quantize_row_i4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_i4_ref(x, (block_rocmi4 *) y, k);
+}
+
+size_t rocmfpx_quantize_i4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    const size_t row_size = rocmfpx_row_size_i4(n_per_row);
+    char * qrow = (char *) dst;
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        if (imatrix) {
+            rocmfpx_quantize_row_i4_weighted(src + row * n_per_row, (block_rocmi4 *) qrow, n_per_row, imatrix);
+        } else {
+            rocmfpx_quantize_row_i4_ref(src + row * n_per_row, (block_rocmi4 *) qrow, n_per_row);
+        }
+        qrow += row_size;
+    }
+
+    return (size_t) nrows * row_size;
+}
+
+bool rocmfpx_validate_row_data_i4(const void * data, size_t nbytes) {
+    if (nbytes % sizeof(block_rocmi4) != 0) {
+        return false;
+    }
+
+    const block_rocmi4 * blocks = (const block_rocmi4 *) data;
+    const size_t nb = nbytes / sizeof(block_rocmi4);
+    for (size_t i = 0; i < nb; ++i) {
+        if (!rocmfpx_scale_is_valid(blocks[i].e)) {
+            return false;
+        }
+    }
+    return true;
+}

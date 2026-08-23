@@ -268,7 +268,9 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
     }
 }
 
-template <mmq_q8_1_ds_layout ds_layout>
+// i4_grid: quantize activations onto a signed 4-bit grid and store packed
+// nibbles for the experimental gfx1151 ROCmI4 W4A4 MMQ path.
+template <mmq_q8_1_ds_layout ds_layout, bool i4_grid = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -324,16 +326,40 @@ static __global__ void quantize_mmq_q8_1(
         }
     }
 
-    const float d_inv = 127.0f / amax;
-    char4 q;
-    q.x = roundf(xi.x*d_inv);
-    q.y = roundf(xi.y*d_inv);
-    q.z = roundf(xi.z*d_inv);
-    q.w = roundf(xi.w*d_inv);
+    const float d_inv = i4_grid
+        ? (amax > 0.0f ? 7.0f / amax : 0.0f)
+        : 127.0f / amax;
+    if constexpr (i4_grid) {
+        // Emit PACKED nibbles in the byte-interleaved K-order the IU4 MMQ kernel
+        // expects: dword l holds values [8l+0,8l+4,8l+1,8l+5,8l+2,8l+6,8l+3,8l+7].
+        // Packing here rather than in the matmul inner loop keeps tile_B at 4
+        // registers instead of 8+4, which is what stops mmq_x=48/64 spilling.
+        const int c0 = (int) fminf(fmaxf(roundf(xi.x*d_inv), -8.0f), 7.0f);
+        const int c1 = (int) fminf(fmaxf(roundf(xi.y*d_inv), -8.0f), 7.0f);
+        const int c2 = (int) fminf(fmaxf(roundf(xi.z*d_inv), -8.0f), 7.0f);
+        const int c3 = (int) fminf(fmaxf(roundf(xi.w*d_inv), -8.0f), 7.0f);
 
-    // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:
-    char4 * yqs4 = (char4 *) y[ib].qs;
-    yqs4[iqs/4] = q;
+        // one nibble per byte
+        const int lo4 = (c0 & 0xF) | ((c1 & 0xF) << 8) | ((c2 & 0xF) << 16) | ((c3 & 0xF) << 24);
+
+        // the odd thread of each pair holds the next 4 values; merge into its high nibbles
+        const int hi4 = __shfl_xor_sync(0xFFFFFFFF, lo4, 1, WARP_SIZE);
+
+        if (iqs % 8 == 0) {
+            int * yqs_i = (int *) y[ib].qs;
+            yqs_i[iqs/8] = lo4 | (hi4 << 4);
+        }
+    } else {
+        char4 q;
+        q.x = roundf(xi.x*d_inv);
+        q.y = roundf(xi.y*d_inv);
+        q.z = roundf(xi.z*d_inv);
+        q.w = roundf(xi.w*d_inv);
+
+        // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:
+        char4 * yqs4 = (char4 *) y[ib].qs;
+        yqs4[iqs/4] = q;
+    }
 
     if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
         if (iqs % 16 != 0 || iqs >= 96) {
@@ -357,7 +383,9 @@ static __global__ void quantize_mmq_q8_1(
         return;
     }
 
-    const float d = 1.0f / d_inv;
+    // For i4_grid the MMQ kernel scales its accumulator by 16 (it works in units
+    // of c, not 16*c), so pre-divide the stored scale to compensate.
+    const float d = i4_grid ? (amax > 0.0f ? amax / (7.0f * 16.0f) : 0.0f) : 1.0f / d_inv;
 
     if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
         y[ib].ds4[iqs/32] = make_half2(d, sum);
@@ -393,6 +421,15 @@ void quantize_mmq_q8_1_cuda(
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+#if GGML_ROCMI4_W4A4
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    // Native IU4 W4A4: activations go onto the 4-bit grid up front.
+    if (type_src0 == GGML_TYPE_Q4_0_ROCMI4 && GGML_CUDA_CC_IS_GFX1151(cc)) {
+        quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true>
+            <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+        return;
+    }
+#endif
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>

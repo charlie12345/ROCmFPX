@@ -117,6 +117,116 @@ MTP gains are content-dependent: predictable code, JSON, and lists usually
 accept more draft tokens than creative prose. Treat the profiles above as tested
 starting points, not universal defaults.
 
+## Experimental ROCmI4 IU4 Acceleration (`gfx1151`)
+
+ROCmFPX includes an opt-in HIP/ROCm path for `Q4_0_ROCMI4` models on AMD
+Strix Halo. It keeps ROCmI4 weights packed as signed four-bit values and uses
+the native `v_wmma_i32_16x16x16_iu4` instruction for batched matrix
+multiplication. The feature is intended for prompt processing and MTP target
+verification; ordinary one-token-at-a-time generation continues to use MMVQ.
+
+The path is deliberately conservative:
+
+- `GGML_HIP_ROCMI4_W4A4` defaults to `OFF`.
+- Device code is compiled only under the exact `__gfx1151__` target.
+- Runtime dispatch also requires the exact `gfx1151` device identifier.
+- Other GPUs and default builds use the existing exact int8 MMQ path.
+- No backend-test tolerance is weakened when W4A4 is enabled.
+
+### Architecture and terminology
+
+These names describe different layers of the system:
+
+| Term | What it describes | Representation and role |
+|---|---|---|
+| **ROCmI4** | GGUF model-weight format | Signed four-bit weight codes, packed two per byte with block scales. This is the model stored on disk. |
+| **INT4** | Generic integer width | Four-bit integers: usually signed `-8..7` or unsigned `0..15`. INT4 does not imply a particular file format or GPU instruction. |
+| **IU4** | AMD WMMA instruction spelling | The gfx1151 integer matrix instruction consumes packed four-bit operands and accumulates into int32. It is a compute path, not a GGUF quant type. |
+| **INT8** | Eight-bit integer arithmetic | Wider integer range. The exact ROCmI4 MMQ fallback expands packed weight codes and quantizes activations for int8 computation. |
+| **FP8** | Eight-bit floating point | Uses sign, exponent, and mantissa, commonly E4M3 or E5M2. It has different range, precision, scaling, and kernels from INT4/IU4. |
+| **FP4** | Four-bit floating point | A floating-point encoding with exponent/mantissa behavior. It is not the same representation as ROCmI4 or signed INT4. |
+
+`W4A4` means four-bit weights and four-bit activations during the accelerated
+matrix multiply. The ROCmI4 weights themselves are unchanged; the additional
+loss comes from quantizing float activations directly to a signed four-bit grid.
+
+### Why MTP decode becomes faster
+
+Non-speculative decode evaluates one new token at a time and is mostly
+memory-bandwidth bound, so the W4A4 MMQ path does not materially change a plain
+`tg128` result. MTP changes the workload:
+
+1. The model's embedded NextN/MTP head proposes up to several future tokens.
+2. The target model verifies those proposed tokens together in a batch.
+3. Batched verification uses MMQ and therefore reaches the native IU4 path.
+4. Accepted draft tokens become output tokens without separate serial target
+   evaluations.
+
+On the development Ryzen AI MAX+ 395 / Radeon 8060S (`gfx1151`) system, a
+matched 10-task Qwen3.8-27B HumanEval pilot with strict MTP-16 measured:
+
+| Build | Mean decode | Aggregate decode | Prompt processing |
+|---|---:|---:|---:|
+| Exact ROCmI4 int8 MMQ | 41.63 tok/s | 40.90 tok/s | 283.83 tok/s |
+| ROCmI4 W4A4 IU4 MMQ | **49.40 tok/s** | **48.29 tok/s** | **318.83 tok/s** |
+
+The W4A4 run improved mean end-to-end decode by 18.66%. A separate full
+164-task run measured 44.39 tok/s mean and 45.23 tok/s median, with HumanEval
+pass@1 94.5% and HumanEval+ pass@1 91.5%. A 25-chunk perplexity sample was
+about 5.4% higher than the exact path, so W4A4 remains an explicit quality/
+speed tradeoff rather than a default.
+
+### Build the opt-in path
+
+Use a separate build directory so the exact build remains available:
+
+```bash
+cmake -S . -B build-rocmI4-w4a4 \
+  -DGGML_HIP=ON \
+  -DGGML_VULKAN=OFF \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1151 \
+  -DGGML_HIP_ROCMI4_W4A4=ON \
+  -DLLAMA_BUILD_SERVER=ON
+cmake --build build-rocmI4-w4a4 --target llama-cli llama-server llama-bench -j 16
+```
+
+ROCm installations that do not identify Strix Halo natively may also need:
+
+```bash
+export HSA_OVERRIDE_GFX_VERSION=11.5.1
+```
+
+The server prints `ROCmI4 W4A4: enabled` when the accelerated path is active.
+If the compiled binary runs on an unsupported architecture, it reports the
+fallback and uses exact int8 MMQ.
+
+### Fast strict-MTP server profile
+
+For a Qwen model that contains its embedded MTP/NextN tensors:
+
+```bash
+build-rocmI4-w4a4/bin/llama-server \
+  -m model-Q4_0_ROCMI4.gguf \
+  --host 127.0.0.1 --port 8116 \
+  -dev ROCm0 -ngl 999 -np 1 -c 262144 \
+  -b 512 -ub 256 -t 16 -tb 32 -fa on \
+  -ctk f16 -ctv f16 --jinja \
+  --spec-type draft-mtp --spec-mtp-strict-qwen \
+  --spec-draft-device ROCm0 --spec-draft-ngl all \
+  --spec-draft-type-k f16 --spec-draft-type-v f16 \
+  --spec-draft-n-max 16 --spec-draft-n-min 0 \
+  --spec-draft-p-min 0.60 --spec-draft-backend-sampling
+```
+
+MTP acceptance and speed depend on content. Start with `n16 / p0.60` only for
+the qualified Qwen3.8 profile; reduce `--spec-draft-n-max` if another model or
+long-running workload shows lower acceptance or stability. Strict MTP preserves
+the selected target path's greedy decisions, but it does not remove the
+approximation introduced by W4A4 activation quantization.
+
+For implementation details, validation commands, and rollback instructions,
+see [`ggml/rocmfpx/ROCMI4.md`](ggml/rocmfpx/ROCMI4.md).
+
 ## Quick Start (Strix Halo / `gfx1151`)
 
 Four commands from clone to a running model. For other AMD GPUs, swap the build
@@ -194,6 +304,7 @@ build-strix-rocmfp4/bin/llama-cli \
 | **Balanced 4-bit** | `Q4_0_ROCMFP4` | 4.50 bpw, dual per-16 scale — a touch more precision |
 | **Agents / tools / JSON / code** | `Q4_0_ROCMFP4_COHERENT` (or any `*_AGENT`) | protects the tensors that keep structured output correct |
 | **Strix Halo tuned recipe** | `Q4_0_ROCMFP4_STRIX_LEAN` | attn-K/V quality recipe tuned on `gfx1151` |
+| **Experimental gfx1151 IU4 + MTP** | `Q4_0_ROCMI4` with W4A4 enabled | native IU4 batched verification for higher speculative decode throughput; opt-in and lossy |
 | **Preview higher-bit references** | `Q6_0_ROCMFPX` / `Q8_0_ROCMFPX` | 6.5 / 8.25 bpw; optimization and model coverage are still in progress |
 | **Preview 3-bit** | `Q3_0_ROCMFPX` | 3.5 bpw; optimization and model coverage are still in progress |
 
@@ -212,6 +323,7 @@ ROCmFPX is a family of GGUF model-weight quants:
 | ROCmFP2 | `Q2_0_ROCMFPX` | smallest ROCmFPX weight format; 2.50-bpw block layout | optimized and validated on tested Strix Halo paths |
 | ROCmFP3 | `Q3_0_ROCMFPX` | low-bit ROCmFPX weight format | development preview |
 | ROCmFP4 | `Q4_0_ROCMFP4`, `Q4_0_ROCMFP4_FAST` | promoted 4-bit ROCm family baseline | optimized and validated on tested Strix Halo paths |
+| ROCmI4 | `Q4_0_ROCMI4` | signed integer four-bit weights; optional native gfx1151 IU4/W4A4 MMQ | exact path by default; W4A4 is experimental and opt-in |
 | ROCmFP6 | `Q6_0_ROCMFPX` | middle quality/size ROCmFPX weight format | development preview |
 | ROCmFP8 | `Q8_0_ROCMFPX` | high-quality ROCmFPX reference format | development preview |
 

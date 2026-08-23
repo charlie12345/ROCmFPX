@@ -1453,4 +1453,26 @@ namespace ggml_cuda_mma {
         NO_DEVICE_CODE;
 #endif // AMD_WMMA_AVAILABLE
     }
+
+#if defined(GGML_ROCMI4_W4A4) && GGML_ROCMI4_W4A4
+    // Native gfx1151 4-bit tensor core: packed IU4, K=32 as two 16-wide WMMA steps.
+    // b_signed selects how the B operand's nibbles are interpreted: signed [-8,+7]
+    // or unsigned [0,15]. A is always signed (weight codes are two's complement).
+    template <bool b_signed = true, data_layout dl_d = DATA_LAYOUT_I_MAJOR, data_layout dl_ab = DATA_LAYOUT_I_MAJOR>
+    static __device__ __forceinline__ void mma_iu4(
+            tile<16, 16, int, dl_d> & D, const tile<16, 4, int, dl_ab> & A, const tile<16, 4, int, dl_ab> & B) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(__gfx1151__)
+        using int32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+        using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+        int32x8_t * acc = (int32x8_t *) D.x;
+        int32x2_t * a_vec = (int32x2_t *) A.x;
+        int32x2_t * b_vec = (int32x2_t *) B.x;
+        acc[0] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a_vec[0], b_signed, b_vec[0], acc[0], false);
+        acc[0] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a_vec[1], b_signed, b_vec[1], acc[0], false);
+#else
+        GGML_UNUSED_VARS(D, A, B);
+        NO_DEVICE_CODE;
+#endif
+    }
+#endif // defined(GGML_ROCMI4_W4A4) && GGML_ROCMI4_W4A4
 }

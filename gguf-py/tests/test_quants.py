@@ -95,10 +95,21 @@ class GGMLQuants:
         elif qtype == GGMLQuantizationType.BF16:
             self.libggml.ggml_bf16_to_fp32_row(tensor.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)), result.ctypes.data_as(c_float_p), result.size)
         else:
-            lw_qname = qtype.name.lower()
-            if lw_qname[-1] == "k":
-                lw_qname = lw_qname[:-1] + "K"
-            dequant_func: ctypes._NamedFuncPointer = getattr(self.libggml, "dequantize_row_" + lw_qname)
+            custom_names = {
+                GGMLQuantizationType.Q3_0_ROCMFPX: "rocmfpx_dequantize_row_fp3",
+                GGMLQuantizationType.Q6_0_ROCMFPX: "rocmfpx_dequantize_row_fp6",
+                GGMLQuantizationType.Q8_0_ROCMFPX: "rocmfpx_dequantize_row_fp8",
+                GGMLQuantizationType.Q4_0_ROCMI4:  "rocmfpx_dequantize_row_i4",
+            }
+            dequant_name = custom_names.get(qtype)
+            if dequant_name is None:
+                lw_qname = qtype.name.lower()
+                if lw_qname[-1] == "k":
+                    lw_qname = lw_qname[:-1] + "K"
+                dequant_name = "dequantize_row_" + lw_qname
+            dequant_func: ctypes._NamedFuncPointer = getattr(self.libggml, dequant_name)
+            dequant_func.restype = None
+            dequant_func.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int64)
             dequant_func(tensor.ctypes.data_as(ctypes.c_void_p), result.ctypes.data_as(c_float_p), result.size)
         return result
 

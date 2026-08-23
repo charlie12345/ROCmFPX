@@ -349,6 +349,8 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #define VDR_ROCMFP4_Q8_1_MMQ  GGML_ROCMFP4_Q8_1_MMQ_VDR
 #define VDR_ROCMFP4_FAST_Q8_1_MMVQ GGML_ROCMFP4_FAST_Q8_1_MMVQ_VDR
 #define VDR_ROCMFP4_FAST_Q8_1_MMQ  GGML_ROCMFP4_FAST_Q8_1_MMQ_VDR
+#define VDR_ROCMI4_Q8_1_MMVQ VDR_ROCMFP4_FAST_Q8_1_MMVQ
+#define VDR_ROCMI4_Q8_1_MMQ  VDR_ROCMFP4_FAST_Q8_1_MMQ
 #ifndef GGML_ROCMFP3_Q8_1_MMVQ_VDR
 #define GGML_ROCMFP3_Q8_1_MMVQ_VDR 2
 #endif
@@ -571,6 +573,34 @@ static __device__ __forceinline__ float vec_dot_rocmfp4_fast_q8_1(
     }
 
     return __low2float(bq8_1->ds) * rocmfp4_ue4m3_to_fp32_half_finite(bq4->e) * sumi;
+}
+
+static __device__ __forceinline__ int2 rocmi4_unpack_signed_nibbles(const int q4) {
+    int even = q4 & 0x0F0F0F0F;
+    int odd  = (q4 >> 4) & 0x0F0F0F0F;
+    const int se = even & 0x08080808;
+    const int so = odd  & 0x08080808;
+    even |= (se << 1) | (se << 2) | (se << 3) | (se << 4);
+    odd  |= (so << 1) | (so << 2) | (so << 3) | (so << 4);
+    return make_int2(even, odd);
+}
+
+static __device__ __forceinline__ float vec_dot_rocmi4_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_rocmi4 * bq4 = (const block_rocmi4 *) vbq + kbx;
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_ROCMI4_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
+        const int2 v = rocmi4_unpack_signed_nibbles(aux_q4);
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+
+    return __low2float(bq8_1->ds) * rocmfpx_ue4m3_to_fp32_finite(bq4->e) * sumi;
 }
 
 static __device__ __forceinline__ float vec_dot_rocmfpx_fp3_q8_1(

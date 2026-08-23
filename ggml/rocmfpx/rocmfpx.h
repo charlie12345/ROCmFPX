@@ -33,6 +33,11 @@ extern "C" {
 #define QR_ROCMFP8 1
 #define QI_ROCMFP8 (QK_ROCMFP8 / (4 * QR_ROCMFP8))
 
+#define QK_ROCMI4 QK_ROCMFPX
+#define QS_ROCMI4 (QK_ROCMI4 / 2)
+#define QR_ROCMI4 2
+#define QI_ROCMI4 (QK_ROCMI4 / (4 * QR_ROCMI4))
+
 // AMD-native experimental family layouts. The GGUF types are registered, but
 // the layouts stay isolated from the promoted ROCmFP4 formats while evaluated.
 typedef struct {
@@ -55,16 +60,26 @@ typedef struct {
     uint8_t e;
 } block_rocmfp8;
 
+// Native 4-bit integer block: 32 two's-complement nibbles + one UE4M3 scale.
+// Layout matches Q4_0_ROCMFP4_FAST (17 bytes) so loaders stay dword-friendly,
+// but codes are the integer values themselves — no Codebook10 expansion.
+typedef struct {
+    uint8_t qs[QS_ROCMI4];
+    uint8_t e;
+} block_rocmi4;
+
 #if defined(__cplusplus)
 static_assert(sizeof(block_rocmfp2) == QS_ROCMFP2 + 2*sizeof(uint8_t), "wrong rocmfp2 block size/padding");
 static_assert(sizeof(block_rocmfp3) == QS_ROCMFP3 + 2*sizeof(uint8_t), "wrong rocmfp3 block size/padding");
 static_assert(sizeof(block_rocmfp6) == QS_ROCMFP6 + 2*sizeof(uint8_t), "wrong rocmfp6 block size/padding");
 static_assert(sizeof(block_rocmfp8) == QS_ROCMFP8 + sizeof(uint8_t), "wrong rocmfp8 block size/padding");
+static_assert(sizeof(block_rocmi4) == QS_ROCMI4 + sizeof(uint8_t), "wrong rocmi4 block size/padding");
 #else
 _Static_assert(sizeof(block_rocmfp2) == QS_ROCMFP2 + 2*sizeof(uint8_t), "wrong rocmfp2 block size/padding");
 _Static_assert(sizeof(block_rocmfp3) == QS_ROCMFP3 + 2*sizeof(uint8_t), "wrong rocmfp3 block size/padding");
 _Static_assert(sizeof(block_rocmfp6) == QS_ROCMFP6 + 2*sizeof(uint8_t), "wrong rocmfp6 block size/padding");
 _Static_assert(sizeof(block_rocmfp8) == QS_ROCMFP8 + sizeof(uint8_t), "wrong rocmfp8 block size/padding");
+_Static_assert(sizeof(block_rocmi4) == QS_ROCMI4 + sizeof(uint8_t), "wrong rocmi4 block size/padding");
 #endif
 
 GGML_API float  rocmfpx_ue4m3_to_fp32(uint8_t e);
@@ -98,6 +113,13 @@ GGML_API bool rocmfpx_validate_row_data_fp2(const void * data, size_t nbytes);
 GGML_API bool rocmfpx_validate_row_data_fp3(const void * data, size_t nbytes);
 GGML_API bool rocmfpx_validate_row_data_fp6(const void * data, size_t nbytes);
 GGML_API bool rocmfpx_validate_row_data_fp8(const void * data, size_t nbytes);
+
+GGML_API size_t rocmfpx_row_size_i4(int64_t k);
+GGML_API void   rocmfpx_quantize_row_i4_ref(const float * GGML_RESTRICT x, block_rocmi4 * GGML_RESTRICT y, int64_t k);
+GGML_API void   rocmfpx_dequantize_row_i4(const block_rocmi4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void   rocmfpx_quantize_row_i4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+GGML_API size_t rocmfpx_quantize_i4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API bool   rocmfpx_validate_row_data_i4(const void * data, size_t nbytes);
 
 #ifdef __cplusplus
 }

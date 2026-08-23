@@ -473,6 +473,19 @@ class Q8_0_ROCMFPX(__Quant, qtype=GGMLQuantizationType.Q8_0_ROCMFPX):
         return qs * scales
 
 
+class Q4_0_ROCMI4(__Quant, qtype=GGMLQuantizationType.Q4_0_ROCMI4):
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        qs, e = np.hsplit(blocks, [16])
+
+        lo = ((qs & np.uint8(0x0F)).astype(np.int8) << 4) >> 4
+        hi = (qs.astype(np.int8) >> 4)
+        vals = np.concatenate((lo, hi), axis=1).astype(np.float32)
+        scales = _rocmfpx_ue4m3_to_fp32(e)
+
+        return vals * scales
+
+
 class Q2_K(__Quant, qtype=GGMLQuantizationType.Q2_K):
     @classmethod
     def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:

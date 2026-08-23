@@ -296,6 +296,13 @@ static ggml_cuda_device_info ggml_cuda_init() {
                       id, prop.name, prop.gcnArchName, info.devices[id].cc & 0xffff,
                       device_vmm ? "yes" : "no", prop.warpSize,
                       (size_t)(prop.totalGlobalMem / (1024 * 1024)));
+#if defined(GGML_ROCMI4_W4A4) && GGML_ROCMI4_W4A4
+        if (GGML_CUDA_CC_IS_GFX1151(info.devices[id].cc)) {
+            GGML_LOG_WARN("  ROCmI4 W4A4: enabled for device %d (lossy prompt-processing path)\n", id);
+        } else {
+            GGML_LOG_INFO("  ROCmI4 W4A4: unsupported on device %d; using exact int8 MMQ\n", id);
+        }
+#endif
 #elif defined(GGML_USE_MUSA)
         // FIXME: Ensure compatibility with varying warp sizes across different MUSA archs.
         info.devices[id].warp_size = 32;
@@ -5595,6 +5602,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_Q4_0_ROCMFP4:
                     case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+                    case GGML_TYPE_Q4_0_ROCMI4:
                     case GGML_TYPE_Q3_0_ROCMFPX:
                     case GGML_TYPE_Q2_0_ROCMFPX:
                     case GGML_TYPE_Q6_0_ROCMFPX:
@@ -5638,6 +5646,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_Q4_0_ROCMFP4:
                     case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+                    case GGML_TYPE_Q4_0_ROCMI4:
                     case GGML_TYPE_Q3_0_ROCMFPX:
                     case GGML_TYPE_Q2_0_ROCMFPX:
                     case GGML_TYPE_Q6_0_ROCMFPX:

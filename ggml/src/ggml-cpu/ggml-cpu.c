@@ -337,6 +337,38 @@ static void ggml_vec_dot_rocmfpx_fp6_q8_0(int n, float * GGML_RESTRICT s, size_t
     *s = sumf;
 }
 
+static int8_t rocmi4_nibble_i8(uint8_t nibble) {
+    return (int8_t) ((nibble & 0x8u) ? (int) (nibble | 0xF0u) : (int) (nibble & 0x7u));
+}
+
+static void ggml_vec_dot_rocmi4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    assert(nrc == 1);
+    GGML_UNUSED(nrc);
+    assert(n % QK_ROCMI4 == 0);
+    assert(QK_ROCMI4 == QK8_0);
+
+    const block_rocmi4 * GGML_RESTRICT x = (const block_rocmi4 *) vx;
+    const block_q8_0   * GGML_RESTRICT y = (const block_q8_0 *) vy;
+
+    const int nb = n / QK_ROCMI4;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = rocmfpx_ue4m3_to_fp32(x[ib].e) * GGML_CPU_FP16_TO_FP32(y[ib].d);
+        int sumi = 0;
+        for (int j = 0; j < QS_ROCMI4; ++j) {
+            sumi += (int) rocmi4_nibble_i8(x[ib].qs[j] & 0x0Fu) * (int) y[ib].qs[j];
+            sumi += (int) rocmi4_nibble_i8(x[ib].qs[j] >> 4) * (int) y[ib].qs[j + QS_ROCMI4];
+        }
+        sumf += d * (float) sumi;
+    }
+
+    *s = sumf;
+}
+
 static void ggml_vec_dot_rocmfpx_fp8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     GGML_UNUSED(bs);
     GGML_UNUSED(bx);
@@ -430,6 +462,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_Q8_0_ROCMFPX] = {
         .from_float               = rocmfpx_quantize_row_fp8,
         .vec_dot                  = ggml_vec_dot_rocmfpx_fp8_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q4_0_ROCMI4] = {
+        .from_float               = rocmfpx_quantize_row_i4,
+        .vec_dot                  = ggml_vec_dot_rocmi4_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },

@@ -125,6 +125,13 @@ if (GGML_HIP_NO_VMM)
     add_compile_definitions(GGML_HIP_NO_VMM)
 endif()
 
+if (GGML_HIP_ROCMI4_W4A4)
+    add_compile_definitions(GGML_ROCMI4_W4A4=1)
+    message(WARNING
+        "GGML_HIP_ROCMI4_W4A4 is a lossy, experimental ROCmI4 prefill path "
+        "verified only on gfx1151. Exact MMQ is used on other architectures.")
+endif()
+
 if (GGML_HIP_ROCWMMA_FATTN)
     add_compile_definitions(GGML_HIP_ROCWMMA_FATTN)
 endif()

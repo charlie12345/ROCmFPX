@@ -17003,6 +17003,22 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
 
+    // ROCmI4 has no Vulkan implementation - its dequant/matvec live only under
+    // ggml-cuda (mmvq.cu, vecdotq.cuh, convert.cu, getrows.cu). On a box with
+    // both a HIP and a Vulkan device the scheduler will otherwise offload part
+    // of the graph here, ggml_vk_build_graph meets an unknown quant type, and
+    // the process segfaults (observed: llama-perplexity SIGSEGV whenever
+    // -dev ROCm0 was not passed). Decline the op so the scheduler keeps these
+    // tensors on the HIP backend instead of crashing.
+    if (op->type == GGML_TYPE_Q4_0_ROCMI4) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] != nullptr && op->src[i]->type == GGML_TYPE_Q4_0_ROCMI4) {
+            return false;
+        }
+    }
+
     const bool uses_bda = (op->op == GGML_OP_IM2COL || op->op == GGML_OP_IM2COL_3D) &&
                           device->shader_int64 && device->buffer_device_address;
 

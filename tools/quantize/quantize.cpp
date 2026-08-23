@@ -47,6 +47,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q2_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX,          " 2.50 bpw ROCmFPx S40 codebook + dual UE4M3 scales", },
     { "Q6_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX,          " 6.50 bpw ROCmFPx experimental, ROCm/Vulkan staging", },
     { "Q8_0_ROCMFPX",          LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX,          " 8.25 bpw ROCmFPx experimental, ROCm/Vulkan staging", },
+    { "Q4_0_ROCMI4",           LLAMA_FTYPE_MOSTLY_Q4_0_ROCMI4,           " 4.25 bpw native signed-nibble 4-bit (no codebook)", },
     { "Q3_0_ROCMFPX_AGENT",    LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX_AGENT,    " agent/tool-call coherent ROCmFPx Q3 routing", },
     { "Q6_0_ROCMFPX_AGENT",    LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT,    " agent/tool-call coherent ROCmFPx Q6 routing", },
     { "Q8_0_ROCMFPX_AGENT",    LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT,    " agent/tool-call coherent ROCmFPx Q8 routing", },
