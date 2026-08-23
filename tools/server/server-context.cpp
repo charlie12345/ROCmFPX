@@ -1131,11 +1131,30 @@ private:
                         params_base.cache_disk_path.c_str(), params_base.cache_disk_limit_mib);
             }
 
+            // Identity stamp for the disk cache: a later run adopts a previous run's
+            // entries only if all of this matches (the state files are only meaningful
+            // for the same model file, context size and KV cache types).
+            std::string cache_identity;
+            {
+                std::error_code iec;
+                const auto msz = std::filesystem::file_size(std::filesystem::u8path(params_base.model.path), iec);
+                cache_identity = params_base.model.path
+                    + "|size=" + std::to_string(iec ? 0 : (unsigned long long) msz)
+                    + "|n_ctx=" + std::to_string(n_ctx)
+                    + "|ctk=" + ggml_type_name(params_base.cache_type_k)
+                    + "|ctv=" + ggml_type_name(params_base.cache_type_v)
+                    + "|ctkd=" + ggml_type_name(params_base.speculative.draft.cache_type_k)
+                    + "|ctvd=" + ggml_type_name(params_base.speculative.draft.cache_type_v)
+                    + "|spec_n_max=" + std::to_string(params_base.speculative.draft.n_max)
+                    + "|mtp=" + ((std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end()) ? "1" : "0");
+            }
             prompt_cache = std::make_unique<server_prompt_cache>(
                 params_base.cache_ram_mib,
                 n_ctx,
                 params_base.cache_disk_path,
-                params_base.cache_disk_limit_mib);
+                params_base.cache_disk_limit_mib,
+                cache_identity);
         } else {
             SRV_INF("%s", "prompt cache is disabled - use `--cache-ram N` or `--cache-disk PATH` to enable it\n");
         }

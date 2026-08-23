@@ -10,6 +10,7 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include <cstdio>
 
 using json = nlohmann::ordered_json;
 
@@ -635,6 +636,11 @@ struct server_prompt_disk_state {
     size_t      size_ckpt = 0;
     server_prompt_checkpoint_meta ckpt_meta;
 
+    // speculative-impl state blob persisted next to the entry so the entry survives a
+    // server restart (it is otherwise memory-only and stateful MTP entries are useless
+    // without it)
+    std::string path_spec;
+
     size_t size_main = 0;
     size_t size_drft = 0;
 
@@ -657,7 +663,8 @@ struct server_prompt_cache {
             int32_t limit_size_mib,
              size_t limit_tokens,
         const std::string & disk_base_path = {},
-            int32_t disk_limit_size_mib = 0);
+            int32_t disk_limit_size_mib = 0,
+        const std::string & disk_identity = {});
 
     ~server_prompt_cache();
 
@@ -666,6 +673,18 @@ struct server_prompt_cache {
     // Cold automatic cache. Entries own only token/checkpoint metadata in RAM;
     // target and draft context payloads live in owner-only files.
     std::list<server_prompt_disk_state> disk_states;
+
+    // Identity of the model/context this cache was written for (model path + size,
+    // n_ctx, KV types). Written to <run>/identity.txt; a later run adopts a stale run
+    // directory's entries only when its identity matches exactly.
+    std::string disk_identity;
+
+#if defined(_WIN32)
+    // Held open with deny-all sharing for the life of the run: the Windows
+    // counterpart of the POSIX flock() advisory lock, so a later startup can tell a
+    // live run directory from an abandoned one.
+    FILE * disk_lock_file = nullptr;
+#endif
 
     bool ram_enabled = false;
 

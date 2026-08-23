@@ -10,6 +10,7 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
@@ -25,6 +26,9 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
+#if defined(_WIN32)
+#include <share.h>
+#endif
 #endif
 
 using json = nlohmann::ordered_json;
@@ -2119,7 +2123,9 @@ server_prompt_cache::server_prompt_cache(
         int32_t limit_size_mib,
          size_t limit_tokens,
     const std::string & disk_base_path,
-        int32_t disk_limit_size_mib) {
+        int32_t disk_limit_size_mib,
+    const std::string & disk_identity_) {
+    disk_identity = disk_identity_;
     ram_enabled       = limit_size_mib != 0;
     limit_size        = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
     this->limit_tokens = limit_tokens;
@@ -2151,47 +2157,9 @@ server_prompt_cache::server_prompt_cache(
         throw std::runtime_error("unable to secure prompt cache namespace '" + server_prompt_cache_disk_path_utf8(cache_root) + "': " + ec.message());
     }
 
-    // An OOM/SIGKILL cannot run the destructor. Each run therefore holds an
-    // advisory lock in a magic-marked directory. A later server removes only
-    // marked run-* directories whose lock is no longer held.
-    for (const auto & entry : fs::directory_iterator(cache_root, ec)) {
-        if (ec) {
-            break;
-        }
-        const auto name = server_prompt_cache_disk_path_utf8(entry.path().filename());
-        const bool is_run_dir      = name.rfind("run-", 0) == 0;
-        const bool is_deleting_dir = name.rfind(".deleting-run-", 0) == 0;
-        if (!entry.is_directory() || (!is_run_dir && !is_deleting_dir) || !server_prompt_cache_disk_owned(entry.path())) {
-            continue;
-        }
-
-#if !defined(_WIN32)
-        const fs::path lock_path = entry.path() / ".lock";
-        const int fd = open(lock_path.c_str(), O_RDWR | O_CLOEXEC);
-        if (fd < 0) {
-            continue;
-        }
-        const bool stale = flock(fd, LOCK_EX | LOCK_NB) == 0;
-        if (stale) {
-            flock(fd, LOCK_UN);
-        }
-        close(fd);
-        if (!stale) {
-            continue;
-        }
-#else
-        // Without an advisory-lock primitive, preserve old directories rather
-        // than risk deleting a live cache owned by another process.
-        continue;
-#endif
-
-        const auto stale_path = server_prompt_cache_disk_path_utf8(entry.path());
-        std::error_code rm_ec;
-        const auto removed = fs::remove_all(entry.path(), rm_ec);
-        if (!rm_ec) {
-            SRV_INF("prompt cache disk stale cleanup: path=%s files=%zu\n", stale_path.c_str(), (size_t) removed);
-        }
-    }
+    // Stale run directories from earlier runs are handled AFTER this run's own
+    // directory exists (see below): their entries are adopted into it when the
+    // identity matches, otherwise they are removed.
 
     const auto stamp = (uint64_t) std::chrono::high_resolution_clock::now().time_since_epoch().count();
 #if !defined(_WIN32)
@@ -2238,8 +2206,12 @@ server_prompt_cache::server_prompt_cache(
     }
 #else
     {
-        std::ofstream lock(owned / ".lock", std::ios::out | std::ios::trunc);
-        if (!lock.good()) {
+        // Deny all sharing and keep the handle for the life of the run: any other
+        // process trying to open this file fails while we are alive, which is how a
+        // later startup distinguishes a live run directory from an abandoned one.
+        const std::string lock_utf8 = server_prompt_cache_disk_path_utf8(owned / ".lock");
+        disk_lock_file = _fsopen(lock_utf8.c_str(), "wb", _SH_DENYRW);
+        if (disk_lock_file == nullptr) {
             fs::remove_all(owned);
             throw std::runtime_error("unable to create prompt cache lock file in '" + server_prompt_cache_disk_path_utf8(owned) + "'");
         }
@@ -2276,8 +2248,225 @@ server_prompt_cache::server_prompt_cache(
     this->disk_base_path  = server_prompt_cache_disk_path_utf8(base);
     this->disk_owned_path = server_prompt_cache_disk_path_utf8(owned);
 
+    {
+        std::ofstream ident(owned / "identity.txt", std::ios::out | std::ios::trunc);
+        ident << disk_identity << '\n';
+    }
+
     SRV_INF("prompt cache disk enabled: path=%s owned_path=%s limit_mib=%d\n",
             this->disk_base_path.c_str(), this->disk_owned_path.c_str(), disk_limit_size_mib);
+
+    // ---- adopt entries from abandoned run directories (survive server restarts) ----
+    // A run directory is abandoned when its lock is no longer held (POSIX: flock
+    // succeeds; Windows: the deny-all .lock can be opened). Entries whose identity
+    // matches ours are MOVED into this run's directory and registered; non-matching
+    // stale directories are removed. Every adopted entry is still fully validated by
+    // load_disk() on first use (sizes, tokens, and llama's own state-file checks), so
+    // a damaged file can at worst cost one rejected restore.
+    struct adopted_t {
+        server_prompt_disk_state st;
+        fs::file_time_type       mtime;
+    };
+    std::vector<adopted_t> adopted;
+    size_t n_stale_removed = 0;
+    size_t n_adopt_bytes = 0;
+
+    std::error_code sc;
+    for (const auto & entry : fs::directory_iterator(cache_root, sc)) {
+        if (sc) {
+            break;
+        }
+        if (entry.path() == owned) {
+            continue;
+        }
+        const auto name = server_prompt_cache_disk_path_utf8(entry.path().filename());
+        const bool is_run_dir      = name.rfind("run-", 0) == 0;
+        const bool is_deleting_dir = name.rfind(".deleting-run-", 0) == 0;
+        if (!entry.is_directory() || (!is_run_dir && !is_deleting_dir) || !server_prompt_cache_disk_owned(entry.path())) {
+            continue;
+        }
+
+        bool stale = false;
+#if !defined(_WIN32)
+        {
+            const fs::path lock_path = entry.path() / ".lock";
+            const int fd = open(lock_path.c_str(), O_RDWR | O_CLOEXEC);
+            if (fd < 0) {
+                stale = true; // no lock file at all: nothing can be holding it
+            } else {
+                stale = flock(fd, LOCK_EX | LOCK_NB) == 0;
+                if (stale) {
+                    flock(fd, LOCK_UN);
+                }
+                close(fd);
+            }
+        }
+#else
+        {
+            const std::string lock_utf8 = server_prompt_cache_disk_path_utf8(entry.path() / ".lock");
+            FILE * probe = _fsopen(lock_utf8.c_str(), "rb", _SH_DENYNO);
+            if (probe != nullptr) {
+                fclose(probe);
+                stale = true;             // opened: no live owner holds it deny-all
+            } else {
+                stale = (errno != EACCES); // EACCES = a live process holds it; anything else (e.g. missing) = stale
+            }
+        }
+#endif
+        if (!stale) {
+            continue;
+        }
+
+        const auto stale_path = server_prompt_cache_disk_path_utf8(entry.path());
+
+        std::string their_identity;
+        {
+            std::ifstream ident(entry.path() / "identity.txt");
+            std::getline(ident, their_identity);
+        }
+        const bool same_identity = !disk_identity.empty() && their_identity == disk_identity;
+
+        if (!same_identity || is_deleting_dir) {
+            std::error_code rm_ec;
+            const auto removed = fs::remove_all(entry.path(), rm_ec);
+            if (!rm_ec) {
+                n_stale_removed++;
+                SRV_INF("prompt cache disk stale cleanup: path=%s files=%zu reason=%s\n",
+                        stale_path.c_str(), (size_t) removed, is_deleting_dir ? "half-deleted" : "identity-mismatch");
+            }
+            continue;
+        }
+
+        // adopt: every state-<id>-target.bin with its siblings
+        size_t n_here = 0;
+        std::error_code dc;
+        for (const auto & f : fs::directory_iterator(entry.path(), dc)) {
+            if (dc) {
+                break;
+            }
+            const std::string fname = server_prompt_cache_disk_path_utf8(f.path().filename());
+            if (fname.rfind("state-", 0) != 0 || fname.size() < 17 || fname.compare(fname.size() - 11, 11, "-target.bin") != 0) {
+                continue;
+            }
+            const std::string old_stem = fname.substr(0, fname.size() - 11); // "state-<id>"
+
+            // header: u32 magic, u32 version, u32 n_tokens, tokens[]
+            llama_tokens toks;
+            {
+                FILE * fh = fopen(server_prompt_cache_disk_path_utf8(f.path()).c_str(), "rb");
+                if (!fh) {
+                    continue;
+                }
+                uint32_t magic = 0, version = 0, n_tok = 0;
+                const bool hdr_ok = fread(&magic, 4, 1, fh) == 1 && fread(&version, 4, 1, fh) == 1 && fread(&n_tok, 4, 1, fh) == 1 &&
+                                    magic == LLAMA_STATE_SEQ_MAGIC && version == LLAMA_STATE_SEQ_VERSION &&
+                                    n_tok > 0 && n_tok <= (uint32_t) limit_tokens;
+                if (hdr_ok) {
+                    toks.resize(n_tok);
+                    if (fread(toks.data(), sizeof(llama_token), n_tok, fh) != n_tok) {
+                        toks.clear();
+                    }
+                }
+                fclose(fh);
+                if (toks.empty()) {
+                    SRV_WRN("prompt cache disk adopt: skipping unreadable entry %s\n", server_prompt_cache_disk_path_utf8(f.path()).c_str());
+                    continue;
+                }
+            }
+
+            const fs::path p_main = f.path();
+            const fs::path p_drft = entry.path() / (old_stem + "-draft.bin");
+            const fs::path p_ckpt = entry.path() / (old_stem + "-ckpt.bin");
+            const fs::path p_spec = entry.path() / (old_stem + "-spec.bin");
+            const bool has_drft = fs::exists(p_drft);
+            const bool has_ckpt = fs::exists(p_ckpt);
+            const bool has_spec = fs::exists(p_spec);
+
+            server_prompt_disk_state st;
+            st.tokens = server_tokens(toks, false);
+            st.id     = disk_next_id++;
+            st.usable = true;
+
+            const std::string new_stem = "state-" + std::to_string(st.id);
+            auto move_in = [&](const fs::path & from, const char * suffix, std::string & path_out, size_t & size_out) -> bool {
+                std::error_code mec;
+                const fs::path to = owned / (new_stem + suffix);
+                fs::rename(from, to, mec);
+                if (mec) {
+                    return false;
+                }
+                path_out = server_prompt_cache_disk_path_utf8(to);
+                std::error_code zec;
+                const auto sz = fs::file_size(to, zec);
+                size_out = zec ? 0 : (size_t) sz;
+                return true;
+            };
+
+            size_t dummy = 0;
+            if (!move_in(p_main, "-target.bin", st.path_main, st.size_main)) {
+                continue;
+            }
+            if (has_drft && !move_in(p_drft, "-draft.bin", st.path_drft, st.size_drft)) {
+                server_prompt_cache_disk_remove_file(st.path_main);
+                continue;
+            }
+            if (has_ckpt && move_in(p_ckpt, "-ckpt.bin", st.path_ckpt, st.size_ckpt)) {
+                FILE * fc = fopen(st.path_ckpt.c_str(), "rb");
+                if (fc) {
+                    uint32_t cmagic = 0, cver = 0; uint64_t n_tokens = 0; int32_t pmin = 0, pmax = 0;
+                    if (fread(&cmagic, 4, 1, fc) == 1 && fread(&cver, 4, 1, fc) == 1 && fread(&n_tokens, 8, 1, fc) == 1 &&
+                        fread(&pmin, 4, 1, fc) == 1 && fread(&pmax, 4, 1, fc) == 1 && cmagic == 0x50434b43u && cver == 1) {
+                        st.ckpt_meta = {(int64_t) n_tokens, pmin, pmax};
+                        st.checkpoints.push_back(st.ckpt_meta);
+                    } else {
+                        fclose(fc); fc = nullptr;
+                        server_prompt_cache_disk_remove_file(st.path_ckpt);
+                        st.path_ckpt.clear(); st.size_ckpt = 0;
+                    }
+                    if (fc) fclose(fc);
+                }
+            }
+            if (has_spec && move_in(p_spec, "-spec.bin", st.path_spec, dummy)) {
+                FILE * fsp = fopen(st.path_spec.c_str(), "rb");
+                if (fsp) {
+                    st.spec.resize(dummy);
+                    if (dummy > 0 && fread(st.spec.data(), 1, dummy, fsp) != dummy) {
+                        st.spec.clear();
+                    }
+                    fclose(fsp);
+                }
+            }
+
+            std::error_code tec;
+            const auto mt = fs::last_write_time(fs::u8path(st.path_main), tec);
+            n_adopt_bytes += st.size();
+            adopted.push_back({std::move(st), tec ? fs::file_time_type::min() : mt});
+            n_here++;
+        }
+
+        // drop the emptied directory (ignore failures: leftovers are harmless)
+        std::error_code rm_ec;
+        fs::remove_all(entry.path(), rm_ec);
+        SRV_INF("prompt cache disk adopt: path=%s entries=%zu\n", stale_path.c_str(), n_here);
+    }
+
+    if (!adopted.empty()) {
+        std::sort(adopted.begin(), adopted.end(), [](const adopted_t & a, const adopted_t & b) { return a.mtime < b.mtime; });
+        for (auto & a : adopted) {
+            disk_size_total += a.st.size();
+            disk_states.push_back(std::move(a.st));
+        }
+        // respect the size limit: evict the oldest adopted entries first
+        while (disk_limit_size > 0 && disk_size_total > disk_limit_size && !disk_states.empty()) {
+            if (!erase_disk_state(disk_states.begin(), true, "adopt-limit")) {
+                break;
+            }
+        }
+        SRV_INF("prompt cache disk adopted %zu entries (%zu bytes) from previous runs; stale dirs removed: %zu\n",
+                adopted.size(), n_adopt_bytes, n_stale_removed);
+    } else if (n_stale_removed) {
+        SRV_INF("prompt cache disk: no adoptable entries; stale dirs removed: %zu\n", n_stale_removed);
+    }
 }
 
 server_prompt_cache::~server_prompt_cache() {
@@ -2285,19 +2474,12 @@ server_prompt_cache::~server_prompt_cache() {
         return;
     }
 
-    SRV_INF("prompt cache disk cleanup: path=%s entries=%zu bytes=%zu saves=%" PRIu64 " loads=%" PRIu64 " evictions=%" PRIu64 "\n",
+    // The entries are deliberately RETAINED: the next run with the same identity
+    // adopts them (see the constructor), so the cache survives restarts. Only the
+    // lock is released. Abandoned directories are cleaned up by the next run
+    // (adopted or removed), or by external retention policy.
+    SRV_INF("prompt cache disk retained for the next run: path=%s entries=%zu bytes=%zu saves=%" PRIu64 " loads=%" PRIu64 " evictions=%" PRIu64 "\n",
             disk_owned_path.c_str(), disk_states.size(), disk_size_total, disk_saves, disk_loads, disk_evictions);
-
-    fs::path cleanup_path = fs::u8path(disk_owned_path);
-    std::error_code ec;
-    const fs::path trash_path = cleanup_path.parent_path() /
-        fs::u8path(".deleting-" + server_prompt_cache_disk_path_utf8(cleanup_path.filename()));
-    fs::rename(cleanup_path, trash_path, ec);
-    if (!ec) {
-        cleanup_path = trash_path;
-    } else {
-        ec.clear();
-    }
 
 #if !defined(_WIN32)
     if (disk_lock_fd >= 0) {
@@ -2305,13 +2487,12 @@ server_prompt_cache::~server_prompt_cache() {
         close(disk_lock_fd);
         disk_lock_fd = -1;
     }
-#endif
-
-    fs::remove_all(cleanup_path, ec);
-    if (ec) {
-        const std::string cleanup_path_utf8 = server_prompt_cache_disk_path_utf8(cleanup_path);
-        SRV_WRN("prompt cache disk cleanup failed: path=%s error=%s\n", cleanup_path_utf8.c_str(), ec.message().c_str());
+#else
+    if (disk_lock_file != nullptr) {
+        fclose(disk_lock_file);
+        disk_lock_file = nullptr;
     }
+#endif
 }
 
 size_t server_prompt_cache::size() const {
@@ -2629,6 +2810,31 @@ bool server_prompt_cache::save_disk(
     disk_bytes_written += actual_total;
 
     auto new_entry = std::prev(disk_states.end());
+
+    // Persist the speculative-impl state blob too: it is memory-only otherwise, and a
+    // stateful (MTP) entry adopted by a later run is unusable without it.
+    if (!state_spec.empty()) {
+        const fs::path p_spec_tmp = owned / (stem + "-spec.bin.tmp");
+        const fs::path p_spec     = owned / (stem + "-spec.bin");
+        const std::string p_spec_tmp_utf8 = server_prompt_cache_disk_path_utf8(p_spec_tmp);
+        FILE * fsp = fopen(p_spec_tmp_utf8.c_str(), "wb");
+        bool ok = false;
+        if (fsp) {
+            ok = fwrite(state_spec.data(), 1, state_spec.size(), fsp) == state_spec.size();
+            ok = (fclose(fsp) == 0) && ok;
+        }
+        if (ok) {
+            std::error_code sec;
+            fs::rename(p_spec_tmp, p_spec, sec);
+            ok = !sec;
+        }
+        if (ok) {
+            new_entry->path_spec = server_prompt_cache_disk_path_utf8(p_spec);
+        } else {
+            server_prompt_cache_disk_remove_file(p_spec_tmp_utf8);
+            SRV_WRN("prompt cache disk save: entry=%" PRIu64 " spec blob NOT persisted - entry will not survive a restart\n", entry_id);
+        }
+    }
 
     // Persist the newest context checkpoint with the entry (best effort: a failure here
     // leaves a perfectly valid exact-boundary entry). Only the newest one is kept - it
@@ -2998,6 +3204,9 @@ bool server_prompt_cache::erase_disk_state(
     if (it->has_ckpt()) {
         // best effort; the accounting below uses it->size() which includes the checkpoint
         server_prompt_cache_disk_remove_file(it->path_ckpt);
+    }
+    if (!it->path_spec.empty()) {
+        server_prompt_cache_disk_remove_file(it->path_spec);
     }
     if (!main_ok || !drft_ok) {
         SRV_ERR("prompt cache disk removal failed: entry=%" PRIu64 " reason=%s target_removed=%s draft_removed=%s accounted_bytes=%zu path=%s\n",
