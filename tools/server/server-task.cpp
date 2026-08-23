@@ -12,6 +12,7 @@
 
 #include <cerrno>
 #include <cinttypes>
+#include <cstdio>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -2628,6 +2629,69 @@ bool server_prompt_cache::save_disk(
     disk_bytes_written += actual_total;
 
     auto new_entry = std::prev(disk_states.end());
+
+    // Persist the newest context checkpoint with the entry (best effort: a failure here
+    // leaves a perfectly valid exact-boundary entry). Only the newest one is kept - it
+    // sits at the last prompt/generation boundary, which is where a client that does not
+    // echo reasoning_content diverges, and one checkpoint is ~150-200 MiB.
+    if (!prompt.checkpoints.empty()) {
+        const auto & ck = prompt.checkpoints.back();
+        const bool ck_ok = ck.n_tokens > 0 && ck.n_tokens < (int64_t) tokens.size() &&
+                           !ck.data_tgt.empty() && (ctx_drft == nullptr || !ck.data_dft.empty()) &&
+                           (state_spec.empty() || !ck.data_spec.empty());
+        if (ck_ok) {
+            const fs::path path_ckpt_tmp = owned / (stem + "-ckpt.bin.tmp");
+            const fs::path path_ckpt     = owned / (stem + "-ckpt.bin");
+            const std::string path_ckpt_tmp_utf8 = server_prompt_cache_disk_path_utf8(path_ckpt_tmp);
+            const std::string path_ckpt_utf8     = server_prompt_cache_disk_path_utf8(path_ckpt);
+            bool ok = false;
+            size_t n_ckpt = 0;
+            {
+                // header: magic, version, n_tokens, pos_min, pos_max, size_tgt, size_dft, size_spec
+                const uint32_t magic = 0x50434b43u; // 'CKCP'
+                const uint32_t version = 1;
+                const uint64_t h_n_tokens = (uint64_t) ck.n_tokens;
+                const int32_t  h_pos_min  = ck.pos_min;
+                const int32_t  h_pos_max  = ck.pos_max;
+                const uint64_t s_tgt = ck.data_tgt.size();
+                const uint64_t s_dft = ck.data_dft.size();
+                const uint64_t s_spc = ck.data_spec.size();
+                FILE * f = fopen(path_ckpt_tmp_utf8.c_str(), "wb");
+                if (f) {
+                    ok = fwrite(&magic, sizeof(magic), 1, f) == 1 &&
+                         fwrite(&version, sizeof(version), 1, f) == 1 &&
+                         fwrite(&h_n_tokens, sizeof(h_n_tokens), 1, f) == 1 &&
+                         fwrite(&h_pos_min, sizeof(h_pos_min), 1, f) == 1 &&
+                         fwrite(&h_pos_max, sizeof(h_pos_max), 1, f) == 1 &&
+                         fwrite(&s_tgt, sizeof(s_tgt), 1, f) == 1 &&
+                         fwrite(&s_dft, sizeof(s_dft), 1, f) == 1 &&
+                         fwrite(&s_spc, sizeof(s_spc), 1, f) == 1 &&
+                         (s_tgt == 0 || fwrite(ck.data_tgt.data(), 1, s_tgt, f) == s_tgt) &&
+                         (s_dft == 0 || fwrite(ck.data_dft.data(), 1, s_dft, f) == s_dft) &&
+                         (s_spc == 0 || fwrite(ck.data_spec.data(), 1, s_spc, f) == s_spc);
+                    n_ckpt = (size_t) ftell(f);
+                    ok = (fclose(f) == 0) && ok;
+                }
+            }
+            if (ok) {
+                std::error_code eck;
+                fs::rename(path_ckpt_tmp, path_ckpt, eck);
+                ok = !eck;
+            }
+            if (ok) {
+                new_entry->path_ckpt = path_ckpt_utf8;
+                new_entry->size_ckpt = n_ckpt;
+                new_entry->ckpt_meta = {ck.n_tokens, ck.pos_min, ck.pos_max};
+                disk_size_total    += n_ckpt;
+                disk_bytes_written += n_ckpt;
+                SRV_INF("prompt cache disk save: entry=%" PRIu64 " checkpoint persisted n_tokens=%" PRId64 " pos=[%d,%d] bytes=%zu\n",
+                        entry_id, ck.n_tokens, ck.pos_min, ck.pos_max, n_ckpt);
+            } else {
+                server_prompt_cache_disk_remove_file(path_ckpt_tmp_utf8);
+                SRV_WRN("prompt cache disk save: entry=%" PRIu64 " checkpoint NOT persisted (write failed) - entry stays exact-boundary only\n", entry_id);
+            }
+        }
+    }
     bool reclaim_ok = true;
 
     // Stateless entries can supersede shorter prefixes. Stateful MTP blobs
@@ -2860,12 +2924,47 @@ bool server_prompt_cache::load_disk(
     server_prompt restored;
     restored.tokens = it->tokens.clone();
     restored.data.spec = it->spec;
-    // Intentionally do not recreate common_prompt_checkpoint payloads. The
-    // disk entry retained only their small positions, not cloned host/device
-    // state. Fresh checkpoints are created as processing continues.
+    // The older checkpoints were retained only as positions; but the NEWEST one was
+    // persisted in full (see save_disk) so the slot can roll back to it when the request
+    // diverges inside the last assistant turn. Restore it as a real checkpoint.
+    size_t nread_ckpt = 0;
+    if (it->has_ckpt()) {
+        bool ok = false;
+        common_prompt_checkpoint ck;
+        FILE * f = fopen(it->path_ckpt.c_str(), "rb");
+        if (f) {
+            uint32_t magic = 0, version = 0; uint64_t h_n_tokens = 0, s_tgt = 0, s_dft = 0, s_spc = 0; int32_t h_pos_min = 0, h_pos_max = 0;
+            ok = fread(&magic, sizeof(magic), 1, f) == 1 && magic == 0x50434b43u &&
+                 fread(&version, sizeof(version), 1, f) == 1 && version == 1 &&
+                 fread(&h_n_tokens, sizeof(h_n_tokens), 1, f) == 1 &&
+                 fread(&h_pos_min, sizeof(h_pos_min), 1, f) == 1 &&
+                 fread(&h_pos_max, sizeof(h_pos_max), 1, f) == 1 &&
+                 fread(&s_tgt, sizeof(s_tgt), 1, f) == 1 &&
+                 fread(&s_dft, sizeof(s_dft), 1, f) == 1 &&
+                 fread(&s_spc, sizeof(s_spc), 1, f) == 1 &&
+                 h_n_tokens == (uint64_t) it->ckpt_meta.n_tokens;
+            if (ok) {
+                ck.n_tokens = (int64_t) h_n_tokens; ck.pos_min = h_pos_min; ck.pos_max = h_pos_max;
+                ck.data_tgt.resize((size_t) s_tgt); ck.data_dft.resize((size_t) s_dft); ck.data_spec.resize((size_t) s_spc);
+                ok = (s_tgt == 0 || fread(ck.data_tgt.data(), 1, (size_t) s_tgt, f) == s_tgt) &&
+                     (s_dft == 0 || fread(ck.data_dft.data(), 1, (size_t) s_dft, f) == s_dft) &&
+                     (s_spc == 0 || fread(ck.data_spec.data(), 1, (size_t) s_spc, f) == s_spc);
+                nread_ckpt = (size_t) ftell(f);
+            }
+            fclose(f);
+        }
+        if (ok) {
+            restored.checkpoints.push_back(std::move(ck));
+            SRV_INF("prompt cache disk load: entry=%" PRIu64 " checkpoint restored n_tokens=%" PRId64 " bytes=%zu\n",
+                    entry_id, it->ckpt_meta.n_tokens, nread_ckpt);
+        } else {
+            SRV_WRN("prompt cache disk load: entry=%" PRIu64 " checkpoint file unreadable (%s) - restoring exact-boundary state only\n",
+                    entry_id, it->path_ckpt.c_str());
+        }
+    }
     prompt = std::move(restored);
 
-    disk_bytes_read += nread_main + nread_drft;
+    disk_bytes_read += nread_main + nread_drft + nread_ckpt;
 
     const double t_ms = (ggml_time_us() - t_start)/1000.0;
     SRV_INF("prompt cache disk load: entry=%" PRIu64 " lcp=%zu tokens=%zu checkpoints=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu read_bytes=%zu load_ms=%.2f path=%s\n",
@@ -2896,6 +2995,10 @@ bool server_prompt_cache::erase_disk_state(
     it->usable = false;
     const bool main_ok = server_prompt_cache_disk_remove_file(path_main);
     const bool drft_ok = server_prompt_cache_disk_remove_file(path_drft);
+    if (it->has_ckpt()) {
+        // best effort; the accounting below uses it->size() which includes the checkpoint
+        server_prompt_cache_disk_remove_file(it->path_ckpt);
+    }
     if (!main_ok || !drft_ok) {
         SRV_ERR("prompt cache disk removal failed: entry=%" PRIu64 " reason=%s target_removed=%s draft_removed=%s accounted_bytes=%zu path=%s\n",
                 entry_id, reason, main_ok ? "true" : "false", drft_ok ? "true" : "false",
@@ -3052,6 +3155,23 @@ bool server_prompt_cache::load(
     size_t spec_boundary_best = base_boundary_valid ? prompt.tokens.size() : 0;
     bool ram_loaded = false;
 
+    // The live slot may still be the best source even when its tail diverges from the
+    // request: the slot code rolls back to its newest checkpoint at or before the
+    // divergence and re-prefills only the tail. Seed its worth with that checkpoint, so
+    // a (necessarily older) disk copy of the same conversation cannot outrank it.
+    if (!base_boundary_valid && lcp_best > 0) {
+        for (auto ck = prompt.checkpoints.rbegin(); ck != prompt.checkpoints.rend(); ++ck) {
+            if (ck->n_tokens <= (int64_t) lcp_best && ck->n_tokens > 0) {
+                spec_boundary_best = (size_t) ck->n_tokens;
+                f_keep_best = float(ck->n_tokens) / std::max<size_t>(1, prompt.tokens.size());
+                sim_best    = float(ck->n_tokens) / std::max<size_t>(1, tokens_new.size());
+                SRV_INF("prompt cache: slot salvageable via checkpoint n_tokens=%" PRId64 " (lcp=%d), seeding selection\n",
+                        ck->n_tokens, lcp_best);
+                break;
+            }
+        }
+    }
+
     // Find the most similar RAM prompt first. On an equal match, the hot RAM
     // copy wins and avoids SSD I/O.
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -3097,10 +3217,23 @@ bool server_prompt_cache::load(
 
         const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
 
-        if (!spec_boundary_valid(it->tokens.size(), lcp_cur)) {
-            SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=disk entry=%" PRIu64 " lcp=%d cached_tokens=%zu request_tokens=%zu spec_bytes=%zu\n",
-                    it->id, lcp_cur, it->tokens.size(), tokens_new.size(), it->spec.size());
+        // Exact-boundary match, or the request covers the entry's persisted checkpoint
+        // (it diverges only inside the last assistant turn): then the entry is worth
+        // ckpt.n_tokens - the slot restores it and rolls back to the checkpoint.
+        const bool boundary_ok = spec_boundary_valid(it->tokens.size(), lcp_cur);
+        const bool ckpt_ok = !boundary_ok && it->has_ckpt() &&
+                             it->ckpt_meta.n_tokens > 0 && lcp_cur >= (int) it->ckpt_meta.n_tokens;
+        const size_t eff_tokens = boundary_ok ? it->tokens.size() : (size_t) it->ckpt_meta.n_tokens;
+
+        if (!boundary_ok && !ckpt_ok) {
+            SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=disk entry=%" PRIu64 " lcp=%d cached_tokens=%zu request_tokens=%zu spec_bytes=%zu%s\n",
+                    it->id, lcp_cur, it->tokens.size(), tokens_new.size(), it->spec.size(),
+                    it->has_ckpt() ? " (checkpoint present but request diverges before it)" : "");
             continue;
+        }
+        if (ckpt_ok) {
+            SRV_INF("prompt cache candidate: source=disk entry=%" PRIu64 " via checkpoint n_tokens=%" PRId64 " lcp=%d cached_tokens=%zu request_tokens=%zu\n",
+                    it->id, it->ckpt_meta.n_tokens, lcp_cur, it->tokens.size(), tokens_new.size());
         }
         if (spec_state_required && it->spec.empty()) {
             SRV_INF("prompt cache skip: reason=spec-state-missing source=disk entry=%" PRIu64 " cached_tokens=%zu request_tokens=%zu\n",
@@ -3116,12 +3249,12 @@ bool server_prompt_cache::load(
         }
 
         const bool is_better = spec_state_required
-            ? it->tokens.size() > spec_boundary_best
+            ? eff_tokens > spec_boundary_best
             : f_keep_best < f_keep_cur && sim_best < sim_cur;
         if (is_better) {
             f_keep_best = f_keep_cur;
             sim_best    = sim_cur;
-            spec_boundary_best = it->tokens.size();
+            spec_boundary_best = eff_tokens;
 
             it_best_ram  = states.end();
             it_best_disk = it;

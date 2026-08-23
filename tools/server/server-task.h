@@ -625,14 +625,26 @@ struct server_prompt_disk_state {
     std::string path_main;
     std::string path_drft;
 
+    // The newest context checkpoint is persisted alongside the entry (see save_disk). It
+    // lets a request that EXTENDS the cached prompt only up to a point inside the last
+    // assistant turn (e.g. a client that re-sends that turn without reasoning_content, so
+    // it re-tokenizes differently) still restore this entry: the slot rolls back to the
+    // checkpoint exactly as it does in-slot and re-prefills just the tail. Without it,
+    // stateful (MTP) entries are usable only on an exact-boundary match.
+    std::string path_ckpt;
+    size_t      size_ckpt = 0;
+    server_prompt_checkpoint_meta ckpt_meta;
+
     size_t size_main = 0;
     size_t size_drft = 0;
+
+    bool has_ckpt() const { return !path_ckpt.empty(); }
 
     uint64_t id = 0;
     bool usable = true;
 
     size_t size() const {
-        return size_main + size_drft;
+        return size_main + size_drft + size_ckpt;
     }
 
     int n_tokens() const {
