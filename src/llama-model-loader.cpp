@@ -290,9 +290,14 @@ static std::string llama_model_loader_compat_key(const std::string & key) {
         compat_key.replace(0, std::string("gemma4_assistant").size(), "gemma4-assistant");
         return compat_key;
     }
+    if (key.rfind("deepseek4-dflash-draft.", 0) == 0) {
+        std::string compat_key = key;
+        compat_key.replace(0, std::string("deepseek4-dflash-draft").size(), "dflash-draft");
+        return compat_key;
+    }
     if (key.rfind("dflash.", 0) == 0) {
         std::string compat_key = key;
-        compat_key.replace(0, std::string("dflash").size(), "dflash-draft");
+        compat_key.replace(0, std::string("dflash").size(), "deepseek4-dflash-draft");
         return compat_key;
     }
     return {};
@@ -1144,8 +1149,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         } else if (load_name == "fc.weight" && get_tensor_meta("dflash_fc.weight") != nullptr) {
             load_name = "dflash_fc.weight";
+        } else if (load_name == "fc.weight" && get_tensor_meta("dflash.fc.weight") != nullptr) {
+            load_name = "dflash.fc.weight";
         } else if (load_name == "enc.output_norm.weight" && get_tensor_meta("dflash_hidden_norm.weight") != nullptr) {
             load_name = "dflash_hidden_norm.weight";
+        } else if (load_name == "enc.output_norm.weight" && get_tensor_meta("dflash.hidden_norm.weight") != nullptr) {
+            load_name = "dflash.hidden_norm.weight";
+        } else if (load_name == "markov_w1.weight" && get_tensor_meta("dflash.dspark.markov.w1") != nullptr) {
+            load_name = "dflash.dspark.markov.w1";
+        } else if (load_name == "markov_w2.weight" && get_tensor_meta("dflash.dspark.markov.w2") != nullptr) {
+            load_name = "dflash.dspark.markov.w2";
+        } else if (load_name == "conf_proj.weight" && get_tensor_meta("dflash.dspark.confidence.weight") != nullptr) {
+            load_name = "dflash.dspark.confidence.weight";
+        } else if (load_name == "conf_proj.bias" && get_tensor_meta("dflash.dspark.confidence.bias") != nullptr) {
+            load_name = "dflash.dspark.confidence.bias";
         } else {
             std::string compat_name = load_name;
             const std::string from = ".ffn_norm.";

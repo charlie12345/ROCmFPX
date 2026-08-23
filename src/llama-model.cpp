@@ -1022,7 +1022,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         return;
     }
 
-    ml.get_key(LLM_KV_CONTEXT_LENGTH,          hparams.n_ctx_train);
+    ml.get_key(LLM_KV_CONTEXT_LENGTH,          hparams.n_ctx_train, false);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH,        hparams.n_embd);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH_OUT,    hparams.n_embd_out_impl, false);
     ml.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn,     false);
@@ -2272,6 +2272,10 @@ llama_model_params llama_model_default_params() {
 
 const llama_vocab * llama_model_get_vocab(const llama_model * model) {
     return &model->vocab;
+}
+
+void llama_model_share_vocab(llama_model * dst, const llama_model * src) {
+    dst->vocab.copy_from(src->vocab);
 }
 
 void llama_free_model(llama_model * model) {

@@ -896,6 +896,11 @@ private:
                 return false;
             }
 
+            // DSpark/DFlash drafts from Lucebox may ship weights-only (no tokenizer); share the target's vocab
+            if (llama_vocab_type(llama_model_get_vocab(model_dft.get())) == LLAMA_VOCAB_TYPE_NONE) {
+                llama_model_share_vocab(model_dft.get(), model_tgt);
+            }
+
             auto cparams = common_context_params_to_llama(params_dft);
 
             const bool spec_mtp = std::find(params_base.speculative.types.begin(),
