@@ -936,7 +936,7 @@ llm_arch llm_arch_from_string(const std::string & name) {
     if (name == "gemma4-assistant") {
         return LLM_ARCH_GEMMA4_ASSISTANT;
     }
-    if (name == "dflash-draft") {
+    if (name == "dflash-draft" || name == "deepseek4-dflash-draft") {
         return LLM_ARCH_DFLASH;
     }
 

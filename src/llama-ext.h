@@ -92,6 +92,9 @@ struct llama_device_memory_data {
 using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data>;
 
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
+
+// Share the source model's vocab with the destination model (e.g. vocab-less DFlash drafts).
+LLAMA_API void llama_model_share_vocab(struct llama_model * dst, const struct llama_model * src);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);

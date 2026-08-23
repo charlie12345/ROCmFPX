@@ -1905,7 +1905,9 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
 
     // determine vocab type
     {
-        ml.get_key(LLM_KV_TOKENIZER_MODEL, tokenizer_model);
+        if (!ml.get_key(LLM_KV_TOKENIZER_MODEL, tokenizer_model, false)) {
+            tokenizer_model = "no_vocab";
+        }
         ml.get_key(LLM_KV_TOKENIZER_PRE,   tokenizer_pre, false);
 
         ml.get_key(LLM_KV_TOKENIZER_TOKEN_TYPE_COUNT, n_token_types, false);
@@ -3731,6 +3733,55 @@ void llama_vocab::impl::print_info() const {
     }
 
     LLAMA_LOG_INFO("%s: max token length      = %d\n", __func__, max_token_len);
+}
+
+void llama_vocab::copy_from(const llama_vocab & other) {
+    // Member-wise copy; the reference member 'vocab' is fixed at construction.
+    auto & dst = *pimpl;
+    const auto & src = *other.pimpl;
+
+    dst.n_token_types            = src.n_token_types;
+    dst.tokenizer_model          = src.tokenizer_model;
+    dst.tokenizer_pre            = src.tokenizer_pre;
+    dst.type                     = src.type;
+    dst.pre_type                 = src.pre_type;
+    dst.max_token_len            = src.max_token_len;
+    dst.special_bos_id           = src.special_bos_id;
+    dst.special_eos_id           = src.special_eos_id;
+    dst.special_eot_id           = src.special_eot_id;
+    dst.special_eom_id           = src.special_eom_id;
+    dst.special_unk_id           = src.special_unk_id;
+    dst.special_sep_id           = src.special_sep_id;
+    dst.special_pad_id           = src.special_pad_id;
+    dst.special_mask_id          = src.special_mask_id;
+    dst.linefeed_id              = src.linefeed_id;
+    dst.special_fim_pre_id       = src.special_fim_pre_id;
+    dst.special_fim_suf_id       = src.special_fim_suf_id;
+    dst.special_fim_mid_id       = src.special_fim_mid_id;
+    dst.special_fim_pad_id       = src.special_fim_pad_id;
+    dst.special_fim_rep_id       = src.special_fim_rep_id;
+    dst.special_fim_sep_id       = src.special_fim_sep_id;
+    dst.add_space_prefix         = src.add_space_prefix;
+    dst.add_bos                  = src.add_bos;
+    dst.add_eos                  = src.add_eos;
+    dst.add_sep                  = src.add_sep;
+    dst.ignore_merges            = src.ignore_merges;
+    dst.clean_spaces             = src.clean_spaces;
+    dst.remove_extra_whitespaces = src.remove_extra_whitespaces;
+    dst.escape_whitespaces       = src.escape_whitespaces;
+    dst.treat_whitespace_as_suffix = src.treat_whitespace_as_suffix;
+    dst.normalizer_opts          = src.normalizer_opts;
+    dst.token_to_id              = src.token_to_id;
+    dst.id_to_token              = src.id_to_token;
+    dst.cache_special_tokens     = src.cache_special_tokens;
+    dst.cache_token_to_piece     = src.cache_token_to_piece;
+    dst.bpe_ranks                = src.bpe_ranks;
+    dst.special_eog_ids          = src.special_eog_ids;
+    dst.suppress_tokens          = src.suppress_tokens;
+    dst.precompiled_charsmap     = src.precompiled_charsmap;
+
+    dst.tokenizer.reset();
+    dst.init_tokenizer(dst.type);
 }
 
 llama_vocab::llama_vocab() : pimpl(new impl(*this)) {
