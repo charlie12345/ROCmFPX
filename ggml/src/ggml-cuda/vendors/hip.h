@@ -133,6 +133,9 @@
 #define cudaGraphNodeTypeKernel hipGraphNodeTypeKernel
 #define cudaGraphInstantiate hipGraphInstantiate
 #define cudaStreamEndCapture hipStreamEndCapture
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
+#define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaGraphDestroy hipGraphDestroy
 #define cudaGraphKernelNodeSetParams hipGraphKernelNodeSetParams
 #define cudaErrorInvalidDeviceFunction hipErrorInvalidDeviceFunction

@@ -125,6 +125,25 @@ if (GGML_HIP_NO_VMM)
     add_compile_definitions(GGML_HIP_NO_VMM)
 endif()
 
+# hipCUB (CUB-compatible layer over rocPRIM, header-only, ships with ROCm) enables the
+# CUB code paths in ggml-cuda: argsort / top-k over vocabulary-wide rows on the GPU. Without
+# it GGML_OP_TOP_K is unsupported beyond 1024 columns and backend samplers that use top-k
+# (e.g. the MTP drafter) fall back to CPU sampling with a logits round-trip per token.
+option(GGML_HIP_CUB "ggml: use hipCUB for GPU argsort/top-k" ON)
+if (GGML_HIP_CUB)
+    find_path(HIPCUB_INCLUDE_DIR NAMES hipcub/hipcub.hpp
+              HINTS ${ROCM_PATH}/include $ENV{HIP_PATH}/include)
+    if (HIPCUB_INCLUDE_DIR)
+        message(STATUS "hipCUB found at ${HIPCUB_INCLUDE_DIR}: GPU top-k/argsort enabled")
+        add_compile_definitions(GGML_HIP_USE_CUB)
+        include_directories(${HIPCUB_INCLUDE_DIR})
+        # shim so `#include <cub/cub.cuh>` resolves to hipCUB for every CUB user in ggml-cuda
+        include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/vendors/hipcub-shim)
+    else()
+        message(WARNING "GGML_HIP_CUB=ON but hipcub/hipcub.hpp was not found; GPU top-k over wide rows stays disabled")
+    endif()
+endif()
+
 if (GGML_HIP_ROCMI4_W4A4)
     add_compile_definitions(GGML_ROCMI4_W4A4=1)
     message(WARNING
