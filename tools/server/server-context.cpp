@@ -1441,6 +1441,12 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // A prompt-cache restore move-assigns a whole server_prompt over the slot's,
+        // and cached entries are text-only, so their tokens carry has_mtmd = false.
+        // That clobbers the mmproj stamp set at init and a later media request then
+        // hits GGML_ASSERT(has_mtmd) in server_tokens::push_back. Re-stamp per launch.
+        slot.prompt.tokens.has_mtmd = mctx != nullptr;
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
