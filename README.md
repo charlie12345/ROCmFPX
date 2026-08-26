@@ -9,6 +9,12 @@ Vulkan kernels.
 > hardware, drivers, model, prompt, and quantization recipe; use BF16/F16 sources
 > for quality comparisons.
 
+> **HaloSpecKV branch:** `halospeckv/accepted-prefix-replay` is an independent
+> Radical Geek research branch. It adds strict-Qwen partial-rejection replay
+> and the state-correctness fixes used to obtain exact serial/MTP output through
+> 32K context on AMD Strix Halo. See [`HALOSPECKV.md`](HALOSPECKV.md) for scope,
+> provenance, measurements and reproduction details.
+
 ## Disclosure
 
 **#AD #AMDAI**

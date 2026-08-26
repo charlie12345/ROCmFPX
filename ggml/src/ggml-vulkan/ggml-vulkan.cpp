@@ -3339,6 +3339,13 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
     if (turbo_kv) {
         path = FA_SCALAR;
     }
+    // On AMD UMA, cooperative-matrix FA with Q8_0 keys can consume stale
+    // masked cache rows after sequence reuse.  Keep the integer-dot MMQ inner
+    // loop, but use the scalar FA dispatcher, which is deterministic and has
+    // equivalent measured throughput on Strix Halo.
+    if (device->vendor_id == VK_VENDOR_ID_AMD && device->uma && k_type == GGML_TYPE_Q8_0) {
+        path = FA_SCALAR;
+    }
 
     if (path == FA_COOPMAT2 && k_type == GGML_TYPE_BF16 && !device->coopmat2_bf16_support) {
         path = FA_COOPMAT1;
