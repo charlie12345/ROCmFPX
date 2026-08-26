@@ -2806,6 +2806,19 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+
+                                // MTP keeps endpoint hidden rows outside the target and draft
+                                // memory modules.  A full prompt re-prefill must therefore
+                                // discard this side state as well as removing the KV/recurrent
+                                // sequences below.  Otherwise the next request can inherit the
+                                // previous request's MTP boundary despite cache_prompt=false.
+                                if (common_speculative_state_required(spec.get())) {
+                                    slot.spec_draft.clear();
+                                    slot.spec_i_batch.clear();
+                                    slot.spec_ckpt.clear();
+                                    slot.spec_state.clear();
+                                    common_speculative_set_state(spec.get(), slot.id, {});
+                                }
                             }
 
                             // MTP carries only the endpoint and immediately preceding target hidden
@@ -3580,6 +3593,48 @@ private:
                     const bool use_ckpt_tgt =
                         ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                        (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+
+                    // A partial rejection keeps an intermediate recurrent snapshot from the
+                    // multi-row verification graph. Rebuild the accepted prefix with one-token
+                    // ubatches so the retained target state follows the serial decode path.
+                    // The first verification row is retained; rolling back all draft rows is
+                    // bounded by n_max, then only accepted draft tokens are replayed.
+                    if (strict_qwen_mtp_verification && n_rollback > 0 && !use_ckpt_tgt && accepted.size() > 1) {
+                        const size_t n_replay = accepted.size() - 1;
+                        const llama_pos replay_pos = slot.prompt.tokens.pos_next() - (llama_pos) n_draft;
+
+                        common_context_seq_rm(slot.ctx_tgt, slot.id, replay_pos, -1);
+
+                        int replay_ret = 0;
+                        for (size_t j = 0; j < n_replay; ++j) {
+                            llama_batch replay = llama_batch_init(1, 0, 1);
+                            common_batch_add(
+                                    replay,
+                                    accepted[j],
+                                    replay_pos + (llama_pos) j,
+                                    { slot.id },
+                                    false);
+                            replay_ret = llama_decode(slot.ctx_tgt, replay);
+                            llama_batch_free(replay);
+                            if (replay_ret != 0) {
+                                break;
+                            }
+                        }
+
+                        if (replay_ret != 0) {
+                            const std::string err = "Strict Qwen accepted-prefix replay failed.";
+                            SLT_WRN(slot, "%s ret=%d\n", err.c_str(), replay_ret);
+                            send_error(slot, err);
+                            slot.release();
+                            slot.prompt_clear(false);
+                            continue;
+                        }
+
+                        SLT_DBG(slot,
+                                "strict Qwen partial rejection: replayed %zu accepted draft tokens serially from pos %d\n",
+                                n_replay,
+                                replay_pos);
+                    }
 
                     // check for partial draft acceptance
                     if (n_rollback > 0) {

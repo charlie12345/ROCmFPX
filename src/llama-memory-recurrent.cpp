@@ -96,7 +96,10 @@ llama_memory_recurrent::llama_memory_recurrent(
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
-        const uint32_t n_rows = mem_size * (1 + n_rs_seq);
+        // Reserve one immutable zero row after the live and rollback planes.
+        // Fresh sequences gather from this row instead of clearing and then
+        // gathering an aliased live row in the same backend graph.
+        const uint32_t n_rows = mem_size * (1 + n_rs_seq) + 1;
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
         ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
@@ -171,7 +174,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
-                if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                // The pending rollback is consumed and reset by s_copy().  A
+                // second seq_rm call must not replace it before that graph.
+                const bool pending = rs_idx[seq_id] != 0;
+                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -180,7 +186,6 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
-                set_rs_idx(seq_id, 0);
                 tail_id = -1;
             }
         }
@@ -410,7 +415,10 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
             } else {
                 // TODO: non-sequential equal split can be done if using unified KV cache
                 //       for simplicity, we always use sequential equal split for now
-                ubatch = balloc.split_equal(n_ubatch, true);
+                // [TAG_RECURRENT_ROLLBACK_SPLITS]
+                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
+                //   so that the rollback snapshots remain valid
+                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -639,28 +647,16 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         }
     }
 
-    // Find first cell without src refs, to use as the zero-ed state
+    // Use the immutable row after the live and rollback planes as the source
+    // for every fresh sequence.  The previous scheme borrowed a live row,
+    // cleared it in the graph and immediately gathered from an alias of the
+    // same tensor.  Backends may schedule those operations without a true
+    // dependency, allowing state from the previous sequence to leak in.
     {
-        // TODO: bake-in src refcounts in the cell metadata
-        std::vector<int32_t> refcounts(size, 0);
-        for (size_t i = 0; i < size; ++i) {
-            const int32_t src = cells[i].src;
-            if (src >= 0) {
-                refcounts[src] += 1;
-            }
-        }
-
-        rs_z = -1;
-        for (int i = min; i <= max; ++i) {
-            if (refcounts[i] == 0) {
-                rs_z = i;
-                break;
-            }
-        }
+        rs_z = size * (1 + n_rs_seq);
 
         for (int i = min; i <= max; ++i) {
             if (cells[i].src < 0) {
-                GGML_ASSERT(rs_z >= 0);
                 cells[i].src0 = rs_z;
             } else {
                 // Stage the source ids for all used cells to allow correct seq_* behavior
