@@ -1,5 +1,9 @@
 # ROCmFPX for llama.cpp
 
+Local long-context inference on AMD Strix Halo was too slow. This fork carries
+the HaloSpecKV runtime changes that make strict Qwen MTP faster while preserving
+exact target-model output.
+
 ROCmFPX adds experimental AMD-focused 2-, 3-, 4-, 6-, and 8-bit GGUF model-weight
 formats to `llama.cpp`, with CPU reference paths and accelerated HIP/ROCm and
 Vulkan kernels.

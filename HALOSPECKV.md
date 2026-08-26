@@ -1,5 +1,8 @@
 # HaloSpecKV runtime branch
 
+Local long-context inference on AMD Strix Halo was too slow. This branch exists
+to make it faster without changing the target model's output.
+
 This branch is the buildable runtime for the independent
 [HaloSpecKV](https://github.com/radicalgeek/halospeckv) project. It starts at
 ROCmFPX commit `c49ebdbd5c9f01ec242369f9e7f7967855f80cba` and contains the exact
