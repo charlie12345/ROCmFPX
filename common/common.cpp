@@ -2068,6 +2068,8 @@ common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoin
     pos_max(other.pos_max),
     data_tgt(other.data_tgt),
     data_dft(other.data_dft),
+    data_tgt_host(other.data_tgt_host),
+    data_dft_host(other.data_dft_host),
     data_spec(other.data_spec),
     storage_tgt(llama_state_seq_storage_clone(other.storage_tgt)),
     storage_dft(llama_state_seq_storage_clone(other.storage_dft)) {
@@ -2084,6 +2086,8 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(const common_prom
 
     data_tgt = other.data_tgt;
     data_dft = other.data_dft;
+    data_tgt_host = other.data_tgt_host;
+    data_dft_host = other.data_dft_host;
     data_spec = other.data_spec;
 
     llama_state_seq_storage_free(storage_tgt);
@@ -2100,6 +2104,8 @@ common_prompt_checkpoint::common_prompt_checkpoint(common_prompt_checkpoint && o
     pos_max(other.pos_max),
     data_tgt(std::move(other.data_tgt)),
     data_dft(std::move(other.data_dft)),
+    data_tgt_host(std::move(other.data_tgt_host)),
+    data_dft_host(std::move(other.data_dft_host)),
     data_spec(std::move(other.data_spec)),
     storage_tgt(other.storage_tgt),
     storage_dft(other.storage_dft) {
@@ -2121,6 +2127,8 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_che
 
     data_tgt = std::move(other.data_tgt);
     data_dft = std::move(other.data_dft);
+    data_tgt_host = std::move(other.data_tgt_host);
+    data_dft_host = std::move(other.data_dft_host);
     data_spec = std::move(other.data_spec);
 
     storage_tgt = other.storage_tgt;
@@ -2135,6 +2143,8 @@ common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_che
 size_t common_prompt_checkpoint::size() const {
     return data_tgt.size() +
            data_dft.size() +
+           data_tgt_host.size() +
+           data_dft_host.size() +
            data_spec.size() +
            llama_state_seq_storage_size(storage_tgt) +
            llama_state_seq_storage_size(storage_dft);
@@ -2152,6 +2162,8 @@ void common_prompt_checkpoint::clear() {
 
     data_tgt.clear();
     data_dft.clear();
+    data_tgt_host.clear();
+    data_dft_host.clear();
     data_spec.clear();
 
     llama_state_seq_storage_free(storage_tgt);
@@ -2221,6 +2233,85 @@ void common_prompt_checkpoint::update_dft(
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
+}
+
+void common_prompt_checkpoint::capture_host(
+        llama_context *       ctx_tgt,
+        llama_context *       ctx_dft,
+        llama_seq_id          seq_id,
+        llama_state_seq_flags flags) {
+    if (ctx_tgt != nullptr) {
+        const size_t ckpt_size = llama_state_seq_get_size_ext(ctx_tgt, seq_id, flags);
+
+        data_tgt_host.resize(ckpt_size);
+
+        const size_t n = llama_state_seq_get_data_ext_storage(ctx_tgt, data_tgt_host.data(), ckpt_size, seq_id, flags, nullptr);
+        if (n != ckpt_size) {
+            GGML_ABORT("host checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+        }
+    }
+
+    if (ctx_dft != nullptr) {
+        const size_t ckpt_size = llama_state_seq_get_size_ext(ctx_dft, seq_id, flags);
+
+        data_dft_host.resize(ckpt_size);
+
+        const size_t n = llama_state_seq_get_data_ext_storage(ctx_dft, data_dft_host.data(), ckpt_size, seq_id, flags, nullptr);
+        if (n != ckpt_size) {
+            GGML_ABORT("host draft checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+        }
+    }
+}
+
+bool common_prompt_checkpoint::load_tgt_host(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) const {
+    if (ctx == nullptr) {
+        return true;
+    }
+
+    if (data_tgt_host.empty()) {
+        return true;
+    }
+
+    const size_t n = llama_state_seq_set_data_ext_storage(ctx, data_tgt_host.data(), data_tgt_host.size(), seq_id, flags, nullptr);
+    if (n != data_tgt_host.size()) {
+        LOG_WRN("%s: target host checkpoint restore failed: expected=%zu, restored=%zu\n",
+                __func__, data_tgt_host.size(), n);
+        return false;
+    }
+
+    return true;
+}
+
+bool common_prompt_checkpoint::load_dft_host(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) const {
+    if (ctx == nullptr) {
+        return true;
+    }
+
+    if (data_dft_host.empty()) {
+        return true;
+    }
+
+    const size_t n = llama_state_seq_set_data_ext_storage(ctx, data_dft_host.data(), data_dft_host.size(), seq_id, flags, nullptr);
+    if (n != data_dft_host.size()) {
+        LOG_WRN("%s: draft host checkpoint restore failed: expected=%zu, restored=%zu\n",
+                __func__, data_dft_host.size(), n);
+        return false;
+    }
+
+    return true;
+}
+
+void common_prompt_checkpoint::clear_host() {
+    data_tgt_host.clear();
+    data_tgt_host.shrink_to_fit();
+    data_dft_host.clear();
+    data_dft_host.shrink_to_fit();
 }
 
 bool common_prompt_checkpoint::load_tgt(

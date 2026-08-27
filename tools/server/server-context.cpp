@@ -2045,6 +2045,24 @@ private:
             common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
         }
 
+        // host-memory shadow for the prompt-cache salvage path: ON_DEVICE
+        // payloads are views into the live context memory and do not survive
+        // the slot being reused by the next task. keep shadows only on the
+        // newest few checkpoints to bound memory.
+        cur.capture_host(ctx_tgt, ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+        {
+            static constexpr int KEEP_HOST = 2;
+            int remaining = KEEP_HOST;
+            for (auto it = slot.prompt.checkpoints.rbegin(); it != slot.prompt.checkpoints.rend(); ++it) {
+                if (remaining > 0) {
+                    --remaining;
+                    continue;
+                }
+                it->clear_host();
+            }
+        }
+
         SLT_INF(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
