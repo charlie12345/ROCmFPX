@@ -17,6 +17,7 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_PLAMO3:
         case LLM_ARCH_GEMMA3:
         case LLM_ARCH_GEMMA3N:
