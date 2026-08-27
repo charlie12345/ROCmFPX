@@ -179,17 +179,19 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
     return mb;
 }
 
+// [TAG_HYBRID_STATE_FULL]
+// server checkpoints are captured with LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY.
+// for hybrid memory the partial state must still include the attention KV:
+// skipping it produced checkpoints that rewind the recurrent state but read
+// stale attention memory on resume (nondeterministic output). the flag only
+// means "skip padding cells" for the sub-caches, never "skip a component".
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        mem_attn->state_write(io, seq_id, flags);
-    }
+    mem_attn->state_write(io, seq_id, flags);
     mem_recr->state_write(io, seq_id, flags);
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        mem_attn->state_read(io, seq_id, flags);
-    }
+    mem_attn->state_read(io, seq_id, flags);
     mem_recr->state_read(io, seq_id, flags);
 }
 
