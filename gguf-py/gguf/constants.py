@@ -253,6 +253,20 @@ class Keys:
     class ShortConv:
         L_CACHE = "{arch}.shortconv.l_cache"
 
+    class HyperConnection:
+        LOW_RANK = "{arch}.hyper_connection.low_rank"
+
+    class PLE:
+        LAYERS            = "{arch}.ple.layers"
+        NGRAM_SIZE        = "{arch}.ple.ngram_size"
+        HEADS_PER_NGRAM   = "{arch}.ple.heads_per_ngram"
+        CONV_KERNEL       = "{arch}.ple.conv_kernel"
+        LAYER_MULTIPLIERS = "{arch}.ple.layer_multipliers"
+        HEAD_OFFSETS      = "{arch}.ple.head_offsets"
+        HEAD_VOCAB_SIZES  = "{arch}.ple.head_vocab_sizes"
+        EOS_TOKEN_ID      = "{arch}.ple.eos_token_id"
+        IMAGE_TOKEN_ID    = "{arch}.ple.image_token_id"
+
     class Tokenizer:
         MODEL                = "tokenizer.ggml.model"
         PRE                  = "tokenizer.ggml.pre"
@@ -756,9 +770,15 @@ class MODEL_TENSOR(IntEnum):
     INDEXER_PROJ         = auto()
     INDEXER_ATTN_K       = auto()
     INDEXER_ATTN_Q_B     = auto()
+    INDEXER_Q_PROJ       = auto()
+    INDEXER_K_PROJ       = auto()
+    INDEXER_Q_NORM       = auto()
     OUTPUT_HC_BASE       = auto()
     OUTPUT_HC_FN         = auto()
     OUTPUT_HC_SCALE      = auto()
+    HC_HEAD_NORM         = auto()
+    HC_HEAD_DOWN         = auto()
+    HC_HEAD_UP           = auto()
     ATTN_KV              = auto()
     ATTN_OUT_A           = auto()
     ATTN_OUT_B           = auto()
@@ -773,9 +793,23 @@ class MODEL_TENSOR(IntEnum):
     HC_ATTN_BASE         = auto()
     HC_ATTN_FN           = auto()
     HC_ATTN_SCALE        = auto()
+    HC_ATTN_NORM         = auto()
+    HC_ATTN_DOWN         = auto()
+    HC_ATTN_UP           = auto()
+    HC_ATTN_INJECT       = auto()
     HC_FFN_BASE          = auto()
     HC_FFN_FN            = auto()
     HC_FFN_SCALE         = auto()
+    HC_FFN_NORM          = auto()
+    HC_FFN_DOWN          = auto()
+    HC_FFN_UP            = auto()
+    HC_FFN_INJECT        = auto()
+    PLE_KEY              = auto()
+    PLE_VALUE            = auto()
+    PLE_NORM_KEY         = auto()
+    PLE_NORM_QUERY       = auto()
+    PLE_NORM_CONV        = auto()
+    PLE_CONV1D           = auto()
     FFN_GATE_TID2EID     = auto()
     # vision
     V_MMPROJ             = auto()
@@ -1322,9 +1356,15 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.INDEXER_PROJ:              "blk.{bid}.indexer.proj",
     MODEL_TENSOR.INDEXER_ATTN_K:            "blk.{bid}.indexer.attn_k",
     MODEL_TENSOR.INDEXER_ATTN_Q_B:          "blk.{bid}.indexer.attn_q_b",
+    MODEL_TENSOR.INDEXER_Q_PROJ:            "blk.{bid}.indexer.q_proj",
+    MODEL_TENSOR.INDEXER_K_PROJ:            "blk.{bid}.indexer.k_proj",
+    MODEL_TENSOR.INDEXER_Q_NORM:            "blk.{bid}.indexer.q_norm",
     MODEL_TENSOR.OUTPUT_HC_BASE:            "output_hc_base",
     MODEL_TENSOR.OUTPUT_HC_FN:              "output_hc_fn",
     MODEL_TENSOR.OUTPUT_HC_SCALE:           "output_hc_scale",
+    MODEL_TENSOR.HC_HEAD_NORM:              "output_hc_norm",
+    MODEL_TENSOR.HC_HEAD_DOWN:              "output_hc_down",
+    MODEL_TENSOR.HC_HEAD_UP:                "output_hc_up",
     MODEL_TENSOR.ATTN_KV:                   "blk.{bid}.attn_kv",
     MODEL_TENSOR.ATTN_OUT_A:                "blk.{bid}.attn_output_a",
     MODEL_TENSOR.ATTN_OUT_B:                "blk.{bid}.attn_output_b",
@@ -1339,9 +1379,23 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.HC_ATTN_BASE:              "blk.{bid}.hc_attn_base",
     MODEL_TENSOR.HC_ATTN_FN:                "blk.{bid}.hc_attn_fn",
     MODEL_TENSOR.HC_ATTN_SCALE:             "blk.{bid}.hc_attn_scale",
+    MODEL_TENSOR.HC_ATTN_NORM:              "blk.{bid}.hc_attn_norm",
+    MODEL_TENSOR.HC_ATTN_DOWN:              "blk.{bid}.hc_attn_down",
+    MODEL_TENSOR.HC_ATTN_UP:                "blk.{bid}.hc_attn_up",
+    MODEL_TENSOR.HC_ATTN_INJECT:            "blk.{bid}.hc_attn_inject",
     MODEL_TENSOR.HC_FFN_BASE:               "blk.{bid}.hc_ffn_base",
     MODEL_TENSOR.HC_FFN_FN:                 "blk.{bid}.hc_ffn_fn",
     MODEL_TENSOR.HC_FFN_SCALE:              "blk.{bid}.hc_ffn_scale",
+    MODEL_TENSOR.HC_FFN_NORM:               "blk.{bid}.hc_ffn_norm",
+    MODEL_TENSOR.HC_FFN_DOWN:               "blk.{bid}.hc_ffn_down",
+    MODEL_TENSOR.HC_FFN_UP:                 "blk.{bid}.hc_ffn_up",
+    MODEL_TENSOR.HC_FFN_INJECT:             "blk.{bid}.hc_ffn_inject",
+    MODEL_TENSOR.PLE_KEY:                   "blk.{bid}.ple_key",
+    MODEL_TENSOR.PLE_VALUE:                 "blk.{bid}.ple_value",
+    MODEL_TENSOR.PLE_NORM_KEY:              "blk.{bid}.ple_norm_key",
+    MODEL_TENSOR.PLE_NORM_QUERY:            "blk.{bid}.ple_norm_query",
+    MODEL_TENSOR.PLE_NORM_CONV:             "blk.{bid}.ple_norm_conv",
+    MODEL_TENSOR.PLE_CONV1D:                "blk.{bid}.ple_conv1d",
     MODEL_TENSOR.FFN_GATE_TID2EID:          "blk.{bid}.ffn_gate_tid2eid",
     # vision
     MODEL_TENSOR.V_MMPROJ:                  "mm.{bid}",
@@ -2326,15 +2380,15 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.HC_FFN_DOWN,
         MODEL_TENSOR.HC_FFN_UP,
         MODEL_TENSOR.HC_FFN_INJECT,
-        MODEL_TENSOR.HC_MIX_NORM,
-        MODEL_TENSOR.HC_MIX_DOWN,
-        MODEL_TENSOR.HC_MIX_UP,
-        MODEL_TENSOR.PLE_NGRAM_EMBD,
+        MODEL_TENSOR.HC_HEAD_NORM,
+        MODEL_TENSOR.HC_HEAD_DOWN,
+        MODEL_TENSOR.HC_HEAD_UP,
+        MODEL_TENSOR.PER_LAYER_TOKEN_EMBD,
         MODEL_TENSOR.PLE_KEY,
         MODEL_TENSOR.PLE_VALUE,
-        MODEL_TENSOR.PLE_KEY_NORM,
-        MODEL_TENSOR.PLE_QUERY_NORM,
-        MODEL_TENSOR.PLE_CONV_NORM,
+        MODEL_TENSOR.PLE_NORM_KEY,
+        MODEL_TENSOR.PLE_NORM_QUERY,
+        MODEL_TENSOR.PLE_NORM_CONV,
         MODEL_TENSOR.PLE_CONV1D,
         MODEL_TENSOR.NEXTN_ENORM,
         MODEL_TENSOR.NEXTN_HNORM,
