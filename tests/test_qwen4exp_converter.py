@@ -262,6 +262,7 @@ def test_tensor_name_map_qwen4exp():
 def _build_synthetic_qwen4exp_hf_model(
     model_dir: Path,
     ple_enabled: bool,
+    hidden_size: int = 16,
 ) -> dict[str, Any]:
     tok = Tokenizer(models.BPE())
     tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, trim_offsets=True, use_regex=True)
@@ -279,7 +280,6 @@ def _build_synthetic_qwen4exp_hf_model(
     (model_dir / "tokenizer_config.json").write_text(json.dumps(tok_cfg))
 
     vocab_size = tok.get_vocab_size() + 10
-    hidden_size = 16
     intermediate_size = 32
     moe_intermediate_size = 16
     num_experts = 2
@@ -308,6 +308,7 @@ def _build_synthetic_qwen4exp_hf_model(
         "num_experts": num_experts,
         "num_experts_per_tok": num_experts_per_tok,
         "num_hidden_layers": num_hidden_layers,
+        "rms_norm_eps": 1e-6,
         "num_attention_heads": num_attention_heads,
         "num_key_value_heads": num_key_value_heads,
         "head_dim": head_dim,
@@ -569,4 +570,135 @@ def test_qwen4exp_e2e_conversion(tmp_path: Path, ple_enabled: bool):
         assert np.allclose(ple_tensor.data, expected_table_np), (
             "Merged PLE table in GGUF does not match expected concatenation of shards"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 7: llama-quantize must protect the PLE n-gram lookup table
+# ---------------------------------------------------------------------------
+def test_qwen4exp_rocmfp4_fast_protects_ple_table(tmp_path: Path):
+    # Given: A miniature qwen4exp GGUF converted from the synthetic checkpoint
+    _ensure_import_path()
+    import gguf
+
+    quantize_bin = REPO_ROOT / "build-strix-rocmfp4" / "bin" / "llama-quantize"
+    if not quantize_bin.is_file():
+        pytest.skip(f"llama-quantize binary not built at {quantize_bin}")
+
+    model_dir = tmp_path / "model_quant_src"
+    model_dir.mkdir()
+    f16_gguf = tmp_path / "qwen4exp-f16.gguf"
+    quant_gguf = tmp_path / "qwen4exp-rocmfp4-fast.gguf"
+
+    _build_synthetic_qwen4exp_hf_model(model_dir, ple_enabled=True, hidden_size=64)
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = f"{REPO_ROOT / 'gguf-py'}:{REPO_ROOT}"
+
+    convert_proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "convert_hf_to_gguf.py"),
+            str(model_dir),
+            "--outfile", str(f16_gguf),
+            "--outtype", "f16",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(REPO_ROOT),
+    )
+    assert convert_proc.returncode == 0, (
+        f"conversion failed with code {convert_proc.returncode}:\n{convert_proc.stderr}"
+    )
+
+    # When: Quantizing to Q4_0_ROCMFP4_FAST
+    quant_proc = subprocess.run(
+        [str(quantize_bin), str(f16_gguf), str(quant_gguf), "Q4_0_ROCMFP4_FAST"],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+    )
+    assert quant_proc.returncode == 0, (
+        f"llama-quantize failed with code {quant_proc.returncode}:\n"
+        f"STDOUT:\n{quant_proc.stdout}\nSTDERR:\n{quant_proc.stderr}"
+    )
+
+    # Then: The PLE n-gram lookup table survives at Q8_0 precision instead of
+    # inheriting the low-bit base type (it is gathered via hash lookups, not GEMMs)
+    quant_reader = gguf.GGUFReader(quant_gguf)
+    ple_tensor = next(
+        (t for t in quant_reader.tensors if t.name == "per_layer_token_embd.weight"), None
+    )
+    assert ple_tensor is not None, "per_layer_token_embd.weight missing after quantization"
+    observed_type = int(ple_tensor.tensor_type)
+    expected_type = int(gguf.GGMLQuantizationType.Q8_0)
+    assert observed_type == expected_type, (
+        f"PLE lookup table was quantized to type code {observed_type} "
+        f"(tensor_type={ple_tensor.tensor_type!r}); expected Q8_0 ({expected_type})"
+    )
+
+
+def test_qwen4exp_rocmfp4_tensor_type_override_pins_ple_table(tmp_path: Path):
+    _ensure_import_path()
+    import gguf
+
+    quantize_bin = REPO_ROOT / "build-strix-rocmfp4" / "bin" / "llama-quantize"
+    if not quantize_bin.is_file():
+        pytest.skip(f"llama-quantize binary not built at {quantize_bin}")
+
+    model_dir = tmp_path / "model_pin_src"
+    model_dir.mkdir()
+    f16_gguf = tmp_path / "qwen4exp-pin-f16.gguf"
+    quant_gguf = tmp_path / "qwen4exp-pin.gguf"
+
+    _build_synthetic_qwen4exp_hf_model(model_dir, ple_enabled=True, hidden_size=64)
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = f"{REPO_ROOT / 'gguf-py'}:{REPO_ROOT}"
+
+    convert_proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "convert_hf_to_gguf.py"),
+            str(model_dir),
+            "--outfile", str(f16_gguf),
+            "--outtype", "f16",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(REPO_ROOT),
+    )
+    assert convert_proc.returncode == 0, (
+        f"conversion failed with code {convert_proc.returncode}:\n{convert_proc.stderr}"
+    )
+
+    quant_proc = subprocess.run(
+        [
+            str(quantize_bin),
+            "--tensor-type", "per_layer_token_embd.weight=f16",
+            str(f16_gguf),
+            str(quant_gguf),
+            "Q4_0_ROCMFP4_FAST",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+    )
+    assert quant_proc.returncode == 0, (
+        f"llama-quantize failed with code {quant_proc.returncode}:\n"
+        f"STDOUT:\n{quant_proc.stdout}\nSTDERR:\n{quant_proc.stderr}"
+    )
+
+    quant_reader = gguf.GGUFReader(quant_gguf)
+    ple_tensor = next(
+        (t for t in quant_reader.tensors if t.name == "per_layer_token_embd.weight"), None
+    )
+    assert ple_tensor is not None, "per_layer_token_embd.weight missing after quantization"
+    observed_type = int(ple_tensor.tensor_type)
+    expected_type = int(gguf.GGMLQuantizationType.F16)
+    assert observed_type == expected_type, (
+        f"--tensor-type override ignored: PLE table got type code {observed_type} "
+        f"(tensor_type={ple_tensor.tensor_type!r}); expected F16 ({expected_type})"
+    )
 

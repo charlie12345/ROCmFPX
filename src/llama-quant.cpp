@@ -103,6 +103,10 @@ static bool tensor_name_match_token_embd(const char * tensor_name) {
            std::strcmp(tensor_name, "per_layer_token_embd.weight") == 0;
 }
 
+static bool tensor_is_ple_lookup_table(const char * tensor_name) {
+    return std::strcmp(tensor_name, "per_layer_token_embd.weight") == 0;
+}
+
 static bool tensor_name_match_output_weight(const char * tensor_name) {
     return std::strcmp(tensor_name, "output.weight") == 0;
 }
@@ -591,6 +595,16 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         return { 0, n_layer };
     };
 
+    // qwen4exp PLE n-gram tables are resolved through hashed gather lookups,
+    // not GEMMs; block-low-bit formats destroy their hash resolution. Same
+    // rationale as the draft-sensitive projections above. Explicit overrides
+    // take precedence: --token-embedding-type in llama_tensor_get_type and
+    // --tensor-type patterns further down.
+    if (category == tensor_category::TOKEN_EMBD &&
+        tensor_is_ple_lookup_table(name.c_str())) {
+        return GGML_TYPE_Q8_0;
+    }
+
     // for arches that share the same tensor between the token embeddings and the output, we quantize the token embeddings
     // with the quantization of the output tensor
     if (category == tensor_category::OUTPUT || (qs.has_tied_embeddings && category == tensor_category::TOKEN_EMBD)) {
@@ -1021,7 +1035,21 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
         return tensor->type;
     }
     if (params->token_embedding_type < GGML_TYPE_COUNT && tm.category == tensor_category::TOKEN_EMBD) {
-        return params->token_embedding_type;
+        // per_layer_token_embd follows --token-embedding-type by default, but it is a large
+        // separate table, so let an explicit --tensor-type name it
+        bool named = false;
+        if (std::strcmp(tensor->name, "per_layer_token_embd.weight") == 0) {
+            const std::string tensor_name(tensor->name);
+            for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+                if (std::regex_search(tensor_name, pattern)) {
+                    named = true;
+                    break;
+                }
+            }
+        }
+        if (!named) {
+            return params->token_embedding_type;
+        }
     }
     if (params->output_tensor_type < GGML_TYPE_COUNT && tm.category == tensor_category::OUTPUT) {
         return params->output_tensor_type;
