@@ -5886,6 +5886,18 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self._ple_rows_per_shard: int | None = None
         self._ple_map = None
         self._ple_path = None
+        self._ple_fp8_scale: float | None = None
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        # the text GGUF carries only the language model: the MTP draft head is
+        # not consumed by this runtime and the vision tower belongs to mmproj
+        name, _ = item
+        if name.startswith("mtp."):
+            return None
+        if name.startswith("model.visual.") or name.startswith("visual."):
+            return None
+        return super().filter_tensors(item)
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -5938,6 +5950,15 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if self._ple_row_dim is not None:
             self.gguf_writer.add_embedding_length_per_layer_input(self._ple_row_dim)
 
+        # the PLE table ships FP8 in this checkpoint family with a single
+        # per-tensor scale; capture it before the shards stream through
+        # prepare_tensors (alphabetical order puts the scale after the shards)
+        self._ple_fp8_scale = None
+        for tname, tgen in self.model_tensors.items():
+            if tname.endswith("ple_embedding.ngram_embedding.weight_scale"):
+                self._ple_fp8_scale = float(LazyTorchTensor.to_eager(tgen()).reshape(-1)[0])
+                break
+
         self.gguf_writer.add_ple_layer_multipliers(
             self._read_hash_constants("ple_embedding.layer_multipliers"))
         self.gguf_writer.add_ple_head_offsets(
@@ -5976,6 +5997,47 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if name.endswith("ple_embedding.ngram_heads_vocab_sizes"):
             self._ple_head_vocab_sizes = [int(x) for x in data_torch.tolist()]
             return []
+
+        # PLE table FP8: the checkpoint ships one per-tensor scale for the
+        # whole n-gram embedding; captured in set_gguf_parameters and applied
+        # in _write_ple_shard
+        if name.endswith("ple_embedding.ngram_embedding.weight_scale"):
+            return []
+
+        # hyper-connections: HF naming -> canonical. the head level replaces
+        # the final norm; the block level replaces per-layer norms
+        if ".hyper_connection_mixer." in name:
+            hc_map = {
+                "hc_norm": gguf.MODEL_TENSOR.HC_HEAD_NORM,
+                "input_mix_weight_down": gguf.MODEL_TENSOR.HC_HEAD_DOWN,
+                "input_mix_weight_up": gguf.MODEL_TENSOR.HC_HEAD_UP,
+            }
+            leaf = name.split(".")[-2]
+            return [(gguf.TENSOR_NAMES[hc_map[leaf]] + ".weight", data_torch)]
+        if ".attn_hyper_connection." in name:
+            hc_map = {
+                "hc_norm": gguf.MODEL_TENSOR.HC_ATTN_NORM,
+                "input_mix_weight_down": gguf.MODEL_TENSOR.HC_ATTN_DOWN,
+                "input_mix_weight_up": gguf.MODEL_TENSOR.HC_ATTN_UP,
+                "block_inject_weight": gguf.MODEL_TENSOR.HC_ATTN_INJECT,
+            }
+            leaf = name.split(".")[-2]
+            return [(self.format_tensor_name(hc_map[leaf], bid, ".weight"), data_torch)]
+        if ".mlp_hyper_connection." in name:
+            hc_map = {
+                "hc_norm": gguf.MODEL_TENSOR.HC_FFN_NORM,
+                "input_mix_weight_down": gguf.MODEL_TENSOR.HC_FFN_DOWN,
+                "input_mix_weight_up": gguf.MODEL_TENSOR.HC_FFN_UP,
+                "block_inject_weight": gguf.MODEL_TENSOR.HC_FFN_INJECT,
+            }
+            leaf = name.split(".")[-2]
+            return [(self.format_tensor_name(hc_map[leaf], bid, ".weight"), data_torch)]
+
+        # PLE projections: HF module names differ from the canonical suffixes
+        if name.endswith(".ple.key_proj.weight"):
+            return [(self.format_tensor_name(gguf.MODEL_TENSOR.PLE_KEY, bid, ".weight"), data_torch)]
+        if name.endswith(".ple.value_proj.weight"):
+            return [(self.format_tensor_name(gguf.MODEL_TENSOR.PLE_VALUE, bid, ".weight"), data_torch)]
 
         if ".ngram_embedding.shard_" in name:
             return self._place_ple_shard(data_torch, name)
@@ -6061,6 +6123,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         # the shard is still lazy here; force it, since the point of this path
         # is that exactly one shard is resident at a time
         eager = LazyTorchTensor.to_eager(shard).to(torch.float32).contiguous()
+        if self._ple_fp8_scale is not None:
+            eager = eager * self._ple_fp8_scale
         self._ple_map[start:start + rows] = eager.numpy()
         del eager
 
