@@ -6053,8 +6053,11 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             ]
 
         # Gemma zero-centred gammas the inherited norm.weight rule misses
-        if name.endswith((".ple.norm_key.weight", ".ple.norm_query.weight", ".ple.norm_conv.weight",
-                          ".indexer.q_layernorm.weight", ".indexer.k_layernorm.weight")):
+        if name.endswith(".indexer.q_layernorm.weight"):
+            return [(self.format_tensor_name(gguf.MODEL_TENSOR.INDEXER_Q_NORM, bid, ".weight"), data_torch + 1)]
+        if name.endswith(".indexer.k_layernorm.weight"):
+            return [(self.format_tensor_name(gguf.MODEL_TENSOR.INDEXER_K_NORM, bid, ".weight"), data_torch + 1)]
+        if name.endswith((".ple.norm_key.weight", ".ple.norm_query.weight", ".ple.norm_conv.weight")):
             return [(self.map_tensor_name(name), data_torch + 1)]
 
         if name.endswith(".ple.conv1d.weight"):
