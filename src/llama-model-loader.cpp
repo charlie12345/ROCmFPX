@@ -407,10 +407,13 @@ static std::string llama_model_loader_compat_key(const std::string & key) {
             case GGUF_TYPE_UINT32:
             case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same<T,     int32_t>::value) ||
                                                 (std::is_same<T,    uint32_t>::value)); break;
+            case GGUF_TYPE_UINT64:
+            case GGUF_TYPE_INT64:   GGML_ASSERT((std::is_same<T,     int64_t>::value) ||
+                                                (std::is_same<T,    uint64_t>::value)); break;
             case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T,       float>::value)); break;
             case GGUF_TYPE_STRING:  GGML_ASSERT((std::is_same<T, std::string>::value)); break;
             default:
-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32 array", found_key.c_str()));
+                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64 array", found_key.c_str()));
         }
 
         if (arr_info.length > N_MAX) {
