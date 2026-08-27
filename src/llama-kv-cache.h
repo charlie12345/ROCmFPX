@@ -209,6 +209,8 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    const llama_kv_cells & get_cells(uint32_t stream) const { return v_cells.at(stream); }
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
