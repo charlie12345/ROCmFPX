@@ -36,6 +36,15 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+
+// Flags for the per-slot CONTEXT checkpoints (slot.prompt.checkpoints): the recurrent-layer
+// state snapshots used to roll a prompt back to an earlier position. Kept in HOST memory
+// on purpose: with LLAMA_STATE_SEQ_FLAGS_ON_DEVICE each one pins ~155-190 MiB of VRAM
+// (measured on Qwen3.8-27B / RX 7900 XT), so --ctx-checkpoints directly eats the headroom
+// that keeps the HIP pool from spilling. Host copies cost ~50 ms per create/restore over
+// PCIe (~2 creates + ~0.5 restores per turn), a negligible price for freeing that VRAM.
+// The short-lived per-step speculative checkpoint (slot.spec_ckpt) stays ON_DEVICE.
+static constexpr llama_state_seq_flags CTX_CHECKPOINT_FLAGS = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
 #endif
 
 using json = nlohmann::ordered_json;
@@ -983,10 +992,9 @@ private:
                 SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
             }
 
-            if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
-            }
+            // NOTE: deliberately NOT disabling n_cache_reuse here. Loading an mmproj does not
+            // mean every prompt carries media; the per-request guard in update_slots
+            // (can_cache_reuse) rejects reuse only for prompts that actually do.
         }
 
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
@@ -1123,11 +1131,30 @@ private:
                         params_base.cache_disk_path.c_str(), params_base.cache_disk_limit_mib);
             }
 
+            // Identity stamp for the disk cache: a later run adopts a previous run's
+            // entries only if all of this matches (the state files are only meaningful
+            // for the same model file, context size and KV cache types).
+            std::string cache_identity;
+            {
+                std::error_code iec;
+                const auto msz = std::filesystem::file_size(std::filesystem::u8path(params_base.model.path), iec);
+                cache_identity = params_base.model.path
+                    + "|size=" + std::to_string(iec ? 0 : (unsigned long long) msz)
+                    + "|n_ctx=" + std::to_string(n_ctx)
+                    + "|ctk=" + ggml_type_name(params_base.cache_type_k)
+                    + "|ctv=" + ggml_type_name(params_base.cache_type_v)
+                    + "|ctkd=" + ggml_type_name(params_base.speculative.draft.cache_type_k)
+                    + "|ctvd=" + ggml_type_name(params_base.speculative.draft.cache_type_v)
+                    + "|spec_n_max=" + std::to_string(params_base.speculative.draft.n_max)
+                    + "|mtp=" + ((std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end()) ? "1" : "0");
+            }
             prompt_cache = std::make_unique<server_prompt_cache>(
                 params_base.cache_ram_mib,
                 n_ctx,
                 params_base.cache_disk_path,
-                params_base.cache_disk_limit_mib);
+                params_base.cache_disk_limit_mib,
+                cache_identity);
         } else {
             SRV_INF("%s", "prompt cache is disabled - use `--cache-ram N` or `--cache-disk PATH` to enable it\n");
         }
@@ -1414,6 +1441,12 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // A prompt-cache restore move-assigns a whole server_prompt over the slot's,
+        // and cached entries are text-only, so their tokens carry has_mtmd = false.
+        // That clobbers the mmproj stamp set at init and a later media request then
+        // hits GGML_ASSERT(has_mtmd) in server_tokens::push_back. Re-stamp per launch.
+        slot.prompt.tokens.has_mtmd = mctx != nullptr;
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2035,8 +2068,8 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-        cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+        cur.update_tgt(ctx_tgt,       slot.id, CTX_CHECKPOINT_FLAGS);
+        cur.update_dft(ctx_dft.get(), slot.id, CTX_CHECKPOINT_FLAGS);
 
         // snapshot the speculative-impl state (MTP boundary rows) at the same
         // position, so a checkpoint restore can also rewind the draft bookkeeping
@@ -2424,7 +2457,7 @@ private:
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
                 {
-                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                    GGML_ASSERT(!slot.prompt.tokens.has_media());
 
                     llama_tokens new_tokens = slot.prompt.tokens.get_tokens(); // copy
                     for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
@@ -2743,7 +2776,7 @@ private:
 
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    !slot.prompt.tokens.has_media();
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -2751,7 +2784,7 @@ private:
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
                                 if (can_cache_reuse && n_cache_reuse > 0) {
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                                    GGML_ASSERT(!slot.prompt.tokens.has_media());
 
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt
@@ -2860,8 +2893,8 @@ private:
                                     bool salvaged = false;
 
                                     if (it != slot.prompt.checkpoints.rend()) {
-                                        const bool restored_tgt = it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-                                        const bool restored_dft = it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                        const bool restored_tgt = it->load_tgt(ctx_tgt,       slot.id, CTX_CHECKPOINT_FLAGS);
+                                        const bool restored_dft = it->load_dft(ctx_dft.get(), slot.id, CTX_CHECKPOINT_FLAGS);
 
                                         if (restored_tgt && restored_dft && !it->data_spec.empty()) {
                                             const llama_pos pos_c = std::max(it->pos_min + 1, it->pos_max);
@@ -2984,8 +3017,8 @@ private:
                                     if (!do_reset) {
                                         // restore the context checkpoint
 
-                                        const bool restored_tgt = it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-                                        const bool restored_dft = it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                        const bool restored_tgt = it->load_tgt(ctx_tgt,       slot.id, CTX_CHECKPOINT_FLAGS);
+                                        const bool restored_dft = it->load_dft(ctx_dft.get(), slot.id, CTX_CHECKPOINT_FLAGS);
 
                                         if (!restored_tgt || !restored_dft) {
                                             SLT_WRN(slot,
@@ -4088,6 +4121,30 @@ void server_context::on_sleeping_changed(std::function<void(bool)> callback) {
 // server_routes
 //
 
+// Admission control: cap how many requests may sit waiting for a slot.
+//
+// With a small --parallel count a burst of traffic otherwise queues up behind
+// the running request and every client waits. When a fallback server is
+// available it is better to refuse quickly so the caller can go elsewhere,
+// rather than accept work we cannot start for a long time.
+//
+// Counts tasks that are *deferred* (waiting for a free slot); the request(s)
+// currently occupying slots are not counted.
+//
+//   LLAMA_MAX_QUEUED=<n>   reject when n or more requests are already waiting
+//                          (0 or unset = unlimited, i.e. upstream behaviour)
+static int server_max_queued() {
+    static int v = []() {
+        const char * e = getenv("LLAMA_MAX_QUEUED");
+        const int n = e ? atoi(e) : 0;
+        if (n > 0) {
+            SRV_INF("admission control: rejecting requests when %d are already queued\n", n);
+        }
+        return n > 0 ? n : 0;
+    }();
+    return v;
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
@@ -4097,6 +4154,21 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
     auto res = create_response();
+
+    // refuse early, before tokenizing, when the queue is already too deep
+    {
+        const int n_max_queued = server_max_queued();
+        if (n_max_queued > 0) {
+            const size_t n_queued = queue_tasks.queue_tasks_deferred_size();
+            if ((int) n_queued >= n_max_queued) {
+                SRV_WRN("rejecting request: %zu already queued (limit %d)\n", n_queued, n_max_queued);
+                res->error(format_error_response(
+                    "server busy: too many queued requests, try another endpoint",
+                    ERROR_TYPE_UNAVAILABLE));
+                return res;
+            }
+        }
+    }
     auto completion_id = gen_chatcmplid();
     auto & rd = res->rd;
 

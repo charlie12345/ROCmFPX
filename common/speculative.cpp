@@ -165,7 +165,64 @@ struct common_speculative_impl {
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
 
-    common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {}
+    // Adaptive draft length (ported from LaurentZuijdwijk/llama.cpp).
+    //
+    // Drafting more tokens than the target will accept is pure waste: every drafted
+    // token costs a draft pass and a verify column, and everything after the first
+    // rejection is discarded. A fixed n_max overshoots on unpredictable content and
+    // undershoots on predictable content. Track a per-seq EMA of how many tokens the
+    // target actually accepted per draft and size the next draft from it. A full
+    // accept is a censored observation (the true acceptance was *at least* n_drafted),
+    // so instead of averaging it in - which would ratchet the length down and strand
+    // it - probe upward additively. Backing off is averaged (gentle), probing is
+    // additive (fast), so the controller recovers quickly when content turns predictable.
+    std::vector<float>   acc_ema;      // per-seq EMA of accepted tokens per draft
+    std::vector<int32_t> n_last_draft; // per-seq size of the draft just issued
+    bool adaptive_n = false;           // enabled by --spec-draft-adaptive
+
+    static constexpr float acc_ema_alpha = 0.25f; // ~4-step memory
+    static constexpr float acc_ema_probe = 1.0f;  // additive growth on a clean draft
+    static constexpr float acc_ema_init  = 2.0f;
+
+    void update_acc_ema(llama_seq_id seq_id, uint16_t n_accepted) {
+        if (seq_id < 0 || (size_t) seq_id >= acc_ema.size()) {
+            return;
+        }
+        const int32_t n_drafted = n_last_draft[seq_id];
+        if (n_drafted > 0 && (int32_t) n_accepted >= n_drafted) {
+            acc_ema[seq_id] += acc_ema_probe;   // censored: lower bound, probe up
+        } else {
+            acc_ema[seq_id] = (1.0f - acc_ema_alpha) * acc_ema[seq_id] + acc_ema_alpha * (float) n_accepted;
+        }
+        n_last_draft[seq_id] = 0;
+    }
+
+    // reset on a new prompt / reused slot; never mid-generation, since tracking
+    // content drift within a response is the point of the EMA
+    void reset_acc_ema(llama_seq_id seq_id) {
+        if (seq_id >= 0 && (size_t) seq_id < acc_ema.size()) {
+            acc_ema[seq_id]      = acc_ema_init;
+            n_last_draft[seq_id] = 0;
+        }
+    }
+
+    // effective draft length for this step, never above the configured ceiling
+    int32_t adaptive_n_draft(llama_seq_id seq_id, int32_t n_cfg, int32_t n_min) {
+        if (!adaptive_n || seq_id < 0 || (size_t) seq_id >= acc_ema.size()) {
+            return n_cfg;
+        }
+        const int32_t n_want = (int32_t) std::lround(acc_ema[seq_id]);
+        const int32_t n      = std::max(std::max(1, n_min), std::min(n_cfg, n_want));
+        acc_ema[seq_id]      = std::min(acc_ema[seq_id], (float) n_cfg); // do not let the probe run away
+        n_last_draft[seq_id] = n;
+        return n;
+    }
+
+    common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {
+        // start optimistic so a predictable prefix is not throttled from step one
+        acc_ema.assign(n_seq, acc_ema_init);
+        n_last_draft.assign(n_seq, 0);
+    }
 
     virtual ~common_speculative_impl() = default;
 
@@ -1397,6 +1454,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
         LOG_INF("%s: adding speculative implementation 'draft-mtp'\n", __func__);
+        adaptive_n = this->params.adaptive;
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
         LOG_INF("%s: - gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s\n", __func__,
                 this->params.n_gpu_layers,
@@ -1515,6 +1573,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        reset_acc_ema(seq_id);
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1841,7 +1900,10 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
                 auto & dp = dparams[seq_id];
                 auto & result = *dp.result;
-                const int32_t n_max = common_speculative_effective_n_max(params, dp);
+                // MTP drafts sequentially, so a shorter draft saves draft passes as well as
+                // target verification columns; n_max remains the hard ceiling
+                const int32_t n_cfg = common_speculative_effective_n_max(params, dp);
+                const int32_t n_max = adaptive_n_draft(seq_id, n_cfg, common_speculative_effective_n_min(params, dp, n_cfg));
                 if (n_max <= (int) result.size()) {
                     drafting[seq_id] = 0;
                     n_drafting--;
@@ -2974,6 +3036,115 @@ bool common_speculative_need_embd_pre_norm(common_speculative * spec) {
     return false;
 }
 
+
+// ---------------------------------------------------------------------------
+// Context-lookup draft extension
+//
+// A model drafter (MTP, DFlash2, EAGLE3) proposes k tokens. When the answer is
+// being copied or lightly edited from material already in the prompt - RAG
+// answers, "reproduce this file with one change", quoting a document - the
+// tokens that follow are often sitting verbatim in the context.
+//
+// Those positions are free to fill: we match the tail of (prompt + draft)
+// against the prompt and append whatever followed it there. The target then
+// verifies one wider block instead of stopping at k, so the extra tokens cost
+// no draft compute and only a slightly wider verify batch.
+//
+// This differs from the ngram-* speculative implementations, which *compete*
+// with the model drafter for the sequence (first non-empty draft wins). Here we
+// extend the model drafter's own proposal.
+//
+// Config via env (opt-in, off by default):
+//   LLAMA_SPEC_LOOKUP_EXTEND=1     enable
+//   LLAMA_SPEC_LOOKUP_MATCH=<n>    tail length that must match exactly (default 8)
+//   LLAMA_SPEC_LOOKUP_MAX=<n>      total draft length to extend up to (default 16)
+// ---------------------------------------------------------------------------
+
+struct common_spec_lookup_cfg {
+    bool    enabled = false;
+    int32_t n_match = 8;
+    int32_t n_max   = 16;
+};
+
+static const common_spec_lookup_cfg & common_spec_lookup_get_cfg() {
+    static common_spec_lookup_cfg cfg = []() {
+        common_spec_lookup_cfg c;
+        if (const char * e = getenv("LLAMA_SPEC_LOOKUP_EXTEND")) {
+            c.enabled = atoi(e) != 0;
+        }
+        if (const char * e = getenv("LLAMA_SPEC_LOOKUP_MATCH")) {
+            c.n_match = std::max(2, atoi(e));
+        }
+        if (const char * e = getenv("LLAMA_SPEC_LOOKUP_MAX")) {
+            c.n_max = std::max(1, atoi(e));
+        }
+        if (c.enabled) {
+            LOG_INF("%s: context-lookup draft extension enabled (match=%d, max=%d)\n",
+                    __func__, c.n_match, c.n_max);
+        }
+        return c;
+    }();
+    return cfg;
+}
+
+// Extend `draft` in place using verbatim continuations found in `prompt`.
+// Returns the number of tokens appended.
+static int common_spec_lookup_extend(
+        const llama_tokens & prompt,
+              llama_token    id_last,
+              llama_tokens & draft,
+              int32_t        n_match,
+              int32_t        n_target) {
+    const int32_t n_have = (int32_t) draft.size();
+    if (n_have >= n_target) {
+        return 0;
+    }
+
+    // needle = last n_match tokens of the sequence the target will have seen
+    //          after accepting the whole current draft: [prompt..., id_last, draft...]
+    llama_tokens needle;
+    needle.reserve(n_match);
+    for (int32_t i = n_have - 1; i >= 0 && (int32_t) needle.size() < n_match; --i) {
+        needle.push_back(draft[i]);
+    }
+    if ((int32_t) needle.size() < n_match) {
+        needle.push_back(id_last);
+    }
+    for (int32_t i = (int32_t) prompt.size() - 1; i >= 0 && (int32_t) needle.size() < n_match; --i) {
+        needle.push_back(prompt[i]);
+    }
+    if ((int32_t) needle.size() < n_match) {
+        return 0; // not enough history yet
+    }
+    std::reverse(needle.begin(), needle.end());
+
+    // search the prompt for the most recent occurrence of the needle, skipping
+    // the tail we just built it from
+    const int32_t n_prompt = (int32_t) prompt.size();
+    if (n_prompt <= n_match) {
+        return 0;
+    }
+
+    int32_t found = -1;
+    for (int32_t i = n_prompt - n_match - 1; i >= 0; --i) {
+        bool ok = true;
+        for (int32_t j = 0; j < n_match; ++j) {
+            if (prompt[i + j] != needle[j]) { ok = false; break; }
+        }
+        if (ok) { found = i; break; }
+    }
+    if (found < 0) {
+        return 0;
+    }
+
+    int32_t n_added = 0;
+    for (int32_t i = found + n_match; i < n_prompt && (int32_t) draft.size() < n_target; ++i) {
+        draft.push_back(prompt[i]);
+        ++n_added;
+    }
+    return n_added;
+}
+
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -3043,6 +3214,34 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    // extend model drafts with verbatim continuations found in the prompt
+    {
+        const auto & cfg = common_spec_lookup_get_cfg();
+        if (cfg.enabled) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+                auto & dp = dparams[seq_id];
+
+                if (dp.prompt == nullptr || dp.result == nullptr || dp.result->empty()) {
+                    continue;
+                }
+
+                // respect the caller's cap when it is tighter than ours
+                int32_t n_target = cfg.n_max;
+                if (dp.n_max >= 0) {
+                    n_target = std::min(n_target, dp.n_max);
+                }
+
+                const int n_added = common_spec_lookup_extend(
+                        *dp.prompt, dp.id_last, *dp.result, cfg.n_match, n_target);
+
+                if (n_added > 0) {
+                    LOG_DBG("%s: lookup-extended draft for seq %d by %d tokens (total %zu)\n",
+                            __func__, (int) seq_id, n_added, dp.result->size());
+                }
+            }
+        }
+    }
+
     // these sequences failed to generate a draft
     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
         auto & dp = dparams[seq_id];
@@ -3079,6 +3278,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl->n_acc_tokens += n_accepted;
         }
 
+        impl->update_acc_ema(seq_id, n_accepted);
         impl->accept(seq_id, n_accepted);
         impl->n_call_accept++;
     }

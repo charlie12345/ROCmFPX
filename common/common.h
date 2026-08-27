@@ -309,6 +309,10 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // size each draft from measured acceptance instead of always drafting n_max
+    // (n_max stays the ceiling, so bounded recurrent rollback is unaffected)
+    bool adaptive = false;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

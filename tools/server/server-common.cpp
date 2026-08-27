@@ -395,7 +395,11 @@ void server_tokens::insert(const llama_tokens & inp_tokens) {
 }
 
 const llama_tokens & server_tokens::get_tokens() const {
-    GGML_ASSERT(!has_mtmd);
+    // Only media chunks (LLAMA_TOKEN_NULL placeholders) make the flat array
+    // meaningless. has_mtmd is merely "an mmproj is loaded" - set on every slot
+    // regardless of content - and asserting on it aborted the prompt-cache save
+    // path for pure-text prompts.
+    GGML_ASSERT(!has_media());
     return tokens;
 }
 
@@ -411,7 +415,10 @@ llama_tokens server_tokens::get_text_tokens() const {
 }
 
 void server_tokens::set_token(llama_pos pos, llama_token id) {
-    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+    // Writing a raw token is only invalid where a media chunk occupies the slot. This is
+    // reached from the cache-reuse block, whose guard is has_media() - the assert must
+    // agree with it or a KV-shift-capable context would abort here on text prompts.
+    GGML_ASSERT(!has_media());
     tokens[pos] = id;
 }
 

@@ -132,6 +132,16 @@ using block_rocmfp6_device = block_rocmfp6;
 #    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 
+// On HIP the same CUB code paths (argsort / top-k over rows wider than 1024, i.e. a
+// whole vocabulary) are served by hipCUB, ROCm's CUB-compatible layer over rocPRIM.
+// Without it the backend reports GGML_OP_TOP_K unsupported for vocab-wide rows and every
+// backend sampler that uses top-k (the MTP drafter samples ~4 per step) falls back to the
+// CPU with a logits round-trip each time. GGML_HIP_USE_CUB is set by the HIP CMake when
+// hipcub/hipcub.hpp is found.
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_USE_CUB)
+#    define GGML_CUDA_USE_CUB
+#endif  // defined(GGML_USE_HIP) && defined(GGML_HIP_USE_CUB)
+
 // PDL host-side support requires CUDA 11.8+ and is disabled for HIP/MUSA.
 // The helper is intentionally a no-op on AMD so shared CUDA/HIP kernels compile cleanly.
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080

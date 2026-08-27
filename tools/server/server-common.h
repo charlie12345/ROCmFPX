@@ -201,6 +201,12 @@ public:
 
     size_t size() const { return tokens.size(); }
 
+    // Does this prompt ACTUALLY contain media chunks? Distinct from has_mtmd, which is
+    // merely "an mmproj is loaded" (set unconditionally on the slot in
+    // server_context_impl::init). Anything that must reject un-serializable media
+    // should test this, not has_mtmd, or it needlessly rejects every text prompt.
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     bool empty() const { return tokens.empty(); }
 
     void clear() {
