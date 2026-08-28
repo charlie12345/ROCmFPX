@@ -156,6 +156,8 @@ struct llama_hparams {
     uint32_t n_embd_head_kda = 0;
 
     float    kda_gate_lower_bound = 0.0f;   // bailingmoe3: safe-gate lower bound
+    // bailing-hybrid KDA safe gate lower bound (e.g. -5.0). 0.0 means unset.
+    float f_kda_lower_bound = 0.0f;
 
     // for hybrid state space models
     std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;

@@ -72,10 +72,12 @@ enum llm_arch {
     LLM_ARCH_XVERSE,
     LLM_ARCH_COMMAND_R,
     LLM_ARCH_COHERE2,
+    LLM_ARCH_COHERE2MOE,
     LLM_ARCH_DBRX,
     LLM_ARCH_OLMO,
     LLM_ARCH_OLMO2,
     LLM_ARCH_OLMOE,
+    LLM_ARCH_MUSE_GLIMMER,
     LLM_ARCH_OPENELM,
     LLM_ARCH_ARCTIC,
     LLM_ARCH_DEEPSEEK,
@@ -144,6 +146,7 @@ enum llm_arch {
     LLM_ARCH_LLAMA_EMBED,
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
+    LLM_ARCH_BAILING_HYBRID,
     LLM_ARCH_TALKIE,
     LLM_ARCH_MELLUM,
     LLM_ARCH_EAGLE3,
@@ -299,6 +302,7 @@ enum llm_kv {
 
     LLM_KV_KDA_HEAD_DIM,
     LLM_KV_KDA_GATE_LOWER_BOUND,
+    LLM_KV_KDA_LOWER_BOUND,
 
     LLM_KV_WKV_HEAD_SIZE,
 
@@ -482,6 +486,8 @@ enum llm_tensor {
     LLM_TENSOR_SSM_BETA,            // kimi: beta mixing coefficient and qwen3.5
     LLM_TENSOR_SSM_G_A,             // kimi: output gate projection A
     LLM_TENSOR_SSM_G_B,             // kimi: output gate projection B
+    LLM_TENSOR_SSM_F,               // bailing-hybrid: full-rank forget gate
+    LLM_TENSOR_SSM_G,               // bailing-hybrid: full-rank output gate
     LLM_TENSOR_TIME_MIX_W0,
     LLM_TENSOR_TIME_MIX_W1,
     LLM_TENSOR_TIME_MIX_W2,
