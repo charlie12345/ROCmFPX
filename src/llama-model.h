@@ -121,6 +121,7 @@ enum llm_type {
     LLM_TYPE_24B_A2B, // lfm2moe
     LLM_TYPE_26B_A4B, // Gemma4
     LLM_TYPE_30B_A3B,
+    LLM_TYPE_12B_A2_5B, // mellum
     LLM_TYPE_31B_A3_5B,
     LLM_TYPE_35B_A3B, // Qwen3.5
     LLM_TYPE_48B_A3B, // Kimi Linear
@@ -532,6 +533,27 @@ struct llama_layer {
     struct llama_layer_shortconv shortconv;
 
     struct llama_layer_nextn nextn;
+
+    // ZAYA CCA (Compressed Convolutional Attention)
+    struct ggml_tensor * cca_conv_grp   = nullptr;  // grouped conv   (conv_qk.1)
+    struct ggml_tensor * cca_conv_grp_b = nullptr;  // grouped conv bias
+
+    struct ggml_tensor * cca_k_scale    = nullptr;  // learned K temperature
+    struct ggml_tensor * cca_val_proj1  = nullptr;  // V projection stream 1
+    struct ggml_tensor * cca_val_proj2  = nullptr;  // V projection stream 2
+
+    // Zaya router
+    struct ggml_tensor * zaya_router_mlp2     = nullptr;  // router MLP 2
+    struct ggml_tensor * zaya_router_mlp2_b   = nullptr;  // router MLP 2 bias
+    struct ggml_tensor * zaya_router_mlp4     = nullptr;  // router MLP 4
+    struct ggml_tensor * zaya_router_biases   = nullptr;  // balancing_biases
+    struct ggml_tensor * zaya_router_eda_scale = nullptr; // router_states_scale
+
+    // Zaya per-layer residual scaling: hidden_states = (hs + bias) * scale
+    struct ggml_tensor * res_scale_hs   = nullptr;
+    struct ggml_tensor * res_scale_hs_b = nullptr;
+    struct ggml_tensor * res_scale_res   = nullptr;
+    struct ggml_tensor * res_scale_res_b = nullptr;
 };
 
 struct llama_device {
@@ -585,6 +607,12 @@ struct llama_model {
     struct ggml_tensor * sc_gate     = nullptr;
     struct ggml_tensor * sc_up       = nullptr;
     struct ggml_tensor * sc_down     = nullptr;
+
+    // Zaya final residual scaling (model-level)
+    struct ggml_tensor * zaya_res_scale_hs    = nullptr;
+    struct ggml_tensor * zaya_res_scale_hs_b  = nullptr;
+    struct ggml_tensor * zaya_res_scale_res   = nullptr;
+    struct ggml_tensor * zaya_res_scale_res_b = nullptr;
 
     // classifier
     struct ggml_tensor * cls       = nullptr;

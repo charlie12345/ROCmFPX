@@ -2079,6 +2079,10 @@ int llama_context::decode(const llama_batch & batch_inp, uint32_t n_ubatch_overr
                 float * embd_pre_norm_out = embd_pre_norm.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_pre_norm.size);
+                LLAMA_LOG_DEBUG("JAYDBG decode-path prenorm: arch=%d masked=%d n_rows=%lld offset=%lld n_embd=%u tensor_name=%s tensor_ne0=%lld tensor_ne1=%lld nbytes=%llu read_bytes=%llu\n",
+                    (int) model.arch, (int) masked, (long long) n_rows, (long long) offset, n_embd,
+                    t_h_pre_norm->name, (long long) t_h_pre_norm->ne[0], (long long) t_h_pre_norm->ne[1],
+                    (unsigned long long) ggml_nbytes(t_h_pre_norm), (unsigned long long) n_rows*n_embd*sizeof(float));
                 ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_rows*n_embd*sizeof(float));
             }
         }

@@ -913,9 +913,19 @@ private:
             if (spec_mtp) {
                 // NOTE: do NOT set ctx_other = ctx_tgt for a separate-model MTP draft.
                 // MTP reads the target's pre-norm hidden states via ctx_tgt directly
-                // (see speculative.cpp). Setting ctx_other here would make the draft
-                // ctor mis-detect is_mem_shared (gemma4-style shared KV) and disable
-                // chain_heads for multi-head Step MTP3 drafts, breaking draft KV resets.
+                // (see speculative.cpp). Setting it unconditionally made the draft ctor
+                // mis-detect is_mem_shared and disable chain_heads for multi-head Step
+                // MTP3 drafts, breaking draft KV resets (066f40e).
+                // EXCEPTION: a gemma4_assistant draft hard-requires ctx_other (it shares
+                // the target KV cache), and speculative.cpp now gates is_mem_shared on
+                // the draft arch string, so setting it here is safe for gemma4 and a
+                // no-op for Step/Qwen drafts.
+                char arch_dft_mtp[64] = {};
+                llama_model_meta_val_str(model_dft.get(), "general.architecture", arch_dft_mtp, sizeof(arch_dft_mtp));
+                if (std::strcmp(arch_dft_mtp, "gemma4_assistant") == 0 ||
+                    std::strcmp(arch_dft_mtp, "gemma4-assistant") == 0) {
+                    cparams.ctx_other = ctx_tgt;
+                }
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             } else if (spec_eagle3 || spec_dflash || spec_dspark) {
                 cparams.ctx_other = ctx_tgt;
