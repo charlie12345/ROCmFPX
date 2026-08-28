@@ -40,6 +40,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_QWEN3VLMOE,       "qwen3vlmoe"       },
     { LLM_ARCH_QWEN35,           "qwen35"           },
     { LLM_ARCH_QWEN35MOE,        "qwen35moe"        },
+    { LLM_ARCH_QWEN4EXP,         "qwen4exp"         },
     { LLM_ARCH_PHI2,             "phi2"             },
     { LLM_ARCH_PHI3,             "phi3"             },
     { LLM_ARCH_PHIMOE,           "phimoe"           },
@@ -263,6 +264,18 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,      "%s.attention.compress_rope_freq_base"      },
     { LLM_KV_ATTENTION_OUTPUT_LORA_RANK,             "%s.attention.output_lora_rank"             },
     { LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,           "%s.attention.output_group_count"           },
+    { LLM_KV_ATTENTION_RECURRENT_LAYERS,             "%s.attention.recurrent_layers"             }, // qwen4exp
+    { LLM_KV_HYPER_CONNECTION_LOW_RANK,              "%s.hyper_connection.low_rank"              }, // qwen4exp
+
+    { LLM_KV_PLE_LAYERS,                             "%s.ple.layers"                             }, // qwen4exp
+    { LLM_KV_PLE_NGRAM_SIZE,                         "%s.ple.ngram_size"                         }, // qwen4exp
+    { LLM_KV_PLE_HEADS_PER_NGRAM,                    "%s.ple.heads_per_ngram"                    }, // qwen4exp
+    { LLM_KV_PLE_CONV_KERNEL,                        "%s.ple.conv_kernel"                        }, // qwen4exp
+    { LLM_KV_PLE_LAYER_MULTIPLIERS,                  "%s.ple.layer_multipliers"                  }, // qwen4exp
+    { LLM_KV_PLE_HEAD_OFFSETS,                       "%s.ple.head_offsets"                       }, // qwen4exp
+    { LLM_KV_PLE_HEAD_VOCAB_SIZES,                   "%s.ple.head_vocab_sizes"                   }, // qwen4exp
+    { LLM_KV_PLE_EOS_TOKEN_ID,                       "%s.ple.eos_token_id"                       }, // qwen4exp
+    { LLM_KV_PLE_IMAGE_TOKEN_ID,                     "%s.ple.image_token_id"                     }, // qwen4exp
 
     { LLM_KV_ROPE_DIMENSION_COUNT,           "%s.rope.dimension_count"                 },
     { LLM_KV_ROPE_DIMENSION_COUNT_SWA,       "%s.rope.dimension_count_swa"             },
@@ -463,6 +476,23 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_ATTN_Q_B,                               "blk.%d.attn_q_b" },
     { LLM_TENSOR_ATTN_KV_A_MQA,                          "blk.%d.attn_kv_a_mqa" },
     { LLM_TENSOR_ATTN_KV_B,                              "blk.%d.attn_kv_b" },
+    { LLM_TENSOR_HC_HEAD_NORM,                           "output_hc_norm" },              // qwen4exp
+    { LLM_TENSOR_HC_HEAD_DOWN,                           "output_hc_down" },              // qwen4exp
+    { LLM_TENSOR_HC_HEAD_UP,                             "output_hc_up" },                // qwen4exp
+    { LLM_TENSOR_HC_ATTN_NORM,                           "blk.%d.hc_attn_norm" },         // qwen4exp
+    { LLM_TENSOR_HC_ATTN_DOWN,                           "blk.%d.hc_attn_down" },         // qwen4exp
+    { LLM_TENSOR_HC_ATTN_UP,                             "blk.%d.hc_attn_up" },           // qwen4exp
+    { LLM_TENSOR_HC_ATTN_INJECT,                         "blk.%d.hc_attn_inject" },       // qwen4exp
+    { LLM_TENSOR_HC_FFN_NORM,                            "blk.%d.hc_ffn_norm" },          // qwen4exp
+    { LLM_TENSOR_HC_FFN_DOWN,                            "blk.%d.hc_ffn_down" },          // qwen4exp
+    { LLM_TENSOR_HC_FFN_UP,                              "blk.%d.hc_ffn_up" },            // qwen4exp
+    { LLM_TENSOR_HC_FFN_INJECT,                          "blk.%d.hc_ffn_inject" },        // qwen4exp
+    { LLM_TENSOR_PLE_KEY,                                "blk.%d.ple_key" },              // qwen4exp
+    { LLM_TENSOR_PLE_VALUE,                              "blk.%d.ple_value" },            // qwen4exp
+    { LLM_TENSOR_PLE_NORM_KEY,                           "blk.%d.ple_norm_key" },         // qwen4exp
+    { LLM_TENSOR_PLE_NORM_QUERY,                         "blk.%d.ple_norm_query" },       // qwen4exp
+    { LLM_TENSOR_PLE_NORM_CONV,                          "blk.%d.ple_norm_conv" },        // qwen4exp
+    { LLM_TENSOR_PLE_CONV1D,                             "blk.%d.ple_conv1d" },           // qwen4exp
     { LLM_TENSOR_PER_LAYER_TOKEN_EMBD,                   "per_layer_token_embd" },
     { LLM_TENSOR_PER_LAYER_MODEL_PROJ,                   "per_layer_model_proj" },
     { LLM_TENSOR_PER_LAYER_PROJ_NORM,                    "per_layer_proj_norm" },
@@ -594,6 +624,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_INDEXER_PROJ,                           "blk.%d.indexer.proj" },
     { LLM_TENSOR_INDEXER_ATTN_K,                         "blk.%d.indexer.attn_k" },
     { LLM_TENSOR_INDEXER_ATTN_Q_B,                       "blk.%d.indexer.attn_q_b" },
+    { LLM_TENSOR_INDEXER_Q_PROJ,                         "blk.%d.indexer.q_proj" },              // qwen4exp
+    { LLM_TENSOR_INDEXER_K_PROJ,                         "blk.%d.indexer.k_proj" },              // qwen4exp
+    { LLM_TENSOR_INDEXER_Q_NORM,                         "blk.%d.indexer.q_norm" },              // qwen4exp
     { LLM_TENSOR_OUTPUT_HC_BASE,                         "output_hc_base" },
     { LLM_TENSOR_OUTPUT_HC_FN,                           "output_hc_fn" },
     { LLM_TENSOR_OUTPUT_HC_SCALE,                        "output_hc_scale" },
@@ -669,6 +702,23 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_ATTN_Q_B,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_KV_A_MQA,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_KV_B,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_HC_HEAD_NORM,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},       // qwen4exp
+    {LLM_TENSOR_HC_HEAD_DOWN,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},    // qwen4exp
+    {LLM_TENSOR_HC_HEAD_UP,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},    // qwen4exp
+    {LLM_TENSOR_HC_ATTN_NORM,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},       // qwen4exp
+    {LLM_TENSOR_HC_ATTN_DOWN,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},    // qwen4exp
+    {LLM_TENSOR_HC_ATTN_UP,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},    // qwen4exp
+    {LLM_TENSOR_HC_ATTN_INJECT,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},    // qwen4exp
+    {LLM_TENSOR_HC_FFN_NORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},       // qwen4exp
+    {LLM_TENSOR_HC_FFN_DOWN,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},    // qwen4exp
+    {LLM_TENSOR_HC_FFN_UP,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},    // qwen4exp
+    {LLM_TENSOR_HC_FFN_INJECT,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},    // qwen4exp
+    {LLM_TENSOR_PLE_KEY,                    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},    // qwen4exp
+    {LLM_TENSOR_PLE_VALUE,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},    // qwen4exp
+    {LLM_TENSOR_PLE_NORM_KEY,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},       // qwen4exp
+    {LLM_TENSOR_PLE_NORM_QUERY,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},       // qwen4exp
+    {LLM_TENSOR_PLE_NORM_CONV,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},       // qwen4exp
+    {LLM_TENSOR_PLE_CONV1D,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SSM_CONV}},   // qwen4exp
     {LLM_TENSOR_ATTN_K_B,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_V_B,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_SINKS,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SCALE}},
@@ -841,6 +891,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_INDEXER_PROJ,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_INDEXER_ATTN_K,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_INDEXER_ATTN_Q_B,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INDEXER_Q_PROJ,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},  // qwen4exp
+    {LLM_TENSOR_INDEXER_K_PROJ,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},  // qwen4exp
+    {LLM_TENSOR_INDEXER_Q_NORM,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},     // qwen4exp
     {LLM_TENSOR_OUTPUT_HC_BASE,             {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_ADD}},
     {LLM_TENSOR_OUTPUT_HC_FN,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_OUTPUT_HC_SCALE,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_SCALE}},
@@ -992,6 +1045,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_BAILINGMOE3:
+        case LLM_ARCH_QWEN4EXP:
             return true;
         default:
             return false;

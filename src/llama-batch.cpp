@@ -507,7 +507,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential) {
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -550,7 +550,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential)
         }
     }
 
-    const uint32_t n_seqs = cur_seq_set.size();
+    uint32_t n_seqs = cur_seq_set.size();
 
     // we are done
     if (n_seqs == 0) {
@@ -600,6 +600,72 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential)
         if  ((idxs_per_seq[0].size() + 1)*n_seqs > n_ubatch) {
             break;
         }
+    }
+
+    // if n_keep_tail > 0, keep only the seqs that either finish in this ubatch or have at least
+    //   n_keep_tail tokens remaining for a future ubatch, so that the trailing n_keep_tail tokens
+    //   of each seq are never split across ubatches
+    if (n_keep_tail > 0) {
+        GGML_ASSERT(n_ubatch > n_keep_tail);
+
+        auto n_remaining = [&](uint32_t s) {
+            return (uint32_t) (seq_set_map[cur_seq_set[s]].size() - cur_idx[s]);
+        };
+
+        // keep the longest prefix of seqs that satisfy the constraint, to preserve sequential seq ids
+        uint32_t n_keep = 0;
+        while (n_keep < n_seqs) {
+            const uint32_t remaining = n_remaining(n_keep);
+
+            if (remaining != 0 && remaining < n_keep_tail) {
+                break;
+            }
+
+            n_keep++;
+        }
+
+        // all seqs violate the constraint - resolve the first one directly and emit it alone
+        if (n_keep == 0) {
+            auto & idxs = idxs_per_seq[0];
+
+            const auto & seq_idxs = seq_set_map[cur_seq_set[0]];
+
+            if (idxs.size() + n_remaining(0) <= n_ubatch) {
+                // extend the seq to completion
+                while (n_remaining(0) > 0) {
+                    const int32_t idx = seq_idxs[cur_idx[0]];
+
+                    idxs.push_back(idx);
+
+                    used[idx] = true;
+                    ++n_used;
+
+                    ++cur_idx[0];
+                }
+            } else {
+                // truncate the seq so that at least n_keep_tail tokens remain
+                while (n_remaining(0) < n_keep_tail) {
+                    used[idxs.back()] = false;
+                    --n_used;
+
+                    idxs.pop_back();
+
+                    --cur_idx[0];
+                }
+            }
+
+            n_keep = 1;
+        }
+
+        // return the tokens of the deferred seqs back to the pool
+        for (uint32_t s = n_keep; s < n_seqs; ++s) {
+            for (const int32_t idx : idxs_per_seq[s]) {
+                used[idx] = false;
+                --n_used;
+            }
+        }
+
+        n_seqs = n_keep;
     }
 
     // concat the per-sequence-set lists
