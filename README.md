@@ -1,3 +1,46 @@
+> ## 🍴 This is a fork — it adds 7 model architectures on top of ROCmFPX
+>
+> Upstream [`charlie12345/ROCmFPX`](https://github.com/charlie12345/ROCmFPX) provides the
+> ROCmFP4 / ROCmFPX tensor types. Several GGUFs published at
+> [`huggingface.co/kingjones777`](https://huggingface.co/kingjones777) need **both** those
+> types **and** an architecture that upstream does not carry yet. This fork has both, so a
+> plain clone builds a runtime that loads them.
+>
+> | architecture | models | verified |
+> |---|---|---|
+> | `qwen4exp` | Qwen3.8-Flash-Next | ✅ loads + generates |
+> | `mellum` | Mellum2-12B-A2.5B | ✅ 111 tok/s |
+> | `zaya` | ZAYA1-8B | ✅ 23 tok/s |
+> | `bailing-hybrid` | Ling-3.0 `*-base-*` (KDA + MLA hybrid) | ✅ 108 tok/s |
+> | `muse-glimmer` | Muse-Glimmer-30B | ✅ 12 tok/s |
+> | `cohere2moe` | North-Mini-Code-1.0 | ✅ 61 tok/s |
+> | `instella` | AMD Instella-MoE-16B-A3B | ✅ 88 tok/s |
+>
+> ```bash
+> git clone https://github.com/kingjones30/ROCmFPX.git
+> cd ROCmFPX
+> cmake -B build -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DGGML_NATIVE=ON -DCMAKE_BUILD_TYPE=Release
+> cmake --build build --target llama-server llama-quantize -j$(nproc)
+> ```
+>
+> Verified 2026-08-27 on a Ryzen AI MAX+ 395 (gfx1151, 128 GB): clean clone → **0 build
+> errors** → all seven architectures load a real published ROCmFP4 GGUF and generate coherent
+> text. Speeds above are `-ngl 999 -fa on -c 1024`, greedy, 16 tokens — a smoke test, not a
+> benchmark. Qwen3.8-Flash-Next was verified with partial offload (`-ngl 24`) because the
+> 98 GiB file does not fit this box alongside its KV cache, so no speed is quoted for it.
+>
+> Two fixes here are worth calling out because the affected files were previously unloadable
+> by **any** build:
+> * **`bailing-hybrid`** — Ling-3.0-tiny sets `attention.q_lora_rank=256` (compressed
+>   queries) while Ling-3.0-flash does not. The loader never read that key and always created
+>   a wide `attn_q`, so every `*-base-*` GGUF failed with `missing tensor blk.3.attn_q.weight`.
+> * **`instella`** — the architecture previously existed only in a stock `llama.cpp` clone
+>   with no ROCmFP4 types, which therefore could not load its own published GGUFs
+>   (`file_type=105`, 322 tensors of ggml type 101).
+>
+> Everything below this box is upstream ROCmFPX's own README, unchanged.
+
+
 # ROCmFPX for llama.cpp
 
 ROCmFPX adds experimental AMD-focused 2-, 3-, 4-, 6-, and 8-bit GGUF model-weight
