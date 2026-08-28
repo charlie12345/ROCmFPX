@@ -1728,7 +1728,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                             f32_band = (const float *) tensor->data + first_elem;
                         } else {
                             ggml_tensor band_tensor = *tensor;
-                            band_tensor.data = (char *) tensor->data + first_elem * ggml_type_size(tensor->type);
+                            // block-aligned byte offset: for quantized sources the
+                            // type size is per block, not per element
+                            band_tensor.data = (char *) tensor->data + (first_elem / ggml_blck_size(tensor->type)) * ggml_type_size(tensor->type);
                             llama_tensor_dequantize_impl(&band_tensor, f32_conv_buf, workers, (size_t) band_rows * n_per_row, nthread);
                             f32_band = (const float *) f32_conv_buf.data();
                         }
