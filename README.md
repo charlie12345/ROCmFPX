@@ -6,15 +6,15 @@
 > types **and** an architecture that upstream does not carry yet. This fork has both, so a
 > plain clone builds a runtime that loads them.
 >
-> | architecture | models | status |
-> |---|---|---|
-> | `qwen4exp` | Qwen3.8-Flash-Next | ✅ loads + generates |
-> | `mellum` | Mellum2-12B-A2.5B | ✅ loads + generates |
-> | `zaya` | ZAYA1-8B | ✅ loads + generates |
-> | `bailing-hybrid` | Ling-3.0 `*-base-*` (KDA + MLA hybrid) | ✅ loads + generates |
-> | `muse-glimmer` | Muse-Glimmer-30B | ✅ loads + generates |
-> | `cohere2moe` | North-Mini-Code-1.0 | ✅ loads + generates |
-> | `instella` | AMD Instella-MoE-16B-A3B | ✅ loads + generates |
+> | architecture | models | loads + generates | throughput published on the model card |
+> |---|---|:--:|---|
+> | `mellum` | [Mellum2-12B-A2.5B](https://huggingface.co/kingjones777/Mellum2-12B-A2.5B-Instruct-ROCmFP4-GGUF) | ✅ | **96.92 tok/s** |
+> | `instella` | [Instella-MoE-16B-A3B](https://huggingface.co/kingjones777/Instella-ToolCall-16B-A3B-ROCmFP4-STRIX-GGUF) | ✅ | **~90 tok/s** (3-run median) |
+> | `bailing-hybrid` | [Ling-3.0 `*-base-*`](https://huggingface.co/kingjones777/Ling-3.0-flash-base-ROCmFP4-COHERENT-GGUF) (KDA + MLA hybrid) | ✅ | **36.6 t/s**, **42.3 t/s** with MTP `n-max 3` |
+> | `muse-glimmer` | [Muse-Glimmer-30B](https://huggingface.co/kingjones777/Muse-Glimmer-30B-ROCmFP4-Strix-Halo-DFlash-GGUF) | ✅ | **~17–45 tok/s** by workload, **~30 typical** |
+> | `qwen4exp` | [Qwen3.8-Flash-Next](https://huggingface.co/kingjones777/Qwen3.8-Flash-Next-ROCmFP4-STRIX_LEAN-GGUF) | ✅ | **345 tok/s** prefill, **22.6 tok/s** generation |
+> | `zaya` | [ZAYA1-8B](https://huggingface.co/kingjones777/ZAYA1-8B-ROCmFP4-GGUF) | ✅ | **15.8 tok/s** median, range 14.1–20.49 |
+> | `cohere2moe` | [North-Mini-Code-1.0](https://huggingface.co/kingjones777/North-Mini-Code-1.0-ROCmFP4-STRIX-GGUF) | ✅ | — |
 >
 > ```bash
 > git clone https://github.com/kingjones30/ROCmFPX.git
@@ -25,9 +25,9 @@
 >
 > Verified 2026-08-27 on a Ryzen AI MAX+ 395 (gfx1151, 128 GB): clean clone → **0 build
 > errors** → all seven architectures load a real published ROCmFP4 GGUF and generate coherent
-> text. This table is a build/load gate only — **for throughput see each model's own card**,
-> which carries properly measured numbers (warmed, fixed prompt, full offload, and with the
-> speculative drafter where the model ships with one).
+> text. The ✅ column is this build/load gate. The throughput column is **each model card's own
+> published measurement** — click through for the full method, hardware and ranges behind each
+> number; they were not re-measured here.
 >
 > Two fixes here are worth calling out because the affected files were previously unloadable
 > by **any** build:
