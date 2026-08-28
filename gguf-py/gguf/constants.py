@@ -491,6 +491,7 @@ class MODEL_ARCH(IntEnum):
     DEEPSEEK2OCR     = auto()
     DEEPSEEK32       = auto()
     DEEPSEEK4        = auto()
+    INSTELLA         = auto()
     CHATGLM          = auto()
     GLM4             = auto()
     GLM4_MOE         = auto()
@@ -1095,6 +1096,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.DEEPSEEK2OCR:     "deepseek2-ocr",
     MODEL_ARCH.DEEPSEEK32:       "deepseek32",
     MODEL_ARCH.DEEPSEEK4:        "deepseek4",
+    MODEL_ARCH.INSTELLA:         "instella",
     MODEL_ARCH.CHATGLM:          "chatglm",
     MODEL_ARCH.GLM4:             "glm4",
     MODEL_ARCH.GLM4_MOE:         "glm4moe",
@@ -1621,6 +1623,31 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+    MODEL_ARCH.INSTELLA: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_KV_A_MQA,
+        MODEL_TENSOR.ATTN_KV_A_NORM,
+        MODEL_TENSOR.ATTN_K_B,
+        MODEL_TENSOR.ATTN_V_B,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+    ],
     MODEL_ARCH.MMPROJ: [
         MODEL_TENSOR.V_MMPROJ,
         MODEL_TENSOR.V_MMPROJ_FC,

@@ -176,6 +176,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_arctic(params);
         case LLM_ARCH_DEEPSEEK:
             return new llama_model_deepseek(params);
+        case LLM_ARCH_INSTELLA:
+            return new llama_model_instella(params);
         case LLM_ARCH_DEEPSEEK2:
             return new llama_model_deepseek2(params);
         case LLM_ARCH_DEEPSEEK2OCR:
@@ -1841,7 +1843,7 @@ void llama_model::print_info() const {
             LLAMA_LOG_INFO("%s: expert_weights_scale  = %.1f\n",   __func__, hparams.expert_weights_scale);
         }
 
-        if (arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_DEEPSEEK2OCR || arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4) {
+        if (arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_DEEPSEEK2OCR || arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_INSTELLA) {
             LLAMA_LOG_INFO("%s: n_layer_dense_lead    = %d\n",     __func__, hparams.n_layer_dense_lead);
             LLAMA_LOG_INFO("%s: n_lora_q              = %d\n",     __func__, hparams.n_lora_q);
             LLAMA_LOG_INFO("%s: n_lora_kv             = %d\n",     __func__, hparams.n_lora_kv);
@@ -2488,6 +2490,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_INSTELLA:
         case LLM_ARCH_MUSE_GLIMMER:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:

@@ -86,6 +86,7 @@ enum llm_arch {
     LLM_ARCH_DEEPSEEK2OCR,
     LLM_ARCH_DEEPSEEK32,
     LLM_ARCH_DEEPSEEK4,
+    LLM_ARCH_INSTELLA,
     LLM_ARCH_CHATGLM,
     LLM_ARCH_GLM4,
     LLM_ARCH_GLM4_MOE,
@@ -500,8 +501,6 @@ enum llm_tensor {
     LLM_TENSOR_SSM_BETA,            // kimi: beta mixing coefficient and qwen3.5
     LLM_TENSOR_SSM_G_A,             // kimi: output gate projection A
     LLM_TENSOR_SSM_G_B,             // kimi: output gate projection B
-    LLM_TENSOR_SSM_F,               // bailing-hybrid: full-rank forget gate
-    LLM_TENSOR_SSM_G,               // bailing-hybrid: full-rank output gate
     // ZAYA CCA (Compressed Convolutional Attention)
     LLM_TENSOR_CCA_CONV_GRP,        // zaya: grouped conv1d  (conv_qk.1)
     LLM_TENSOR_CCA_K_SCALE,         // zaya: learned K temperature

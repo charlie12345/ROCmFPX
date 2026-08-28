@@ -242,6 +242,7 @@ void llama_model_bailing_hybrid::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla_impl);
     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA,  hparams.n_embd_head_v_mla_impl);
+    ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q, false);
     ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,      hparams.n_lora_kv);
     ml.get_key(LLM_KV_SSM_CONV_KERNEL,             hparams.ssm_d_conv);
     ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.n_embd_head_kda);
@@ -354,8 +355,15 @@ void llama_model_bailing_hybrid::load_arch_tensors(llama_model_loader &) {
             const int64_t n_embd_head_v_mla = hparams.n_embd_head_v_mla();   // 128
             const int64_t qk_rope_head_dim  = hparams.n_rot();               // 64
 
-            // q_lora_rank is null in config => no Q compression, one wide q_proj
-            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_head * n_embd_head_k_mla}, flags);
+            // Ling-3.0-tiny compresses queries (q_lora_rank > 0); Ling-3.0-flash does not.
+            const int64_t q_lora_rank = hparams.n_lora_q;
+            if (q_lora_rank > 0) { // Ling-3.0-tiny: q_a_proj -> q_a_layernorm -> q_b_proj
+                layer.wq_a          = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,      "weight", i), {n_embd, q_lora_rank}, flags);
+                layer.attn_q_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i), {q_lora_rank}, flags);
+                layer.wq_b          = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,      "weight", i), {q_lora_rank, n_head * n_embd_head_k_mla}, flags);
+            } else { // Ling-3.0-flash: no query compression, one wide q_proj
+                layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_head * n_embd_head_k_mla}, flags);
+            }
 
             layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora_rank}, flags);
             layer.wkv_a_mqa      = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA,  "weight", i), {n_embd, kv_lora_rank + qk_rope_head_dim}, flags);
@@ -601,7 +609,14 @@ llama_model_bailing_hybrid::graph::graph(const llama_model & model, const llm_gr
             // q_proj is one wide matmul (q_lora_rank is null). Per head the
             // layout is [nope(128) | rope(64)], matching the reference's
             // split(q, [qk_nope_head_dim, qk_rope_head_dim], dim=-1).
-            ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.wq, cur);
+            ggml_tensor * Qcur;
+            if (layer.wq_a) { // Ling-3.0-tiny: q_a_proj -> q_a_layernorm -> q_b_proj
+                Qcur = ggml_mul_mat(ctx0, layer.wq_a, cur);
+                Qcur = build_norm(Qcur, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+                Qcur = ggml_mul_mat(ctx0, layer.wq_b, Qcur);
+            } else {
+                Qcur = ggml_mul_mat(ctx0, layer.wq, cur);
+            }
 
             ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
 
@@ -880,7 +895,14 @@ llama_model_bailing_hybrid::graph_mtp::graph_mtp(const llama_model & model, cons
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
 
-    ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.wq, cur);
+    ggml_tensor * Qcur;
+    if (layer.wq_a) { // Ling-3.0-tiny: q_a_proj -> q_a_layernorm -> q_b_proj
+        Qcur = ggml_mul_mat(ctx0, layer.wq_a, cur);
+        Qcur = build_norm(Qcur, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+        Qcur = ggml_mul_mat(ctx0, layer.wq_b, Qcur);
+    } else {
+        Qcur = ggml_mul_mat(ctx0, layer.wq, cur);
+    }
 
     ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
 
