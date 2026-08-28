@@ -754,3 +754,131 @@ def test_qwen4exp_rocmfp4_tensor_type_override_pins_ple_table(tmp_path: Path):
         f"(tensor_type={ple_tensor.tensor_type!r}); expected F16 ({expected_type})"
     )
 
+
+def test_qwen4exp_hc_norm_plus_one_and_shared_gate_squeeze(tmp_path: Path):
+    # Given: a checkpoint using the real hyper-connection module naming
+    # (attn_hyper_connection / mlp_hyper_connection / hyper_connection_mixer).
+    # These names hit the early-return branches in Qwen4ExpTextModel.modify_tensors,
+    # which historically skipped the +1 that RMS-norm weights need, and stored
+    # shared_expert_gate as 2D [1, hidden] instead of 1D.
+    model_dir = tmp_path / "model_real_hc_names"
+    model_dir.mkdir()
+    out_gguf = tmp_path / "out_real_hc_names.gguf"
+
+    _build_synthetic_qwen4exp_hf_model(model_dir, ple_enabled=False)
+
+    raw_tensors = {}
+    st_path = model_dir / "model.safetensors"
+    from safetensors.torch import load_file
+
+    base = load_file(str(st_path))
+    hidden = base["model.embed_tokens.weight"].shape[1]
+    lowrank = base["model.layers.0.hc_attn_down.weight"].shape[0]
+
+    renamed: dict[str, torch.Tensor] = {}
+    for name, tensor in base.items():
+        if name.endswith(".hc_attn_norm.weight"):
+            renamed["model.language_model.layers.0.attn_hyper_connection.hc_norm.weight"] = tensor
+        elif name.endswith(".hc_attn_down.weight"):
+            renamed["model.language_model.layers.0.attn_hyper_connection.input_mix_weight_down.weight"] = tensor
+        elif name.endswith(".hc_attn_up.weight"):
+            renamed["model.language_model.layers.0.attn_hyper_connection.input_mix_weight_up.weight"] = tensor
+        elif name.endswith(".hc_attn_inject.weight"):
+            renamed["model.language_model.layers.0.attn_hyper_connection.block_inject_weight.weight"] = tensor
+        elif name.endswith(".hc_ffn_norm.weight"):
+            renamed["model.language_model.layers.0.mlp_hyper_connection.hc_norm.weight"] = tensor
+        elif name.endswith(".hc_ffn_down.weight"):
+            renamed["model.language_model.layers.0.mlp_hyper_connection.input_mix_weight_down.weight"] = tensor
+        elif name.endswith(".hc_ffn_up.weight"):
+            renamed["model.language_model.layers.0.mlp_hyper_connection.input_mix_weight_up.weight"] = tensor
+        elif name.endswith(".hc_ffn_inject.weight"):
+            renamed["model.language_model.layers.0.mlp_hyper_connection.block_inject_weight.weight"] = tensor
+        elif name == "model.norm.hc_head_norm.weight":
+            renamed["model.language_model.hyper_connection_mixer.hc_norm.weight"] = tensor
+        elif name == "model.norm.hc_head_down.weight":
+            renamed["model.language_model.hyper_connection_mixer.input_mix_weight_down.weight"] = tensor
+        elif name == "model.norm.hc_head_up.weight":
+            renamed["model.language_model.hyper_connection_mixer.input_mix_weight_up.weight"] = tensor
+        else:
+            renamed[name] = tensor
+
+    shared_gate_raw = torch.randn(1, hidden, dtype=torch.float32)
+    renamed["model.language_model.layers.0.mlp.shared_expert_gate.weight"] = shared_gate_raw
+    renamed["model.language_model.layers.0.mlp.shared_expert.down_proj.weight"] = torch.randn(
+        hidden, 16, dtype=torch.float32
+    )
+    renamed["model.language_model.layers.0.mlp.shared_expert.gate_proj.weight"] = torch.randn(
+        16, hidden, dtype=torch.float32
+    )
+    renamed["model.language_model.layers.0.mlp.shared_expert.up_proj.weight"] = torch.randn(
+        16, hidden, dtype=torch.float32
+    )
+
+    raw_tensors["head_norm"] = base["model.norm.hc_head_norm.weight"].clone()
+    raw_tensors["attn_norm"] = base["model.layers.0.hc_attn_norm.weight"].clone()
+    raw_tensors["ffn_norm"] = base["model.layers.0.hc_ffn_norm.weight"].clone()
+    raw_tensors["attn_down"] = base["model.layers.0.hc_attn_down.weight"].clone()
+    raw_tensors["gate"] = shared_gate_raw.clone()
+
+    save_file(renamed, str(st_path))
+
+    script_path = REPO_ROOT / "convert_hf_to_gguf.py"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = f"{REPO_ROOT / 'gguf-py'}:{REPO_ROOT}"
+
+    # When: converting the checkpoint
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(script_path),
+            str(model_dir),
+            "--outfile",
+            str(out_gguf),
+            "--outtype",
+            "f32",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(REPO_ROOT),
+    )
+
+    assert proc.returncode == 0, (
+        f"convert_hf_to_gguf.py failed with code {proc.returncode}:\n"
+        f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    )
+
+    import gguf
+
+    reader = gguf.GGUFReader(out_gguf)
+    by_name = {t.name: t for t in reader.tensors}
+
+    # Then: every hyper-connection RMS norm is written as raw + 1
+    for gguf_name, raw_key in [
+        ("output_hc_norm.weight", "head_norm"),
+        ("blk.0.hc_attn_norm.weight", "attn_norm"),
+        ("blk.0.hc_ffn_norm.weight", "ffn_norm"),
+    ]:
+        assert gguf_name in by_name, f"missing {gguf_name}"
+        observed = by_name[gguf_name].data.astype(np.float32)
+        expected = (raw_tensors[raw_key] + 1).numpy().astype(np.float32)
+        assert np.allclose(observed, expected), (
+            f"{gguf_name} is not raw + 1: unscaled hyper-connection norm "
+            f"(first elem observed {observed.flat[0]:.6f}, expected {expected.flat[0]:.6f})"
+        )
+
+    # And: non-norm hyper-connection weights pass through unchanged
+    observed_down = by_name["blk.0.hc_attn_down.weight"].data.astype(np.float32)
+    assert np.allclose(observed_down, raw_tensors["attn_down"].numpy().astype(np.float32)), (
+        "hc_attn_down was modified; only hc_norm should get +1"
+    )
+
+    # And: shared_expert_gate is stored 1D [hidden] with the raw row values
+    gate = by_name["blk.0.ffn_gate_inp_shexp.weight"]
+    assert tuple(gate.data.shape) == (hidden,), (
+        f"ffn_gate_inp_shexp shape {gate.data.shape}, expected ({hidden},)"
+    )
+    assert np.allclose(gate.data.astype(np.float32), raw_tensors["gate"].numpy().reshape(-1)), (
+        "ffn_gate_inp_shexp values do not match shared_expert_gate row"
+    )
+

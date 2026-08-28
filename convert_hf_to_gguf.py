@@ -6029,6 +6029,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
                 "input_mix_weight_up": gguf.MODEL_TENSOR.HC_HEAD_UP,
             }
             leaf = name.split(".")[-2]
+            if leaf == "hc_norm":
+                data_torch = data_torch + 1
             return [(gguf.TENSOR_NAMES[hc_map[leaf]] + ".weight", data_torch)]
         if ".attn_hyper_connection." in name:
             hc_map = {
@@ -6038,6 +6040,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
                 "block_inject_weight": gguf.MODEL_TENSOR.HC_ATTN_INJECT,
             }
             leaf = name.split(".")[-2]
+            if leaf == "hc_norm":
+                data_torch = data_torch + 1
             return [(self.format_tensor_name(hc_map[leaf], bid, ".weight"), data_torch)]
         if ".mlp_hyper_connection." in name:
             hc_map = {
@@ -6047,6 +6051,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
                 "block_inject_weight": gguf.MODEL_TENSOR.HC_FFN_INJECT,
             }
             leaf = name.split(".")[-2]
+            if leaf == "hc_norm":
+                data_torch = data_torch + 1
             return [(self.format_tensor_name(hc_map[leaf], bid, ".weight"), data_torch)]
 
         # PLE projections: HF module names differ from the canonical suffixes
@@ -6078,6 +6084,9 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
         if name.endswith(".ple.conv1d.weight"):
             return [(self.map_tensor_name(name), data_torch.squeeze())]
+
+        if name.endswith("shared_expert_gate.weight"):
+            return [(self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE_INP_SHEXP, bid, ".weight"), data_torch.squeeze(0))]
 
         return super().modify_tensors(data_torch, name, bid)
 
