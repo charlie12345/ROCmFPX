@@ -3070,17 +3070,9 @@ bool server_prompt_cache::load(
         const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
 
         if (spec_state_required) {
-            for (const auto & ckpt : it->checkpoints) {
-                if (ckpt_sel && ckpt.n_tokens <= ckpt_sel->n_tokens) {
-                    continue;
-                }
-                if (ckpt.n_tokens > lcp_cur) {
-                    continue;
-                }
-                if (ckpt.data_tgt_host.empty() || ckpt.data_spec.empty()) {
-                    continue;
-                }
-                ckpt_sel    = &ckpt;
+            const auto * ckpt_cand = common_prompt_checkpoint_select_salvage(it->checkpoints, lcp_cur);
+            if (ckpt_cand != nullptr && (ckpt_sel == nullptr || ckpt_cand->n_tokens > ckpt_sel->n_tokens)) {
+                ckpt_sel     = ckpt_cand;
                 it_best_ckpt = it;
                 lcp_ckpt     = lcp_cur;
             }
