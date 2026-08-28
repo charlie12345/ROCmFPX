@@ -3,6 +3,7 @@
 #include "llama-model.h"
 #include "llama-graph.h"
 #include "llama-model-loader.h"
+#include "llama-memory-hybrid-idx.h"
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
@@ -2071,6 +2072,101 @@ struct llama_model_step35 : public llama_model_base {
 
     struct graph_mtp : public llm_graph_context {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
+struct llama_model_qwen4exp : public llama_model_base {
+    llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+
+    struct ple_history {
+        llama_pos                next_pos = -1;
+        std::vector<llama_token> toks;
+    };
+    mutable std::unordered_map<llama_seq_id, ple_history> ple_hist;
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_build_delta_net_base {
+        graph(const llama_model & model, const llm_graph_params & params);
+    private:
+        ggml_tensor * build_hc_mix(
+                    ggml_tensor * x,
+                    ggml_tensor * w_norm,
+                    ggml_tensor * w_down,
+                    ggml_tensor * w_up,
+                    ggml_tensor * w_inject,
+                    ggml_tensor ** inject,
+                            int   il);
+
+        ggml_tensor * build_hc_combine(
+                    ggml_tensor * residual,
+                    ggml_tensor * block_out,
+                    ggml_tensor * inject,
+                            int   il);
+
+        ggml_tensor * build_layer_attn(
+              llm_graph_input_attn_kv * inp_attn,
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+
+        ggml_tensor * build_attn_qsa(
+        llm_graph_input_attn_kv * inp,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                    ggml_tensor * top_k,
+                          float   kq_scale,
+                            int   il);
+
+        ggml_tensor * build_qsa_top_k(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+
+        ggml_tensor * build_layer_attn_linear(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * cur,
+                            int   il);
+
+        ggml_tensor * build_layer_ffn(
+                    ggml_tensor * cur,
+                            int   il);
+
+        ggml_tensor * build_norm_gated(
+                    ggml_tensor * input,
+                    ggml_tensor * weights,
+                    ggml_tensor * gate,
+                            int   layer);
+
+        std::map<int, ggml_tensor *> rs_rows;
+
+        ggml_tensor * build_conv_state_at(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * conv_states_all,
+                    ggml_tensor * x,
+                        int64_t   state_cols,
+                        int64_t   channels,
+                        int64_t   row_offset,
+                            int   il);
+
+        ggml_tensor * build_ple(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * hidden,
+                            int   il);
+
+        std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
+                    ggml_tensor * input,
+                            int   il);
+
+        const llama_model & model;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
