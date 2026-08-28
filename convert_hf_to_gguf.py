@@ -5914,6 +5914,34 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
                 return [int(x) for x in t.tolist()]
         raise ValueError(f"PLE constant {suffix!r} missing from the checkpoint")
 
+    def _capture_ple_fp8_scale(self) -> None:
+        """Capture the PLE table's single fp8 scale before the shards stream.
+
+        base write() runs prepare_tensors() ahead of
+        prepare_metadata()/set_gguf_parameters(), so a capture inside
+        set_gguf_parameters() lands after the table has already been placed
+        and the file is written unscaled (~5000x too large for this family).
+        """
+        self._ple_fp8_scale = None
+        for tname, tgen in self.model_tensors.items():
+            if tname.endswith("ngram_embedding.weight_scale"):
+                self._ple_fp8_scale = float(LazyTorchTensor.to_eager(tgen()).reshape(-1)[0])
+                break
+        quant_method = (self.hparams.get("quantization_config") or {}).get("quant_method")
+        if (
+            quant_method == "fp8"
+            and self._ple_fp8_scale is None
+            and any(
+                name.endswith(".shard_0.weight") and ".ngram_embedding." in name
+                for name in self.model_tensors
+            )
+        ):
+            raise ValueError(
+                "the checkpoint quantizes the PLE ngram embedding with fp8 but "
+                "no ngram_embedding.weight_scale scalar was found; refusing to "
+                "write the table unscaled"
+            )
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hp = self.hparams
@@ -5949,15 +5977,6 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             self.gguf_writer.add_ple_image_token_id(int(_img))
         if self._ple_row_dim is not None:
             self.gguf_writer.add_embedding_length_per_layer_input(self._ple_row_dim)
-
-        # the PLE table ships FP8 in this checkpoint family with a single
-        # per-tensor scale; capture it before the shards stream through
-        # prepare_tensors (alphabetical order puts the scale after the shards)
-        self._ple_fp8_scale = None
-        for tname, tgen in self.model_tensors.items():
-            if tname.endswith("ple_embedding.ngram_embedding.weight_scale"):
-                self._ple_fp8_scale = float(LazyTorchTensor.to_eager(tgen()).reshape(-1)[0])
-                break
 
         self.gguf_writer.add_ple_layer_multipliers(
             self._read_hash_constants("ple_embedding.layer_multipliers"))
@@ -5998,10 +6017,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             self._ple_head_vocab_sizes = [int(x) for x in data_torch.tolist()]
             return []
 
-        # PLE table FP8: the checkpoint ships one per-tensor scale for the
-        # whole n-gram embedding; captured in set_gguf_parameters and applied
-        # in _write_ple_shard
-        if name.endswith("ple_embedding.ngram_embedding.weight_scale"):
+        if name.endswith("ngram_embedding.weight_scale"):
             return []
 
         # hyper-connections: HF naming -> canonical. the head level replaces
@@ -6148,6 +6164,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         return torch.from_numpy(np.asarray(raw))
 
     def prepare_tensors(self):
+        self._capture_ple_fp8_scale()
         super().prepare_tensors()
         if self._ple_pending:
             raise ValueError(

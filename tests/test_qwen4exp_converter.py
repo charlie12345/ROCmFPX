@@ -263,6 +263,8 @@ def _build_synthetic_qwen4exp_hf_model(
     model_dir: Path,
     ple_enabled: bool,
     hidden_size: int = 16,
+    include_ple_scale: bool = True,
+    fp8_quantized: bool = False,
 ) -> dict[str, Any]:
     tok = Tokenizer(models.BPE())
     tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, trim_offsets=True, use_regex=True)
@@ -374,7 +376,8 @@ def _build_synthetic_qwen4exp_hf_model(
 
         shard0 = torch.randn(4, hidden_size, dtype=torch.float32)
         shard1 = torch.randn(4, hidden_size, dtype=torch.float32)
-        expected_ple_table = torch.cat([shard0, shard1], dim=0)
+        ple_scale = 0.25
+        expected_ple_table = torch.cat([shard0, shard1], dim=0) * ple_scale
 
         mult_vals = [2**33 + 12345, 2**45 + 67890]
         offset_vals = [2**34 + 1, 2**34 + 2]
@@ -393,8 +396,18 @@ def _build_synthetic_qwen4exp_hf_model(
             "model.layers.0.ngram_embedding.shard_0.weight": shard0,
             "model.layers.0.ngram_embedding.shard_1.weight": shard1,
         })
+        if include_ple_scale:
+            tensors["model.layers.0.ngram_embedding.weight_scale"] = torch.tensor(
+                [ple_scale], dtype=torch.bfloat16
+            )
+        if fp8_quantized:
+            config["quantization_config"] = {
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            }
 
         expected_info["expected_ple_table"] = expected_ple_table
+        expected_info["ple_scale"] = ple_scale
         expected_info["mult_vals"] = mult_vals
         expected_info["offset_vals"] = offset_vals
         expected_info["vocab_vals"] = vocab_vals
@@ -570,6 +583,45 @@ def test_qwen4exp_e2e_conversion(tmp_path: Path, ple_enabled: bool):
         assert np.allclose(ple_tensor.data, expected_table_np), (
             "Merged PLE table in GGUF does not match expected concatenation of shards"
         )
+
+
+def test_qwen4exp_fp8_ple_without_scale_fails_loudly(tmp_path: Path):
+    # Given: an fp8 checkpoint whose PLE ngram embedding has no weight_scale
+    model_dir = tmp_path / "model_fp8_no_scale"
+    model_dir.mkdir()
+    out_gguf = tmp_path / "out_fp8_no_scale.gguf"
+
+    _build_synthetic_qwen4exp_hf_model(
+        model_dir, ple_enabled=True, include_ple_scale=False, fp8_quantized=True
+    )
+
+    script_path = REPO_ROOT / "convert_hf_to_gguf.py"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = f"{REPO_ROOT / 'gguf-py'}:{REPO_ROOT}"
+
+    # When: converting the checkpoint
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(script_path),
+            str(model_dir),
+            "--outfile",
+            str(out_gguf),
+            "--outtype",
+            "f32",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(REPO_ROOT),
+    )
+
+    # Then: conversion fails loudly instead of writing an unscaled table
+    assert proc.returncode != 0, (
+        f"expected failure for fp8 PLE without scale, got success:\n{proc.stdout}"
+    )
+    assert "ngram_embedding.weight_scale" in proc.stderr
+    assert not out_gguf.exists()
 
 
 # ---------------------------------------------------------------------------
