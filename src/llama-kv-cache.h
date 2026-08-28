@@ -156,6 +156,8 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+
+    const llama_kv_cells & get_cells(llama_seq_id seq_id) const; // qwen4exp
     //
     // graph_build API
     //

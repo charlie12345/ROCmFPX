@@ -432,6 +432,15 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
             default:
+                if (qk_k <= 32) {
+                    // the target is already a 32-block type, so there is no smaller block to demote to
+                    // and the shape is simply not representable; the check below turns it into F16, the
+                    // same answer 256-block types reach when their fallback does not fit. Getting here
+                    // means ncols is not a multiple of 32, e.g. a conv kernel a recipe forgot to pin;
+                    // throwing gave no tensor name or message, making a recipe gap look like corruption.
+                    return_type = target_type;
+                    break;
+                }
                 throw std::runtime_error(format("no tensor type fallback is defined for type %s",
                                                 ggml_type_name(target_type)));
         }
@@ -1020,7 +1029,23 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
         return tensor->type;
     }
     if (params->token_embedding_type < GGML_TYPE_COUNT && tm.category == tensor_category::TOKEN_EMBD) {
-        return params->token_embedding_type;
+        // per_layer_token_embd shares this category with token_embd.weight and follows
+        // --token-embedding-type by default. But it is a separate table and far from a
+        // rounding error: qwen4exp's is ~46% of a 4-bit file. Let an explicit --tensor-type
+        // name it; nothing changes unless such a pattern is passed.
+        bool named = false;
+        if (std::strcmp(tensor->name, "per_layer_token_embd.weight") == 0) {
+            const std::string tensor_name(tensor->name);
+            for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+                if (std::regex_search(tensor_name, pattern)) {
+                    named = true;
+                    break;
+                }
+            }
+        }
+        if (!named) {
+            return params->token_embedding_type;
+        }
     }
     if (params->output_tensor_type < GGML_TYPE_COUNT && tm.category == tensor_category::OUTPUT) {
         return params->output_tensor_type;
@@ -1563,6 +1588,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         void * new_data;
         size_t new_size;
+        // set when a tensor's data was already streamed to fout panel by panel
+        // (big-tensor chunked path below) and the tail write must be skipped
+        bool streamed = false;
 
         if (params->dry_run) {
             // the --dry-run option calculates the final quantization size without quantizing
@@ -1633,6 +1661,76 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     throw std::runtime_error(format("Missing importance matrix for tensor %s in a very low-bit quantization", tensor->name));
                 }
 
+                LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
+                fflush(stdout);
+
+                // Big-tensor chunked path: when the F32 image of a whole tensor cannot be
+                // held in memory (qwen4exp's per_layer_token_embd is 51.2 G elements = 192 GiB
+                // of F32), quantize it in row panels instead. Panels run through the same
+                // llama_tensor_quantize_impl as the full path below, and ggml block
+                // quantization is row-local, so panel output is byte-identical to what the
+                // full-tensor path would produce. Panel data is streamed to fout as it
+                // completes and the tail write is skipped via `streamed`. The branch must
+                // be taken BEFORE the whole-tensor dequantize below, which is itself the
+                // allocation that cannot fit.
+                const bool big_tensor = nelements > ((int64_t)1 << 31) && tensor->ne[2] >= 1 && tensor->ne[3] == 1 &&
+                    (tensor->type == GGML_TYPE_F32 ||
+                     tensor->type == GGML_TYPE_F16 ||
+                     tensor->type == GGML_TYPE_BF16);
+
+                if (big_tensor) {
+                    const int64_t n_per_row = tensor->ne[0];
+                    const int64_t nrows    = tensor->ne[1];
+
+                    const size_t src_row_bytes = ggml_row_size(cur_type, n_per_row);
+                    const size_t new_row_bytes = ggml_row_size(new_type, n_per_row);
+
+                    static const int64_t min_chunk_size = 32 * 512;
+                    const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
+                    const int64_t nelements_matrix = n_per_row * nrows;
+                    const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
+                    const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
+
+                    // ~512 MiB of source per panel: the F32 panel, the output panel and the
+                    // mmap read-ahead stay far inside a 70 GiB memory cap.
+                    const int64_t panel_rows = std::max<int64_t>(1, ((int64_t)512 << 20) / (int64_t)src_row_bytes);
+
+                    f32_conv_buf.resize((size_t)panel_rows * (size_t)n_per_row);
+                    work.resize(new_row_bytes * (size_t)panel_rows);
+
+                    new_size = 0;
+                    for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
+                        const char * slice_src = (const char *) tensor->data + (size_t)i03 * src_row_bytes * (size_t)nrows;
+                        const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
+
+                        for (int64_t r0 = 0; r0 < nrows; r0 += panel_rows) {
+                            const int64_t rows = std::min(panel_rows, nrows - r0);
+                            const char * src = slice_src + (size_t)r0 * src_row_bytes;
+                            float * f32_panel = (float *) f32_conv_buf.data();
+
+                            if (cur_type == GGML_TYPE_BF16) {
+                                ggml_bf16_to_fp32_row((const ggml_bf16_t *) src, f32_panel, rows * n_per_row);
+                            } else if (cur_type == GGML_TYPE_F16) {
+                                ggml_fp16_to_fp32_row((const ggml_fp16_t *) src, f32_panel, rows * n_per_row);
+                            } else {
+                                memcpy(f32_panel, src, (size_t)rows * (size_t)n_per_row * sizeof(float));
+                            }
+
+                            const size_t panel_size = llama_tensor_quantize_impl(new_type, f32_panel, work.data(), chunk_size, rows, n_per_row, imatrix_03, workers, nthread_use);
+                            GGML_ASSERT(panel_size == new_row_bytes * (size_t)rows);
+
+                            fout.write((const char *) work.data(), (std::streamsize)panel_size);
+                            new_size += panel_size;
+                        }
+                    }
+
+                    new_data = nullptr; // panels already streamed above
+                    streamed = true;
+                    LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB (chunked, %lld-row panels)\n",
+                                   tensor_size/1024.0/1024.0, new_size/1024.0/1024.0, (long long)panel_rows);
+                } else {
+
+                // full-tensor path: the whole F32 image is materialized here
                 float * f32_data;
 
                 if (tensor->type == GGML_TYPE_F32) {
@@ -1645,11 +1743,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     f32_data = (float *) f32_conv_buf.data();
                 }
 
-                LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
-                fflush(stdout);
-
-                if (work.size() < (size_t)nelements * 4) {
-                    work.resize(nelements * 4); // upper bound on size
+                // Exact output size: ggml_row_size(new_type, ne0) per row, ne1 rows, ne2 slices --
+                // what the loop writes, what new_size sums to, and what the GGUF metadata is
+                // asserted against. The previous `nelements * 4` was a loose upper bound, invisible
+                // on a normal model but 205 GB of dead address space on Qwen3.8-Flash-Next's 51.2 G
+                // element PLE table -- about half of what OOMed a 2 TB machine at five-wide.
+                const size_t out_size =
+                    ggml_row_size(new_type, tensor->ne[0]) * tensor->ne[1] * tensor->ne[2];
+                if (work.size() < out_size) {
+                    work.resize(out_size);
                 }
                 new_data = work.data();
 
@@ -1673,6 +1775,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     new_size += llama_tensor_quantize_impl(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
                 }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
+                }
             }
             total_size_org += tensor_size;
             total_size_new += new_size;
@@ -1683,7 +1786,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             gguf_set_tensor_data(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_data);
 
             // write tensor data + padding
-            fout.write((const char *) new_data, new_size);
+            if (!streamed) {
+                fout.write((const char *) new_data, new_size);
+            }
             zeros(fout, GGML_PAD(new_size, align) - new_size);
         } // no --dry-run
     } // main loop

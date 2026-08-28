@@ -125,6 +125,7 @@ enum llm_type {
     LLM_TYPE_35B_A3B, // Qwen3.5
     LLM_TYPE_48B_A3B, // Kimi Linear
     LLM_TYPE_80B_A3B, // Qwen3 Next
+    LLM_TYPE_A3B,     // Qwen3.8 Flash Next
     LLM_TYPE_100B_A6B,
     LLM_TYPE_124B_A5B, // Ling 3.0 flash
     LLM_TYPE_102B_A12B, // Solar-Open
@@ -519,6 +520,28 @@ struct llama_layer {
     struct ggml_tensor * hc_ffn_fn     = nullptr;
     struct ggml_tensor * hc_ffn_scale  = nullptr;
 
+    // MSA (qwen4exp)
+    struct ggml_tensor * index_q_proj = nullptr;
+    struct ggml_tensor * index_k_proj = nullptr;
+    struct ggml_tensor * index_q_norm = nullptr;
+    struct ggml_tensor * index_k_norm = nullptr;
+
+    struct ggml_tensor * hc_attn_norm   = nullptr; // qwen4exp
+    struct ggml_tensor * hc_attn_down   = nullptr; // qwen4exp
+    struct ggml_tensor * hc_attn_up     = nullptr; // qwen4exp
+    struct ggml_tensor * hc_attn_inject = nullptr; // qwen4exp
+    struct ggml_tensor * hc_ffn_norm    = nullptr; // qwen4exp
+    struct ggml_tensor * hc_ffn_down    = nullptr; // qwen4exp
+    struct ggml_tensor * hc_ffn_up      = nullptr; // qwen4exp
+    struct ggml_tensor * hc_ffn_inject  = nullptr; // qwen4exp
+
+    struct ggml_tensor * ple_key        = nullptr; // qwen4exp
+    struct ggml_tensor * ple_value      = nullptr; // qwen4exp
+    struct ggml_tensor * ple_norm_key   = nullptr; // qwen4exp
+    struct ggml_tensor * ple_norm_query = nullptr; // qwen4exp
+    struct ggml_tensor * ple_norm_conv  = nullptr; // qwen4exp
+    struct ggml_tensor * ple_conv1d     = nullptr; // qwen4exp
+
     // gemma4 layer output scale
     struct ggml_tensor * out_scale = nullptr;
 
@@ -569,6 +592,8 @@ struct llama_model {
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
+    struct ggml_tensor * output_s       = nullptr; // qwen4exp: NVFP4 output weight scale
+    struct ggml_tensor * output_in_s    = nullptr; // qwen4exp: NVFP4 output input scale
     struct ggml_tensor * output_hc_base  = nullptr;
     struct ggml_tensor * output_hc_fn    = nullptr;
     struct ggml_tensor * output_hc_scale = nullptr;
@@ -600,6 +625,10 @@ struct llama_model {
     struct ggml_tensor * altup_proj           = nullptr;
     struct ggml_tensor * altup_unembd_proj    = nullptr;
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
+
+    struct ggml_tensor * hc_head_norm = nullptr;
+    struct ggml_tensor * hc_head_down = nullptr;
+    struct ggml_tensor * hc_head_up   = nullptr;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
