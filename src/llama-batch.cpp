@@ -296,7 +296,14 @@ bool llama_batch_allocr::init(
 
             const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
 
-            if (p0 >= 0) {
+            // Hybrid MTP batches (token + embd, e.g. gemma4 assistant drafts) carry
+            // token ids for embedding lookup while injecting hidden embeddings for
+            // the draft block; like the M-RoPE branch above, they may re-decode at
+            // positions the KV already holds (shared-KV MTP re-runs), so require
+            // overlap-tolerant X <= Y there instead of strict consecutiveness.
+            const bool mtp_hybrid_batch = batch.token != nullptr && batch.embd != nullptr;
+
+            if (p0 >= 0 && !mtp_hybrid_batch) {
                 bool ok = true;
 
                 if (seq_pos_min(s) != p0 + 1) {
@@ -314,6 +321,11 @@ bool llama_batch_allocr::init(
                     return false;
                 }
             }
+
+            // hybrid MTP batches may overlap the KV arbitrarily (shared-KV gemma4
+            // drafts re-decode prompt positions read-only); only reject positions
+            // strictly before the batch's own window, which is never legitimate.
+            // (No extra check needed beyond skipping the strict Y = X + 1 rule.)
 
             if (seq_pos_max(s) - seq_pos_min(s) + 1 > (int) seq_pos[s].size()) {
                 LLAMA_LOG_ERROR("%s: sequence %d positions are not continuous\n", __func__, s);

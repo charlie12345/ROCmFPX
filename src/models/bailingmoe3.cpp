@@ -17,6 +17,7 @@ void llama_model_bailingmoe3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla_impl);
     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA,  hparams.n_embd_head_v_mla_impl);
     ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,      hparams.n_lora_kv);
+    ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q, false);
     ml.get_key(LLM_KV_SSM_CONV_KERNEL,             hparams.ssm_d_conv);
     ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.n_embd_head_kda);
     ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND,        hparams.kda_gate_lower_bound);
@@ -50,6 +51,7 @@ void llama_model_bailingmoe3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_clamp_shexp, hparams.n_layer, false);
 
     switch (hparams.n_layer - hparams.nextn_predict_layers) {
+        case 24: type = LLM_TYPE_16B_A1B; break; // Ling-3.0-tiny (128x1.0B)
         case 42: type = LLM_TYPE_124B_A5B; break; // Ling-3.0-flash
         default: type = LLM_TYPE_UNKNOWN;
     }
@@ -90,9 +92,16 @@ void llama_model_bailingmoe3::load_arch_tensors(llama_model_loader &) {
 
             create_tensor_qkv(layer, i, n_embd, d_inner, d_inner, d_inner, 0);
 
-            // full-rank forget/output gate projections (no_kda_lora)
-            layer.ssm_f = create_tensor(tn(LLM_TENSOR_SSM_F, "weight", i), {n_embd, d_inner}, 0);
-            layer.ssm_g = create_tensor(tn(LLM_TENSOR_SSM_G, "weight", i), {n_embd, d_inner}, 0);
+            // full-rank forget/output gate projections (no_kda_lora).
+            // flash GGUFs call these ssm_f/ssm_g, tiny (PR #26608 layout) ssm_f_a/ssm_g_a
+            layer.ssm_f = create_tensor(tn(LLM_TENSOR_SSM_F, "weight", i), {n_embd, d_inner}, TENSOR_NOT_REQUIRED);
+            if (!layer.ssm_f) {
+                layer.ssm_f = create_tensor(tn(LLM_TENSOR_SSM_F_A, "weight", i), {n_embd, d_inner}, 0);
+            }
+            layer.ssm_g = create_tensor(tn(LLM_TENSOR_SSM_G, "weight", i), {n_embd, d_inner}, TENSOR_NOT_REQUIRED);
+            if (!layer.ssm_g) {
+                layer.ssm_g = create_tensor(tn(LLM_TENSOR_SSM_G_A, "weight", i), {n_embd, d_inner}, 0);
+            }
 
             layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head}, 0);
 
@@ -113,8 +122,14 @@ void llama_model_bailingmoe3::load_arch_tensors(llama_model_loader &) {
             const int64_t n_embd_head_v_mla = hparams.n_embd_head_v_mla();
             const int64_t qk_rope_head_dim  = hparams.n_rot();
 
-            // Ling 3.0 has no query compression (q_lora_rank = null)
-            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_head * n_embd_head_k_mla}, 0);
+            const int64_t q_lora_rank = hparams.n_lora_q;
+            if (q_lora_rank > 0) { // Ling-3.0-tiny: compressed queries
+                layer.wq_a = create_tensor(tn(LLM_TENSOR_ATTN_Q_A, "weight", i), {n_embd, q_lora_rank}, 0);
+                layer.attn_q_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i), {q_lora_rank}, 0);
+                layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", i), {q_lora_rank, n_head * n_embd_head_k_mla}, 0);
+            } else { // Ling-3.0-flash: no query compression
+                layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_head * n_embd_head_k_mla}, 0);
+            }
 
             layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora_rank}, 0);
             layer.wkv_a_mqa      = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA,  "weight", i), {n_embd, kv_lora_rank + qk_rope_head_dim}, 0);
@@ -332,7 +347,16 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
             cb(cur, "kda_out", il);
         } else {
             // === gated MLA ===
-            ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq, cur);
+            ggml_tensor * q;
+            if (layer.wq_a) { // Ling-3.0-tiny: q_a_proj -> q_a_layernorm -> q_b_proj
+                q = ggml_mul_mat(ctx0, layer.wq_a, cur);
+                cb(q, "q_a", il);
+                q = build_norm(q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+                cb(q, "q_a_norm", il);
+                q = ggml_mul_mat(ctx0, layer.wq_b, q);
+            } else {
+                q = ggml_mul_mat(ctx0, layer.wq, cur);
+            }
             cb(q, "q", il);
 
             ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens,
@@ -564,7 +588,16 @@ llama_model_bailingmoe3::graph_mtp::graph_mtp(const llama_model & model, const l
 
     // === gated MLA (mirrors the main-graph MLA branch) ===
     {
-        ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq, cur);
+        ggml_tensor * q;
+        if (layer.wq_a) { // Ling-3.0-tiny: q_a_proj -> q_a_layernorm -> q_b_proj
+            q = ggml_mul_mat(ctx0, layer.wq_a, cur);
+            cb(q, "mtp_q_a", il);
+            q = build_norm(q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+            cb(q, "mtp_q_a_norm", il);
+            q = ggml_mul_mat(ctx0, layer.wq_b, q);
+        } else {
+            q = ggml_mul_mat(ctx0, layer.wq, cur);
+        }
         cb(q, "mtp_q", il);
 
         ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens,

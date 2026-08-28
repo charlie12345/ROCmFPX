@@ -162,7 +162,11 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
         cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
                 Qcur, nullptr, nullptr, nullptr, hparams.f_attention_scale, il, il_src);
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        // gate on masked like the gemma4 target (gemma4.cpp): in full-rows mode
+        // (!embeddings_pre_norm_masked) the MTP hook batch has n_outputs == 0
+        // (no logits requested), so an ungated filter would drop ALL rows and
+        // produce an empty t_h_pre_norm.
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_pre_norm_masked) {
             cur  = ggml_get_rows(ctx0, cur,  inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
@@ -195,16 +199,24 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     }
     cur = inpL;
 
+    // h_pre_norm must carry ALL rows (n_tokens) when !embeddings_pre_norm_masked:
+    // the context layer reads n_tokens rows from t_h_pre_norm in that mode
+    // (llama-context.cpp decode path). Filter by out_ids only for the logits
+    // path, exactly like the gemma4 target model does.
+    ggml_tensor * h_next = ggml_mul_mat(ctx0, model.nextn_proj_post, cur);
+    cb(h_next, "h_nextn", -1);
+    res->t_h_pre_norm = h_next;
+
+    if (!cparams.embeddings_pre_norm_masked && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
     ggml_tensor * logits = build_lora_mm(model.output, cur, model.output_s);
     cb(logits, "result_output", -1);
     res->t_logits = logits;
-
-    ggml_tensor * h_next = ggml_mul_mat(ctx0, model.nextn_proj_post, cur);
-    cb(h_next, "h_nextn", -1);
-    res->t_h_pre_norm = h_next;
 
     ggml_build_forward_expand(gf, logits);
     ggml_build_forward_expand(gf, h_next);

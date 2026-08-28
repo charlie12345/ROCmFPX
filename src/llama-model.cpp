@@ -312,6 +312,10 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_kimi_linear(params);
         case LLM_ARCH_BAILING_HYBRID:
             return new llama_model_bailing_hybrid(params);
+        case LLM_ARCH_MELLUM:
+            return new llama_model_mellum(params);
+        case LLM_ARCH_ZAYA:
+            return new llama_model_zaya(params);
         case LLM_ARCH_STEP35:
             return new llama_model_step35(params);
         default:
@@ -789,6 +793,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_A13B:          return "A13B";
         case LLM_TYPE_7B_A1B:        return "7B.A1B";
         case LLM_TYPE_8B_A1B:        return "8B.A1B";
+        case LLM_TYPE_12B_A2_5B:     return "12B.A2.5B";
         case LLM_TYPE_16B_A1B:       return "16B.A1B";
         case LLM_TYPE_21B_A3B:       return "21B.A3B";
         case LLM_TYPE_24B_A2B:       return "24B.A2B";
@@ -1659,7 +1664,16 @@ const float * llama_model::tensor_split() const {
 }
 
 uint32_t llama_model::n_embd_pre_norm() const {
-    return arch == LLM_ARCH_DEEPSEEK4 ? hparams.n_embd * hparams.n_hc : hparams.n_embd;
+    if (arch == LLM_ARCH_DEEPSEEK4) {
+        return hparams.n_embd * hparams.n_hc;
+    }
+    // gemma4 assistants publish h_pre_norm rows at the backbone (target) dim:
+    // the graph's h_next is the post_projection output (assistant dim -> backbone),
+    // which is what gets re-fed as the next draft step's inp_h.
+    if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        return hparams.n_embd_inp();
+    }
+    return hparams.n_embd;
 }
 
 uint32_t llama_model::n_gpu_layers() const {
@@ -1796,7 +1810,8 @@ void llama_model::print_info() const {
                 arch == LLM_ARCH_QWEN35 ||
                 arch == LLM_ARCH_QWEN35MOE ||
                 arch == LLM_ARCH_NEMOTRON_H ||
-                arch == LLM_ARCH_NEMOTRON_H_MOE) {
+                arch == LLM_ARCH_NEMOTRON_H_MOE ||
+                arch == LLM_ARCH_ZAYA) {
             LLAMA_LOG_INFO("%s: ssm_d_conv            = %u\n",     __func__, hparams.ssm_d_conv);
             LLAMA_LOG_INFO("%s: ssm_d_inner           = %u\n",     __func__, hparams.ssm_d_inner);
             LLAMA_LOG_INFO("%s: ssm_d_state           = %u\n",     __func__, hparams.ssm_d_state);
@@ -1844,7 +1859,7 @@ void llama_model::print_info() const {
             LLAMA_LOG_INFO("%s: n_ff_shexp            = %d\n",     __func__, hparams.n_ff_shexp);
         }
 
-        if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_QWEN3MOE || arch == LLM_ARCH_OPENAI_MOE || arch == LLM_ARCH_QWEN3VLMOE || arch == LLM_ARCH_RND1) {
+        if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MELLUM || arch == LLM_ARCH_QWEN3MOE || arch == LLM_ARCH_OPENAI_MOE || arch == LLM_ARCH_QWEN3VLMOE || arch == LLM_ARCH_RND1) {
             LLAMA_LOG_INFO("%s: n_ff_exp              = %d\n",     __func__, hparams.n_ff_exp);
         }
 
@@ -2123,6 +2138,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     if (arch == LLM_ARCH_FALCON_H1) {
                         filter_attn = [&](int32_t) { return true; };
                         filter_recr = [&](int32_t) { return true; };
+                    } else if (arch == LLM_ARCH_ZAYA) {
+                        filter_attn = [&](int32_t il) {
+                            return il % 2 == 0;
+                        };
+                        filter_recr = [&](int32_t il) {
+                            return il % 2 == 0;
+                        };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
                         filter_attn = [&](int32_t il) {
                             return !hparams.is_recurrent(il) && hparams.n_ff(il) == 0;
@@ -2559,6 +2581,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_HYV3:
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
+        case LLM_ARCH_ZAYA:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_DFLASH:

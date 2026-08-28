@@ -1002,6 +1002,7 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_h_pre_norm  = nullptr; // was missing: stale pointer survived arena re-init
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1673,6 +1674,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
             {
                 probs = logits; // [n_expert, n_tokens]
+            } break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_NONE:
+            {
+                probs = logits; // already-normalized expert probabilities (zaya MLP router)
             } break;
         default:
             GGML_ABORT("fatal error");
