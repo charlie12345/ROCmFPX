@@ -314,11 +314,13 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     inpL = build_hc_combine(inpL, cur, inject, il);
     cb(inpL, "mtp_l_out", il);
 
-    ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, hc*n_embd, n_tokens);
-    // In this ROCmFPX target, t_h_pre_norm is the established MTP handoff channel.
-    res->t_h_pre_norm = flat;
+    // Keep the handoff on a tensor that is part of the output graph.  A standalone
+    // reshape view is not scheduled, so the speculative decoder cannot find its
+    // backend when it copies the wide residual state.
+    res->t_h_pre_norm = inpL;
 
     if (inp_out_ids) {
+        ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, hc*n_embd, n_tokens);
         flat = ggml_get_rows(ctx0, flat, inp_out_ids);
         inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
     }
@@ -493,10 +495,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         cb(res_hc, "l_last", il);
     }
 
-    // Hand the wide residual to an MTP head before the final mix collapses it.  The
-    // target runtime publishes it through t_h_pre_norm and sizes that buffer via
-    // llama_model::n_embd_pre_norm().
-    res->t_h_pre_norm = ggml_reshape_2d(ctx0, res_hc, hc*n_embd, n_tokens);
+    // Hand the live wide residual to an MTP head before the final mix collapses it.
+    // The copy path treats its storage as n_embd*hc contiguous floats per token.
+    res->t_h_pre_norm = res_hc;
 
     // the final mixer is the output norm: there is no separate one
     ggml_tensor * cur = build_hc_mix(res_hc,
