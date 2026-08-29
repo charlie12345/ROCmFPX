@@ -1666,7 +1666,7 @@ const float * llama_model::tensor_split() const {
 }
 
 uint32_t llama_model::n_embd_pre_norm() const {
-    if (arch == LLM_ARCH_DEEPSEEK4) {
+    if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_QWEN4EXP) {
         return hparams.n_embd * hparams.n_hc;
     }
     // gemma4 assistants publish h_pre_norm rows at the backbone (target) dim:
@@ -2112,7 +2112,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_qwen35 =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_BAILING_HYBRID);
+                     arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_BAILINGMOE3 ||
+                     arch == LLM_ARCH_BAILING_HYBRID);
                 const bool step35_with_mtp =
                     arch == LLM_ARCH_STEP35 && hparams.nextn_predict_layers > 0;
                 const bool mtp_on_step35 =
