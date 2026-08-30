@@ -931,6 +931,22 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
     return nullptr;
 }
 
+llama_tensor_source llama_model_loader::get_tensor_source(const char * name) const {
+    const auto * weight = get_weight(name);
+    if (weight == nullptr || weight->tensor == nullptr || weight->idx >= files.size()) {
+        throw std::runtime_error(format("%s: tensor '%s' source is unavailable", __func__, name));
+    }
+    return {
+        files.at(weight->idx)->file_id(),
+        weight->idx,
+        weight->offs,
+        ggml_nbytes(weight->tensor),
+        weight->tensor->type,
+        weight->tensor->ne[0],
+        weight->tensor->ne[1],
+    };
+}
+
 const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weight(const char * name) const {
     const llama_tensor_weight * weight = get_weight(name);
     if (!weight) {

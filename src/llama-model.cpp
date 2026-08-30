@@ -36,6 +36,15 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_LLAMA:
@@ -1492,7 +1501,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(params.ple_storage != LLAMA_PLE_STORAGE_DIRECT,
+                     use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1626,6 +1636,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+#ifdef _WIN32
+    if (params.ple_storage == LLAMA_PLE_STORAGE_DIRECT) {
+        if (!EmptyWorkingSet(GetCurrentProcess())) {
+            LLAMA_LOG_WARN("PLE direct pager: EmptyWorkingSet failed with error %lu\n", GetLastError());
+        } else {
+            LLAMA_LOG_INFO("PLE direct pager: loading-page trim completed\n");
+        }
+    }
+#endif
 
     return true;
 }

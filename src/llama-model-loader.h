@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-ple-pager.h"
 
 #include "ggml-cpp.h"
 
@@ -19,6 +20,16 @@ using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
+
+struct llama_tensor_source {
+    int         file_id;
+    uint16_t    file_index;
+    uint64_t    offset;
+    uint64_t    size;
+    ggml_type   type;
+    int64_t     ne0;
+    int64_t     ne1;
+};
 
 enum llama_fver {
     GGUF_FILE_VERSION_V1 = 1,
@@ -169,6 +180,8 @@ struct llama_model_loader {
     enum llm_arch get_arch() const;
 
     const llama_tensor_weight * get_weight(const char * name) const;
+
+    llama_tensor_source get_tensor_source(const char * name) const;
 
     const llama_tensor_weight & require_weight(const char * name) const;
 

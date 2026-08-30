@@ -2,6 +2,21 @@
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 
+#include <cinttypes>
+
+llama_model_qwen4exp::~llama_model_qwen4exp() {
+    if (ple_pager) {
+        const auto stats = ple_pager->snapshot_stats();
+        LLAMA_LOG_WARN(
+            "PLE direct pager stats: rows=%" PRIu64 " sectors=%" PRIu64 " dedup=%" PRIu64
+            " bytes=%" PRIu64 " reads=%" PRIu64 " failures=%" PRIu64
+            " read_us=%" PRIu64 " max_read_us=%" PRIu64 " dequant_us=%" PRIu64
+            " peak_arena_bytes=%" PRIu64 "\n",
+            stats.rows, stats.sectors, stats.deduplicated_sectors, stats.bytes, stats.reads,
+            stats.failures, stats.read_us, stats.max_read_us, stats.dequant_us, stats.peak_arena_bytes);
+    }
+}
+
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -112,8 +127,43 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         const auto * ple_w = ml.get_weight(ple_name.c_str());
         GGML_ASSERT(ple_w != nullptr && "qwen4exp is missing the PLE n-gram table");
         const int64_t ple_rows = ple_w->tensor->ne[1];
-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, 0);
+        if (params.ple_storage == LLAMA_PLE_STORAGE_DIRECT) {
+#ifndef _WIN32
+            throw std::runtime_error("Qwen4Exp --ple-ssd direct is only supported on Windows");
+#else
+            if (params.use_mlock) {
+                throw std::runtime_error("Qwen4Exp direct PLE cannot be combined with --mlock");
+            }
+            const auto tensor_source = ml.get_tensor_source(ple_name.c_str());
+            if (tensor_source.type != GGML_TYPE_Q8_0 || tensor_source.ne0 != hparams.ple_head_dim ||
+                tensor_source.ne1 <= 0 || tensor_source.size != ggml_nbytes(ple_w->tensor)) {
+                throw std::runtime_error(format(
+                    "unsupported Qwen4Exp PLE direct geometry: type=%s ne0=%" PRId64 " ne1=%" PRId64 " bytes=%" PRIu64,
+                    ggml_type_name(tensor_source.type), tensor_source.ne0, tensor_source.ne1, tensor_source.size));
+            }
+            const uint64_t row_bytes = tensor_source.size / (uint64_t) tensor_source.ne1;
+            if (row_bytes != ggml_row_size(GGML_TYPE_Q8_0, (int64_t) tensor_source.ne0)) {
+                throw std::runtime_error("Qwen4Exp PLE direct row size is not Q8_0-compatible");
+            }
+            ple_source = {
+                tensor_source.offset,
+                tensor_source.size,
+                (uint64_t) tensor_source.ne1,
+                (uint64_t) tensor_source.ne0,
+                row_bytes,
+                4096,
+            };
+            ple_pager = llama_ple_pager::open_from_file_id(
+                tensor_source.file_id, ple_source, params.ple_io_depth, params.ple_buffer_size);
+            LLAMA_LOG_WARN("PLE direct pager active: alignment=%" PRIu64 " io_depth=%u budget_mib=%zu\n",
+                ple_source.alignment, params.ple_io_depth, params.ple_buffer_size/(1024*1024));
+            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                               { hparams.ple_head_dim, ple_rows }, TENSOR_SKIP);
+#endif
+        } else {
+            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                               { hparams.ple_head_dim, ple_rows }, 0);
+        }
     }
 
     // An MTP-only file carries just the draft block. Keep walking the trunk so the
@@ -1056,6 +1106,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * embeddings = nullptr; // F32 [ple_head_dim * ple_n_heads, n_tokens]
 
     const llama_model_qwen4exp & pmodel;
 };
@@ -1166,7 +1217,27 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         h.next_pos = pos + 1;
     }
 
-    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    if (pmodel.ple_pager) {
+        if (embeddings == nullptr) {
+            throw std::runtime_error("Qwen4Exp direct PLE graph input is not initialized");
+        }
+        std::vector<float> host((size_t) n_heads * (size_t) n_tokens * (size_t) hp.ple_head_dim);
+        pmodel.ple_pager->read_rows(idx, host.data(), host.size());
+        ggml_backend_tensor_set(embeddings, host.data(), 0, host.size() * sizeof(float));
+        if (!pmodel.ple_stats_logged) {
+            const auto stats = pmodel.ple_pager->snapshot_stats();
+            LLAMA_LOG_WARN(
+                "PLE direct pager stats: rows=%" PRIu64 " sectors=%" PRIu64 " dedup=%" PRIu64
+                " bytes=%" PRIu64 " reads=%" PRIu64 " failures=%" PRIu64
+                " read_us=%" PRIu64 " max_read_us=%" PRIu64 " dequant_us=%" PRIu64
+                " peak_arena_bytes=%" PRIu64 "\n",
+                stats.rows, stats.sectors, stats.deduplicated_sectors, stats.bytes, stats.reads,
+                stats.failures, stats.read_us, stats.max_read_us, stats.dequant_us, stats.peak_arena_bytes);
+            pmodel.ple_stats_logged = true;
+        }
+    } else {
+        ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    }
 }
 
 // Fetch one conv history out of the recurrent row and write the updated tail
@@ -1240,15 +1311,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model));
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
-    res->add_input(std::move(ple_inp));
+    ggml_tensor * emb = nullptr;
+    const auto & qwen_model = static_cast<const llama_model_qwen4exp &>(model);
+    if (qwen_model.ple_pager) {
+        ple_inp->embeddings = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
+            hparams.ple_head_dim * n_heads, n_tokens);
+        ggml_set_input(ple_inp->embeddings);
+        emb = ple_inp->embeddings;
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        ggml_tensor * rows = ple_inp->rows;
 
-    // gather then flatten the heads: get_rows already lays the head dimension
-    // out slowest, matching the reference's flatten over the head axis
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
-    emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+        // gather then flatten the heads: get_rows already lays the head dimension
+        // out slowest, matching the reference's flatten over the head axis
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+        emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+    }
+    res->add_input(std::move(ple_inp));
     cb(emb, "ple_embd", il);
 
     ggml_tensor * key   = build_lora_mm(model.layers[il].ple_key,   emb);
