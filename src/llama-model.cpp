@@ -2357,6 +2357,9 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.ple_storage                 =*/ LLAMA_PLE_STORAGE_OFF,
+        /*.ple_io_depth                =*/ 32,
+        /*.ple_buffer_size             =*/ 32ull*1024*1024,
     };
 
     return result;

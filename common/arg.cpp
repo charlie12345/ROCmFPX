@@ -29,6 +29,7 @@
 #include <cstdarg>
 #include <fstream>
 #include <list>
+#include <limits>
 #include <regex>
 #include <set>
 #include <string>
@@ -2313,6 +2314,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.use_direct_io = value;
         }
     ).set_env("LLAMA_ARG_DIO"));
+    add_opt(common_arg(
+        {"--ple-ssd"}, "off|direct",
+        string_format("Qwen4Exp PLE storage mode (default: %s)",
+            params.ple_storage == LLAMA_PLE_STORAGE_DIRECT ? "direct" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.ple_storage = LLAMA_PLE_STORAGE_OFF;
+            } else if (value == "direct") {
+                params.ple_storage = LLAMA_PLE_STORAGE_DIRECT;
+            } else {
+                throw std::invalid_argument("invalid value for --ple-ssd (expected off or direct)");
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--ple-io-depth"}, "N",
+        string_format("maximum outstanding Windows PLE reads (default: %u)", params.ple_io_depth),
+        [](common_params & params, const std::string & value) {
+            const uint64_t depth = std::stoull(value);
+            if (depth == 0 || depth > std::numeric_limits<uint32_t>::max()) {
+                throw std::invalid_argument("--ple-io-depth must be between 1 and UINT32_MAX");
+            }
+            params.ple_io_depth = (uint32_t) depth;
+        }
+    ));
+    add_opt(common_arg(
+        {"--ple-buffer-mib"}, "N",
+        string_format("PLE direct-read staging buffer in MiB (minimum 1, default: %zu)",
+            params.ple_buffer_size/(1024*1024)),
+        [](common_params & params, const std::string & value) {
+            const uint64_t mib = std::stoull(value);
+            if (mib == 0 || mib > std::numeric_limits<size_t>::max()/(1024*1024)) {
+                throw std::invalid_argument("--ple-buffer-mib must be at least 1");
+            }
+            params.ple_buffer_size = (size_t) (mib * 1024*1024);
+        }
+    ));
     add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"

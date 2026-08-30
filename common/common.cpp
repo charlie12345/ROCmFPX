@@ -1550,6 +1550,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.tensor_split    = params.tensor_split;
     mparams.use_mmap        = params.use_mmap;
     mparams.use_direct_io   = params.use_direct_io;
+    mparams.ple_storage     = params.ple_storage;
+    mparams.ple_io_depth    = params.ple_io_depth;
+    mparams.ple_buffer_size  = params.ple_buffer_size;
     mparams.use_mlock       = params.use_mlock;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;

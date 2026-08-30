@@ -563,6 +563,9 @@ struct common_params {
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache
     bool use_direct_io     = false; // read from disk without buffering
+    enum llama_ple_storage_type ple_storage = LLAMA_PLE_STORAGE_OFF; // Qwen4Exp PLE storage mode
+    uint32_t ple_io_depth = 32;       // bounded outstanding PLE reads
+    size_t ple_buffer_size = 32ull*1024*1024; // bounded PLE staging buffer
     bool use_mlock         = false; // use mlock to keep model in memory
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
