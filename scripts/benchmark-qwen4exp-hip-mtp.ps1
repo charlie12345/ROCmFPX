@@ -109,8 +109,14 @@ function Stop-OwnedServer([System.Diagnostics.Process]$Process, [string]$Expecte
         return
     }
     $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($Process.Id)" -ErrorAction SilentlyContinue
+    $listener = @(Get-NetTCPConnection -State Listen -LocalPort $LocalPort -ErrorAction SilentlyContinue)
+    $expectedFullPath = [IO.Path]::GetFullPath($ExpectedExecutable)
+    $actualFullPath = if ($null -ne $cim) { [IO.Path]::GetFullPath([string]$cim.ExecutablePath) } else { '' }
+    $ownsListener = @($listener | Where-Object { $_.OwningProcess -eq $Process.Id }).Count -gt 0
+    $commandMatches = $null -ne $cim -and [string]$cim.CommandLine -match "--port\s+$LocalPort(\s|$)"
     if ($null -eq $cim -or $cim.Name -ne 'llama-server.exe' -or
-        $cim.ExecutablePath -ne $ExpectedExecutable -or $cim.CommandLine -notmatch "--port\s+$LocalPort(\s|$)") {
+        $actualFullPath -ine $expectedFullPath -or
+        (($listener.Count -gt 0 -and -not $ownsListener) -or ($listener.Count -eq 0 -and -not $commandMatches))) {
         throw "Refusing to stop unexpected PID $($Process.Id)."
     }
     Stop-Process -Id $Process.Id -ErrorAction Stop
@@ -284,8 +290,11 @@ function Invoke-BenchmarkMode([string]$Mode, [string]$Trial, [int[]]$Targets) {
         '--fit', 'off', '--no-webui', '--metrics', '--props', '--timeout', '36000',
         '--alias', $tag
     )
+    if ($Mode -ne 'existing-no-mtp') {
+        $args += @('--ple-ssd', 'direct', '--ple-io-depth', '32', '--ple-buffer-mib', '32')
+    }
     if ($Mode -eq 'new-mtp-q8-n3') {
-        $args += @('--spec-type', 'draft-mtp', '--spec-draft-model', $DraftModel, '--spec-draft-n-max', '3')
+        $args += @('--spec-type', 'draft-mtp', '--spec-draft-model', $DraftModel, '--spec-draft-n-max', '3', '--ctx-checkpoints', '32')
     }
     Save-Json (Join-Path $modeDir 'launch.json') ([ordered]@{ executable=$runtime; arguments=$args; timestamp=(Get-Date).ToString('o') })
     $process = $null
