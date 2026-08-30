@@ -1230,6 +1230,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (free == 0 && total == 0) {
                 ggml_backend_dev_memory(cpu_dev, &free, &total);
             }
+            // ROCm can report 0 free VRAM on discrete GPUs (e.g. 7900 XTX)
+            // even when memory is available. Use total as fallback to
+            // avoid NaN in the split normalization (causes vector::at OOB).
+            if (free == 0 && total > 0) {
+                free = total;
+            }
             splits[i] = free;
         }
     } else {
