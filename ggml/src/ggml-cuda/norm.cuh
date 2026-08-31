@@ -12,6 +12,12 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,
                                      ggml_tensor *               mul_tensor,
                                      ggml_tensor *               add_tensor);
+void ggml_cuda_op_rms_norm_fused_gate(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor *               rms_norm_node,
+        ggml_tensor *               mul_node,
+        ggml_tensor *               silu_node,
+        ggml_tensor *               final_mul_node);
 
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 

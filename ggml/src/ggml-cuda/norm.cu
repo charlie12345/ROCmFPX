@@ -150,6 +150,51 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+// Fused RMS_NORM + MUL(weights) + SILU(gate) + MUL(gate) kernel.
+// Computes: dst = RMS_norm(x) * weights * SILU(gate)
+// Saves 1 dispatch vs separate (RMS_NORM+MUL) and (SILU+MUL) fusions.
+template <int block_size>
+static __global__ void rms_norm_f32_gated(
+        const float * __restrict__ x,
+        const float * __restrict__ weights,
+        const float * __restrict__ gate,
+        float * __restrict__ dst,
+        const int     ncols,
+        const int64_t stride_row,
+        const int64_t stride_channel,
+        const int64_t stride_sample,
+        const float   eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x   += sample * stride_sample + channel * stride_channel + row * stride_row;
+    gate += sample * stride_sample + channel * stride_channel + row * stride_row;
+    dst += ((sample * nchannels + channel) * nrows + row) * ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float g = gate[col];
+        const float silu_g = g * (1.0f / (1.0f + expf(-g)));
+        dst[col] = scale * x[col] * weights[col] * silu_g;
+    }
+}
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
@@ -645,6 +690,65 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
     GGML_ASSERT(eps >= 0.0f);
 
     rms_norm_back_f32_cuda(grad_d, src0f_d, dst_d, ne00, nrows, eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_fused_gate(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor *               rms_norm_node,
+        ggml_tensor *               mul_node,
+        ggml_tensor *               silu_node,
+        ggml_tensor *               final_mul_node) {
+    // Fuses: RMS_NORM(x) * weights * SILU(gate) into a single dispatch.
+    // rms_norm_node: the RMS_NORM op node
+    // mul_node: MUL(rms_norm_output, weights) — weights is the norm weight
+    // silu_node: UNARY(SILU, gate)
+    // final_mul_node: MUL(normalized, gated_silu) — the output
+
+    const ggml_tensor * rms_norm_src = rms_norm_node->src[0];
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm_node->op_params, sizeof(float));
+
+    const float * x_d        = (const float *) rms_norm_src->data;
+    float *       dst_d      = (float *)       final_mul_node->data;
+    cudaStream_t  stream     = ctx.stream();
+
+    // Identify weights (the MUL src that is NOT the rms_norm output)
+    const float * weights_d = nullptr;
+    if (mul_node->src[0] == rms_norm_node) {
+        weights_d = (const float *) mul_node->src[1]->data;
+    } else {
+        weights_d = (const float *) mul_node->src[0]->data;
+    }
+
+    // Gate is the SILU input
+    const float * gate_d = (const float *) silu_node->src[0]->data;
+
+    GGML_ASSERT(rms_norm_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(rms_norm_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(final_mul_node->type == GGML_TYPE_F32);
+
+    const int64_t ne00 = rms_norm_src->ne[0];
+    const int64_t ne01 = rms_norm_src->ne[1];
+    const int64_t ne02 = rms_norm_src->ne[2];
+    const int64_t ne03 = rms_norm_src->ne[3];
+
+    const size_t ts0 = ggml_type_size(rms_norm_src->type);
+    GGML_ASSERT(rms_norm_src->nb[0] == ts0);
+    const int64_t s01 = rms_norm_src->nb[1] / ts0;
+    const int64_t s02 = rms_norm_src->nb[2] / ts0;
+    const int64_t s03 = rms_norm_src->nb[3] / ts0;
+
+    const dim3 blocks_num(ne01, ne02, ne03);
+
+    if (ne00 < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        rms_norm_f32_gated<256><<<blocks_num, block_dims, 32 * sizeof(float), stream>>>(
+            x_d, weights_d, gate_d, dst_d, (int)ne00, s01, s02, s03, eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        rms_norm_f32_gated<1024><<<blocks_num, block_dims, 32 * sizeof(float), stream>>>(
+            x_d, weights_d, gate_d, dst_d, (int)ne00, s01, s02, s03, eps);
+    }
 }
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
