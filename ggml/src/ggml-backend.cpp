@@ -255,6 +255,13 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+    if (offset + size > ggml_nbytes(tensor)) {
+        GGML_LOG_ERROR("tensor write OOB: name=%s type=%s ne=[%lld,%lld,%lld,%lld] nbytes=%zu offset=%zu size=%zu\n",
+            tensor->name ? tensor->name : "(null)",
+            ggml_type_name(tensor->type),
+            (long long)tensor->ne[0], (long long)tensor->ne[1], (long long)tensor->ne[2], (long long)tensor->ne[3],
+            ggml_nbytes(tensor), offset, size);
+    }
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
     if (backend->iface.set_tensor_async == NULL) {
@@ -269,6 +276,13 @@ void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_ten
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+    if (offset + size > ggml_nbytes(tensor)) {
+        GGML_LOG_ERROR("tensor read OOB: name=%s type=%s ne=[%lld,%lld,%lld,%lld] nbytes=%zu offset=%zu size=%zu\n",
+            tensor->name ? tensor->name : "(null)",
+            ggml_type_name(tensor->type),
+            (long long)tensor->ne[0], (long long)tensor->ne[1], (long long)tensor->ne[2], (long long)tensor->ne[3],
+            ggml_nbytes(tensor), offset, size);
+    }
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
 
     if (backend->iface.get_tensor_async == NULL) {

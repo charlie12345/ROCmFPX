@@ -1393,7 +1393,12 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
-        n_embd = llama_model_n_embd_pre_norm(llama_get_model(ctx_dft));
+        // h rows fed to the draft are the TARGET's pre-norm hidden states.
+        // The draft model's own n_embd_pre_norm (e.g. 1024 for gemma4-assistant)
+        // is NOT the h width: the draft graph's inp_h is n_embd_inp-wide (5376),
+        // so sizing batch.embd by the draft's pre_norm width caused OOB reads
+        // in set_inputs.
+        n_embd = llama_model_n_embd_pre_norm(llama_get_model(ctx_tgt));
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
         LOG_INF("%s: adding speculative implementation 'draft-mtp'\n", __func__);
@@ -1451,7 +1456,12 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         // Only Gemma4 assistants share the target KV cache. Embedded MTP
         // contexts also use ctx_other to read target hidden states, but keep
         // their own MTP-layer cache and must advance draft positions.
-        is_mem_shared = full_hidden_rows && llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        // A separate-model draft with multiple trained MTP heads must use the
+        // chain_heads mode (one head per draft step, own KV with seq_rm
+        // rollback), even though its context needs ctx_other to read target
+        // hidden states.
+        const bool same_model = llama_get_model(ctx_tgt) == llama_get_model(ctx_dft);
+        is_mem_shared = full_hidden_rows && same_model && llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         if (chain_heads) {

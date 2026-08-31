@@ -1,4 +1,4 @@
-#include "llama-graph.h"
+﻿#include "llama-graph.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -130,7 +130,7 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(ubatch->embd);
         GGML_ASSERT(n_embd == embd->ne[0]);
 
-        ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
     }
 
     if (ubatch->embd) {
@@ -1002,6 +1002,7 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_h_pre_norm  = nullptr; // PR #89: stale pointer caused use-after-free on rebuild
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);

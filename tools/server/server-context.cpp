@@ -11,6 +11,7 @@
 #include "diffusion.h"
 #include "llama.h"
 #include "../../src/llama-ext.h"
+#include "../../src/llama-model.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -917,6 +918,12 @@ private:
                 // ctor mis-detect is_mem_shared (gemma4-style shared KV) and disable
                 // chain_heads for multi-head Step MTP3 drafts, breaking draft KV resets.
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                if (model_dft->arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+                    // gemma4 MTP draft (GEMMA4_ASSISTANT) requires the target context:
+                    // its ctor throws without ctx_other and it reserves memory against
+                    // the target's hidden states.
+                    cparams.ctx_other = ctx_tgt;
+                }
             } else if (spec_eagle3 || spec_dflash || spec_dspark) {
                 cparams.ctx_other = ctx_tgt;
             }
