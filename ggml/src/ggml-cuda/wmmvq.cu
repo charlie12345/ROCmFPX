@@ -139,6 +139,100 @@ __global__ void wmmvq_q4_k_f16(
 #endif // defined(RDNA3)
 }
 
+// WMMA-based tg GEMV for Q4_0_ROCMI4 on RDNA3 (gfx1100).
+// ROCMI4 has simpler dequant than Q4_K: signed 4-bit nibbles (-8..7) with
+// a single UE4M3 scale per 32-element block. No sub-block scales or min.
+// Each block (QK=32) yields 2 WMMA tiles of 16 K-elements.
+__global__ void wmmvq_rocmi4_f16(
+        const char * __restrict__ vx,
+        const float * __restrict__ yf,
+        float * __restrict__ dst,
+        const int nrows, const int blocks_per_row, const int64_t row_bytes) {
+
+#if defined(RDNA3)
+    typedef __attribute__((ext_vector_type(16))) _Float16 halfx16_t;
+    typedef __attribute__((ext_vector_type(8)))  float   floatx8_t;
+
+    __shared__ float lds[WMMVQ_K_SPLIT][16];
+
+    const int lane = threadIdx.x % 32;
+    const int w    = threadIdx.x / 32;
+    const int row0 = blockIdx.x * 16;
+    if (row0 >= nrows) {
+        return;
+    }
+
+    const block_rocmi4 * lane_row =
+        (const block_rocmi4 *)(vx + (int64_t)(row0 + (lane % 16)) * row_bytes);
+
+    halfx16_t a;
+    halfx16_t b;
+    _Float16 * av = (_Float16 *) &a;
+    _Float16 * bv = (_Float16 *) &b;
+    floatx8_t c;
+    floatx8_t czero;
+
+    float res[8] = {};
+
+    for (int kb = w; kb < blocks_per_row; kb += WMMVQ_K_SPLIT) {
+        const block_rocmi4 * blk = lane_row + kb;
+        const float d = rocmfpx_ue4m3_to_fp32_finite(blk->e);
+
+        // 2 WMMA tiles of 16 elements per 32-element block
+        #pragma unroll
+        for (int tt = 0; tt < 2; ++tt) {
+            const int base = tt * 8; // 8 bytes = 16 nibbles per tile
+
+            #pragma unroll
+            for (int ele = 0; ele < 16; ++ele) {
+                const uint8_t byte = blk->qs[base + ele/2];
+                int qv = (ele % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+                // Sign-extend 4-bit to 8-bit signed
+                qv = (qv & 0x8) ? (qv | 0xF0) : qv;
+                const float act = yf[32*kb + tt*16 + ele];
+                av[ele] = __float2half((float)(int8_t)qv);
+                bv[ele] = __float2half(act);
+            }
+
+            czero = floatx8_t{};
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, czero);
+
+            #pragma unroll
+            for (int ele = 0; ele < 8; ++ele) {
+                res[ele] += d * c[ele];
+            }
+        }
+    }
+
+    // D[i][j]: i = 2*ele + lane/16, j = lane%16; all columns identical.
+    if (lane == 0) {
+        #pragma unroll
+        for (int ele = 0; ele < 8; ++ele) {
+            lds[w][2*ele] = res[ele];
+        }
+    } else if (lane == 16) {
+        #pragma unroll
+        for (int ele = 0; ele < 8; ++ele) {
+            lds[w][2*ele + 1] = res[ele];
+        }
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x < 16) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < WMMVQ_K_SPLIT; ++s) {
+            sum += lds[s][threadIdx.x];
+        }
+        dst[row0 + threadIdx.x] = sum;
+    }
+#else
+    GGML_UNUSED_VARS(vx, yf, dst, nrows, blocks_per_row, row_bytes);
+    NO_DEVICE_CODE;
+#endif // defined(RDNA3)
+}
+
 bool wmmvq_q4_k_eligible(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
     // Experimental path, off by default: measured at parity with the dp4a
@@ -189,4 +283,52 @@ void ggml_cuda_mul_mat_wmmvq_q4_k(
     wmmvq_q4_k_f16<<<warps, 32*WMMVQ_K_SPLIT, 0, stream>>>(
         (const char *) src0->data, (const float *) src1->data, (float *) dst->data,
         (int) src0->ne[1], (int) (src0->ne[0] / 256), src0->nb[1]);
+}
+
+bool wmmvq_rocmi4_eligible(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    static const bool enabled = getenv("GGML_CUDA_WMMVQ_ROCMI4") != nullptr;
+    if (!enabled) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_Q4_0_ROCMI4) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    if (fusion && (fusion->gate || fusion->x_bias || fusion->gate_bias)) {
+        return false;
+    }
+    if (src0->ne[0] % 256 != 0 || src0->ne[1] % 16 != 0) {
+        return false;
+    }
+    const size_t ts0 = ggml_type_size(src0->type);
+    if (src0->nb[0] != ts0 || src0->nb[1] != ts0 * (src0->ne[0]/QK_ROCMI4)) {
+        return false;
+    }
+    if (src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_mul_mat_wmmvq_rocmi4(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_Q4_0_ROCMI4);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int warps = (int) (src0->ne[1] / 16);
+    wmmvq_rocmi4_f16<<<warps, 32*WMMVQ_K_SPLIT, 0, stream>>>(
+        (const char *) src0->data, (const float *) src1->data, (float *) dst->data,
+        (int) src0->ne[1], (int) (src0->ne[0] / QK_ROCMI4), src0->nb[1]);
 }
