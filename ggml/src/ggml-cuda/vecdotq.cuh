@@ -594,7 +594,10 @@ static __device__ __forceinline__ float vec_dot_rocmi4_q8_1(
     int sumi = 0;
 #pragma unroll
     for (int l = 0; l < VDR_ROCMI4_Q8_1_MMVQ; ++l) {
-        const int aux_q4 = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
+        // Weights are streamed once per token (no reuse): nontemporal loads
+        // keep the 16B granules from evicting L1/L2 lines.
+        const int aux_q4 = __builtin_nontemporal_load(
+            (const int *) ((const uint8_t *) bq4->qs + 4*(iqs + l)));
         const int2 v = rocmi4_unpack_signed_nibbles(aux_q4);
         sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
