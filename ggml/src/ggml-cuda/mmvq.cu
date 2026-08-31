@@ -1593,6 +1593,103 @@ void ggml_cuda_mul_mat_vec_q(
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 }
 
+// Shared-quantize GEMV: quantize src1 once, then run GEMV for each (src0, dst)
+// pair against the shared Q8_1 buffer.  Bit-exact vs separate calls because
+// quantize_row_q8_1_cuda ignores type_src0 (GGML_UNUSED), so the Q8_1 values
+// are identical regardless of which weight matrix consumes them.
+void ggml_cuda_mul_mat_vec_q_shared(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src1,
+        const ggml_tensor * src0_a, ggml_tensor * dst_a,
+        const ggml_tensor * src0_b, ggml_tensor * dst_b,
+        const ggml_tensor * src0_c, ggml_tensor * dst_c) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst_a->type == GGML_TYPE_F32 && dst_b->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0_a->type == src0_b->type);
+    if (src0_c) {
+        GGML_ASSERT(dst_c->type == GGML_TYPE_F32);
+        GGML_ASSERT(src0_c->type == src0_a->type);
+    }
+
+    cudaStream_t stream = ctx.stream();
+
+    const size_t ts_src1 = ggml_type_size(src1->type);
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne13 = src1->ne[3];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+
+    // Quantize src1 once.
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(),
+        ne13 * ne12 * ne11 * ne10_padded * sizeof(block_q8_1) / QK8_1);
+    {
+        const float * src1_d = (const float *) src1->data;
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0_a->type,
+            ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    }
+
+    // Run GEMV for each (src0, dst) pair with the shared quantized src1.
+    auto run_gemv = [&](const ggml_tensor * src0, ggml_tensor * dst) {
+        const size_t ts_src0 = ggml_type_size(src0->type);
+        const size_t ts_dst  = ggml_type_size(dst->type);
+
+        if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            const size_t size_data  = ggml_nbytes(src0);
+            const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+            if (size_alloc > size_data) {
+                GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+                GGML_ASSERT(!src0->view_src);
+                CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+            }
+        }
+
+        const int64_t ne00 = src0->ne[0];
+        const int64_t ne01 = src0->ne[1];
+        const int64_t ne02 = src0->ne[2];
+        const int64_t ne03 = src0->ne[3];
+        const int64_t ne0  = dst->ne[0];
+        const int64_t ne1  = dst->ne[1];
+        const int64_t ne2  = dst->ne[2];
+        const int64_t ne3  = dst->ne[3];
+
+        const int64_t s01 = src0->nb[1] / ts_src0;
+        const int64_t s11 = ne10_padded / QK8_1;
+        const int64_t s1  = dst->nb[1] / ts_dst;
+        const int64_t s02 = src0->nb[2] / ts_src0;
+        const int64_t s2  = dst->nb[2] / ts_dst;
+        const int64_t s03 = src0->nb[3] / ts_src0;
+        const int64_t s3  = dst->nb[3] / ts_dst;
+
+        const int64_t s12 = ne11 * s11;
+        const int64_t s13 = ne12 * s12;
+
+        const int64_t ncols_dst          = ne1;
+        const int64_t nchannels_y        = ne12;
+        const int64_t nchannels_dst      = ne2;
+        const int64_t stride_col_dst     = s1;
+        const int64_t stride_col_y       = s11;
+        const int64_t stride_channel_dst = s2;
+        const int64_t stride_channel_y   = s12;
+
+        ggml_cuda_mm_fusion_args_device fusion_local{};
+
+        mul_mat_vec_q_switch_type(
+            src0->data, src0->type, src1_q8_1.get(), nullptr, fusion_local, (float *) dst->data, ne00,
+            ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+            ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+            ne03,              ne3,           s03, s13,              s3,               0, stream);
+    };
+
+    run_gemv(src0_a, dst_a);
+    run_gemv(src0_b, dst_b);
+    if (src0_c) run_gemv(src0_c, dst_c);
+}
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

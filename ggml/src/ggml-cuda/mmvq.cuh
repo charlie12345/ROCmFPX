@@ -10,6 +10,11 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+void ggml_cuda_mul_mat_vec_q_shared(
+    ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+    const ggml_tensor * src0_a, ggml_tensor * dst_a,
+    const ggml_tensor * src0_b, ggml_tensor * dst_b,
+    const ggml_tensor * src0_c, ggml_tensor * dst_c);
 
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,

@@ -4614,6 +4614,75 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // Shared-quantize fusion: consecutive MUL_MAT nodes (separated only by meta
+    // ops) that share the same F32 src1 activation.  Quantizes src1 once, then
+    // runs GEMV for each (src0, dst) pair.  Bit-exact vs separate calls because
+    // quantize_row_q8_1_cuda ignores type_src0 (GGML_UNUSED).  Placed after
+    // GLU/bias fusion so those patterns keep priority.
+    if (node->op == GGML_OP_MUL_MAT) {
+        ggml_tensor * src0_a = node->src[0];
+        ggml_tensor * src1   = node->src[1];
+
+        const bool bad_pad_a = ggml_backend_buffer_get_usage(src0_a->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                               ggml_nbytes(src0_a) != ggml_backend_buffer_get_alloc_size(src0_a->buffer, src0_a) &&
+                               src0_a->view_src;
+        const bool split_a   = ggml_backend_buft_is_cuda_split(src0_a->buffer->buft) ||
+                               ggml_backend_buft_is_cuda_split(src1->buffer->buft);
+
+        if (ggml_is_quantized(src0_a->type) && !bad_pad_a && !split_a &&
+            src1->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+            src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1) {
+
+            auto is_meta = [](ggml_op op) {
+                return op == GGML_OP_RESHAPE || op == GGML_OP_TRANSPOSE ||
+                       op == GGML_OP_VIEW    || op == GGML_OP_PERMUTE ||
+                       op == GGML_OP_NONE;
+            };
+
+            // Scan forward (skipping meta ops) for the next MUL_MAT with same src1.
+            int j = i + 1;
+            while (j < cgraph->n_nodes && is_meta(cgraph->nodes[j]->op)) j++;
+
+            if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_MUL_MAT &&
+                cgraph->nodes[j]->src[1] && cgraph->nodes[j]->src[1]->data == src1->data &&
+                cgraph->nodes[j]->src[1]->ne[0] == src1->ne[0] &&
+                cgraph->nodes[j]->type == GGML_TYPE_F32) {
+
+                ggml_tensor * src0_b = cgraph->nodes[j]->src[0];
+                ggml_tensor * dst_b  = cgraph->nodes[j];
+
+                const bool bad_pad_b = ggml_backend_buffer_get_usage(src0_b->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                       ggml_nbytes(src0_b) != ggml_backend_buffer_get_alloc_size(src0_b->buffer, src0_b) &&
+                                       src0_b->view_src;
+
+                if (!bad_pad_b && src0_b->type == src0_a->type) {
+                    // Try to find a third MUL_MAT sharing src1.
+                    int k = j + 1;
+                    while (k < cgraph->n_nodes && is_meta(cgraph->nodes[k]->op)) k++;
+
+                    const ggml_tensor * src0_c = nullptr;
+                    ggml_tensor * dst_c = nullptr;
+                    if (k < cgraph->n_nodes && cgraph->nodes[k]->op == GGML_OP_MUL_MAT &&
+                        cgraph->nodes[k]->src[1] && cgraph->nodes[k]->src[1]->data == src1->data &&
+                        cgraph->nodes[k]->src[1]->ne[0] == src1->ne[0] &&
+                        cgraph->nodes[k]->type == GGML_TYPE_F32 &&
+                        cgraph->nodes[k]->src[0]->type == src0_a->type) {
+                        const bool bad_pad_c = ggml_backend_buffer_get_usage(cgraph->nodes[k]->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                               ggml_nbytes(cgraph->nodes[k]->src[0]) != ggml_backend_buffer_get_alloc_size(cgraph->nodes[k]->src[0]->buffer, cgraph->nodes[k]->src[0]) &&
+                                               cgraph->nodes[k]->src[0]->view_src;
+                        if (!bad_pad_c) {
+                            src0_c = cgraph->nodes[k]->src[0];
+                            dst_c  = cgraph->nodes[k];
+                        }
+                    }
+
+                    ggml_cuda_mul_mat_vec_q_shared(*cuda_ctx, src1, src0_a, node, src0_b, dst_b, src0_c, dst_c);
+                    return src0_c ? (k - i) : (j - i);
+                }
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
