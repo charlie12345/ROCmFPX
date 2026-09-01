@@ -134,6 +134,7 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     ggml_tensor * inpL = cur;
+    ggml_tensor * inpL_full = nullptr;
 
     for (int il = 0; il < n_layer; ++il) {
         const bool is_swa = hparams.is_swa(il);
@@ -163,6 +164,10 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
                 Qcur, nullptr, nullptr, nullptr, hparams.f_attention_scale, il, il_src);
 
         if (il == n_layer - 1 && inp_out_ids) {
+            // keep the full-row (all ubatch tokens) residual for the MTP hidden
+            // state: t_h_pre_norm is extracted for all n_tokens, but inp_out_ids
+            // can select zero rows on draft decodes that request no logits
+            inpL_full = inpL;
             cur  = ggml_get_rows(ctx0, cur,  inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
@@ -202,7 +207,11 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     cb(logits, "result_output", -1);
     res->t_logits = logits;
 
-    ggml_tensor * h_next = ggml_mul_mat(ctx0, model.nextn_proj_post, cur);
+    // full-row (all ubatch tokens) source for the MTP hidden state, kept
+    // pre-get_rows; normalized like the original draft path
+    ggml_tensor * h_next_src = inpL_full ? inpL_full : inpL;
+    ggml_tensor * h_next_norm = build_norm(h_next_src, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    ggml_tensor * h_next = ggml_mul_mat(ctx0, model.nextn_proj_post, h_next_norm);
     cb(h_next, "h_nextn", -1);
     res->t_h_pre_norm = h_next;
 

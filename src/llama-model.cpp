@@ -1630,7 +1630,17 @@ const float * llama_model::tensor_split() const {
 }
 
 uint32_t llama_model::n_embd_pre_norm() const {
-    return arch == LLM_ARCH_DEEPSEEK4 ? hparams.n_embd * hparams.n_hc : hparams.n_embd;
+    if (arch == LLM_ARCH_DEEPSEEK4) {
+        return hparams.n_embd * hparams.n_hc;
+    }
+    // gemma4-assistant (MTP draft): the h rows it consumes/produces (inp_h,
+    // h_nextn) are backbone-wide (n_embd_inp, e.g. 5376), NOT its internal
+    // n_embd (1024). decode()'s ubatch embd sizing and the pre-norm extraction
+    // must use the backbone width or set_inputs reads past the ubatch buffer.
+    if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        return hparams.n_embd_inp();
+    }
+    return hparams.n_embd;
 }
 
 uint32_t llama_model::n_gpu_layers() const {

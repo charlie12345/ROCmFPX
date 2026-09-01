@@ -1,4 +1,4 @@
-#include "llama-context.h"
+﻿#include "llama-context.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -239,9 +239,10 @@ llama_context::llama_context(
 
     // With SPLIT_MODE_TENSOR both contexts share meta-backend buffers;
     // a reused graph holds dangling per-device refs after the peer rebuilds.
-    if (cparams.ctx_other != nullptr &&
-        (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ||
-         cparams.ctx_other->get_model().split_mode() == LLAMA_SPLIT_MODE_TENSOR)) {
+    // Also disable for any ctx_other pair (gemma4 MTP shared-KV): a graph cached
+    // from an empty-batch build (warmup/reserve) keeps ne[1]=0 on h_nextn-style
+    // outputs and later decodes read out of bounds.
+    if (cparams.ctx_other != nullptr) {
         graph_reuse_disable = true;
         cparams.ctx_other->graph_reuse_disable = true;
     }
