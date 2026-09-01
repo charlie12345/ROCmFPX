@@ -2,6 +2,7 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "wmmvq.h"
 
 #include <cstdint>
 
@@ -1496,6 +1497,11 @@ static void mul_mat_vec_q_switch_type(
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
+    // RDNA3 WMMA tg path for the tied Q4_K output head (single activation row).
+    if (!ids && wmmvq_q4_k_eligible(src0, src1, dst, fusion)) {
+        ggml_cuda_mul_mat_wmmvq_q4_k(ctx, src0, src1, dst);
+        return;
+    }
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -1598,13 +1604,11 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream) {
-
     const int64_t ne00 = src0->ne[0];
     const int64_t row_diff = row_high - row_low;
 
     const int64_t ne10 = src1->ne[0];
     GGML_ASSERT(ne10 % QK8_1 == 0);
-
     const int64_t ne0 = dst->ne[0];
 
     int id = ggml_cuda_get_device();

@@ -31,6 +31,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/wmmvq.h"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -2952,8 +2953,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_f16  = src0->type == GGML_TYPE_F16 && (src1->type == GGML_TYPE_F16 || !any_gpus_with_slow_fp16);
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
-
-    if (!split && use_mul_mat_vec_f) {
+    // RDNA3 WMMA tg path for the tied Q4_K output head (single activation row):
+    // the vocab-sized GEMV is compute-bound in the dp4a MMVQ kernel.
+    if (!split && use_mul_mat_vec_q && src1->type == GGML_TYPE_F32
+        && wmmvq_q4_k_eligible(src0, src1, dst, nullptr)) {
+        ggml_cuda_mul_mat_wmmvq_q4_k(ctx, src0, src1, dst);
+    } else if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
