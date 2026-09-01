@@ -886,8 +886,14 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         }
 #endif // defined(GGML_USE_HIP)
         CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        // Small per-token inputs (tokens, positions, scalars): the pageable
+        // source is staged by the runtime during the call, and stream order
+        // still places the DMA before any dependent kernel. Skipping the
+        // stream sync here removes several kfd round trips per decode token.
+        if (size > 4096) {
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        }
     }
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {

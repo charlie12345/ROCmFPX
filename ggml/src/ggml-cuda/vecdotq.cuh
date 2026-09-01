@@ -356,7 +356,7 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #endif
 
 #ifndef GGML_ROCMFP2_Q8_1_MMVQ_VDR
-#define GGML_ROCMFP2_Q8_1_MMVQ_VDR 4
+#define GGML_ROCMFP2_Q8_1_MMVQ_VDR 8
 #endif
 
 #ifndef GGML_ROCMFP6_Q8_1_MMVQ_VDR
@@ -413,7 +413,7 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #define VDR_ROCMFP8_Q8_1_MMVQ GGML_ROCMFP8_Q8_1_MMVQ_VDR
 
 #define VDR_ROCMFP3_Q8_1_MMQ 4
-#define VDR_ROCMFP2_Q8_1_MMQ 4
+#define VDR_ROCMFP2_Q8_1_MMQ 8
 #ifndef VDR_ROCMFP6_Q8_1_MMQ
 #define VDR_ROCMFP6_Q8_1_MMQ 4
 #endif
@@ -591,14 +591,19 @@ static __device__ __forceinline__ float vec_dot_rocmi4_q8_1(
     const block_rocmi4 * bq4 = (const block_rocmi4 *) vbq + kbx;
     const int * q8 = (const int *) bq8_1->qs + iqs;
 
-    int sumi = 0;
+    int sumi0 = 0;
+    int sumi1 = 0;
 #pragma unroll
     for (int l = 0; l < VDR_ROCMI4_Q8_1_MMVQ; ++l) {
-        const int aux_q4 = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
+        // Weights are streamed once per token (no reuse): nontemporal loads
+        // keep the 16B granules from evicting L1/L2 lines.
+        const int aux_q4 = __builtin_nontemporal_load(
+            (const int *) ((const uint8_t *) bq4->qs + 4*(iqs + l)));
         const int2 v = rocmi4_unpack_signed_nibbles(aux_q4);
-        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
-        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+        sumi0 = ggml_cuda_dp4a(v.x, q8[l + 0], sumi0);
+        sumi1 = ggml_cuda_dp4a(v.y, q8[l + 4], sumi1);
     }
+    const int sumi = sumi0 + sumi1;
 
     return __low2float(bq8_1->ds) * rocmfpx_ue4m3_to_fp32_finite(bq4->e) * sumi;
 }
@@ -1065,9 +1070,8 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
     return dm4f.x*sumf_d - dm4f.y*sumf_m;
 }
 
-#define VDR_Q6_K_Q8_1_MMVQ 1
+#define VDR_Q6_K_Q8_1_MMVQ 4
 #define VDR_Q6_K_Q8_1_MMQ  8
-
 // contiguous v/x values
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     const int & vl, const int & vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
@@ -1405,26 +1409,33 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
     const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
-
-    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
-    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
-    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
-
-    const int vl = get_int_b2(bq6_K->ql, iqs);
-    const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
-
-    const int8_t * scales = bq6_K->scales + scale_offset;
-
-    int    u[QR6_K];
-    float d8[QR6_K];
+    float sumf = 0.0f;
 
 #pragma unroll
-    for (int i = 0; i < QR6_K; ++i) {
-        u[i]  = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
-        d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
-    }
+    for (int l = 0; l < VDR_Q6_K_Q8_1_MMVQ; ++l) {
+        const int iqsl = iqs + l;
 
-    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+        const int bq8_offset = 2 * QR6_K * (iqsl / (QI6_K/2)) + (iqsl % (QI6_K/2)) / (QI6_K/4);
+        const int scale_offset = (QI6_K/4) * (iqsl / (QI6_K/2)) + (iqsl % (QI6_K/2)) / (QI6_K/8);
+        const int vh_shift = 2 * ((iqsl % (QI6_K/2)) / (QI6_K/4));
+
+        const int vl = get_int_b2(bq6_K->ql, iqsl);
+        const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqsl / (QI6_K/2)) + iqsl % (QI6_K/4)) >> vh_shift;
+
+        const int8_t * scales = bq6_K->scales + scale_offset;
+
+        int    u[QR6_K];
+        float d8[QR6_K];
+
+    #pragma unroll
+        for (int i = 0; i < QR6_K; ++i) {
+            u[i]  = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqsl % QI8_1);
+            d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
+        }
+
+        sumf += vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+    }
+    return sumf;
 }
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
