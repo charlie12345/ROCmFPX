@@ -224,6 +224,46 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+// Q6_K dequantize for get_rows: produces float2 for positions iqs and iqs+QK_K/2
+// Q6_K block: 256 elements, QR6_K=2, so iqs ranges 0..127
+static __device__ __forceinline__ void dequantize_q6_K(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_q6_K * x = (const block_q6_K *) vx;
+
+    const float d = x[ib].d;
+
+    const int il  = iqs & 31;    // 0..31
+    const int sub = iqs >> 5;    // 0..3 (iqs / 32)
+    const int is0 = il >> 4;     // 0 or 1 (il / 16)
+    const int is1 = is0 + 8;     // 8 or 9
+
+    const uint8_t * ql0 = x[ib].ql + il;
+    const uint8_t   qh0 = x[ib].qh[il];
+    const int8_t  * sc0 = x[ib].scales + is0;
+
+    const uint8_t * ql1 = x[ib].ql + 64 + il;
+    const uint8_t   qh1 = x[ib].qh[32 + il];
+    const int8_t  * sc1 = x[ib].scales + is1;
+
+    switch (sub) {
+        case 0:
+            v.x = d * sc0[0] * ((int8_t)((ql0[ 0] & 0xF) | (((qh0 >> 0) & 3) << 4)) - 32);
+            v.y = d * sc1[0] * ((int8_t)((ql1[ 0] & 0xF) | (((qh1 >> 0) & 3) << 4)) - 32);
+            break;
+        case 1:
+            v.x = d * sc0[2] * ((int8_t)((ql0[32] & 0xF) | (((qh0 >> 2) & 3) << 4)) - 32);
+            v.y = d * sc1[2] * ((int8_t)((ql1[32] & 0xF) | (((qh1 >> 2) & 3) << 4)) - 32);
+            break;
+        case 2:
+            v.x = d * sc0[4] * ((int8_t)((ql0[ 0] >> 4) | (((qh0 >> 4) & 3) << 4)) - 32);
+            v.y = d * sc1[4] * ((int8_t)((ql1[ 0] >> 4) | (((qh1 >> 4) & 3) << 4)) - 32);
+            break;
+        default:
+            v.x = d * sc0[6] * ((int8_t)((ql0[32] >> 4) | (((qh0 >> 6) & 3) << 4)) - 32);
+            v.y = d * sc1[6] * ((int8_t)((ql1[32] >> 4) | (((qh1 >> 6) & 3) << 4)) - 32);
+            break;
+    }
+}
+
 // ============================================================
 // TurboQuant GPU dequantize device functions
 // ============================================================
