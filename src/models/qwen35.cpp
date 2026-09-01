@@ -268,26 +268,31 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
+    // Issue wq, wk, wv matmuls consecutively (all share cur as activation)
+    // so the CUDA shared-quantize fusion can quantize once for all three.
+    // Must call ggml_build_forward_expand to control graph node order
+    // (DFS would otherwise interleave norm/rope ops between matmuls).
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+    ggml_build_forward_expand(gf, Qcur_full);
     cb(Qcur_full, "Qcur_full", il);
 
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    ggml_build_forward_expand(gf, Kcur);
+    cb(Kcur, "Kcur", il);
+
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    ggml_build_forward_expand(gf, Vcur);
+    cb(Vcur, "Vcur", il);
+
+    // Apply Q normalization
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
     cb(Qcur, "Qcur_reshaped", il);
-
-    // Apply Q normalization
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
-
-    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
-    cb(Kcur, "Kcur", il);
-
-    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
-    cb(Vcur, "Vcur", il);
 
     // Apply K normalization
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
@@ -358,19 +363,26 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
-    // Input projections
+    // Input projections — issue all matmuls sharing cur consecutively
+    // so the CUDA shared-quantize fusion can quantize once for all of them.
+    // Must call ggml_build_forward_expand to control graph node order.
     auto qkvz = build_qkvz(cur, il);
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
+    ggml_build_forward_expand(gf, qkv_mixed);
+    ggml_build_forward_expand(gf, z);
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    ggml_tensor * beta  = build_lora_mm(model.layers[il].ssm_beta,  cur, model.layers[il].ssm_beta_s);
+    ggml_build_forward_expand(gf, beta);
+    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    ggml_build_forward_expand(gf, alpha);
+
+    // Now process beta and alpha outputs
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
-
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
@@ -380,7 +392,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
     cb(gate, "gate", il);
-
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
@@ -460,16 +471,15 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // Apply gated normalization: self.norm(core_attn_out, z)
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // Final reshape: flatten to 2D so ssm_out matmul output is already 2D.
+    // This eliminates the post-matmul reshape, allowing MUL_MAT+ADD bias fusion
+    // for the residual connection.
+    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
     cb(final_output, "final_output", il);
 
     // Output projection
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
     cb(cur, "linear_attn_out", il);
-
-    // Reshape back to original dimensions
-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
 
     return cur;
 }

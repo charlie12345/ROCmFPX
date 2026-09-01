@@ -750,7 +750,7 @@ static constexpr int calc_moe_mmvq_rows_per_block() {
 }
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 4)
 static __global__ void mul_mat_vec_q(
         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids, const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1593,6 +1593,109 @@ void ggml_cuda_mul_mat_vec_q(
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 }
 
+// Shared-quantize GEMV: quantize src1 once, then run GEMV for each (src0, dst)
+// pair against the shared Q8_1 buffer.  Bit-exact vs separate calls because
+// quantize_row_q8_1_cuda ignores type_src0 (GGML_UNUSED), so the Q8_1 values
+// are identical regardless of which weight matrix consumes them.
+void ggml_cuda_mul_mat_vec_q_shared(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src1,
+        const ggml_tensor * src0_a, ggml_tensor * dst_a,
+        const ggml_tensor * src0_b, ggml_tensor * dst_b,
+        const ggml_tensor * src0_c, ggml_tensor * dst_c,
+        const ggml_tensor * src0_d, ggml_tensor * dst_d) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst_a->type == GGML_TYPE_F32 && dst_b->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0_a->type == src0_b->type);
+    if (src0_c) {
+        GGML_ASSERT(dst_c->type == GGML_TYPE_F32);
+        GGML_ASSERT(src0_c->type == src0_a->type);
+    }
+    if (src0_d) {
+        GGML_ASSERT(dst_d->type == GGML_TYPE_F32);
+        GGML_ASSERT(src0_d->type == src0_a->type);
+    }
+
+    cudaStream_t stream = ctx.stream();
+
+    const size_t ts_src1 = ggml_type_size(src1->type);
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne13 = src1->ne[3];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+
+    // Quantize src1 once.
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(),
+        ne13 * ne12 * ne11 * ne10_padded * sizeof(block_q8_1) / QK8_1);
+    {
+        const float * src1_d = (const float *) src1->data;
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0_a->type,
+            ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    }
+
+    // Run GEMV for each (src0, dst) pair with the shared quantized src1.
+    auto run_gemv = [&](const ggml_tensor * src0, ggml_tensor * dst) {
+        const size_t ts_src0 = ggml_type_size(src0->type);
+        const size_t ts_dst  = ggml_type_size(dst->type);
+
+        if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            const size_t size_data  = ggml_nbytes(src0);
+            const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+            if (size_alloc > size_data) {
+                GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+                GGML_ASSERT(!src0->view_src);
+                CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+            }
+        }
+
+        const int64_t ne00 = src0->ne[0];
+        const int64_t ne01 = src0->ne[1];
+        const int64_t ne02 = src0->ne[2];
+        const int64_t ne03 = src0->ne[3];
+        const int64_t ne0  = dst->ne[0];
+        const int64_t ne1  = dst->ne[1];
+        const int64_t ne2  = dst->ne[2];
+        const int64_t ne3  = dst->ne[3];
+
+        const int64_t s01 = src0->nb[1] / ts_src0;
+        const int64_t s11 = ne10_padded / QK8_1;
+        const int64_t s1  = dst->nb[1] / ts_dst;
+        const int64_t s02 = src0->nb[2] / ts_src0;
+        const int64_t s2  = dst->nb[2] / ts_dst;
+        const int64_t s03 = src0->nb[3] / ts_src0;
+        const int64_t s3  = dst->nb[3] / ts_dst;
+
+        const int64_t s12 = ne11 * s11;
+        const int64_t s13 = ne12 * s12;
+
+        const int64_t ncols_dst          = ne1;
+        const int64_t nchannels_y        = ne12;
+        const int64_t nchannels_dst      = ne2;
+        const int64_t stride_col_dst     = s1;
+        const int64_t stride_col_y       = s11;
+        const int64_t stride_channel_dst = s2;
+        const int64_t stride_channel_y   = s12;
+
+        ggml_cuda_mm_fusion_args_device fusion_local{};
+
+        mul_mat_vec_q_switch_type(
+            src0->data, src0->type, src1_q8_1.get(), nullptr, fusion_local, (float *) dst->data, ne00,
+            ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+            ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+            ne03,              ne3,           s03, s13,              s3,               0, stream);
+    };
+
+    run_gemv(src0_a, dst_a);
+    run_gemv(src0_b, dst_b);
+    if (src0_c) run_gemv(src0_c, dst_c);
+    if (src0_d) run_gemv(src0_d, dst_d);
+}
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -1622,4 +1725,129 @@ void ggml_cuda_op_mul_mat_vec_q(
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+}
+
+// F32 activation fusion kernel for Q4_0_ROCMI4.
+// Quantizes F32 activation to q8_1 in shared memory, then runs MMVQ.
+// Eliminates the separate quantize_q8_1 kernel dispatch (~210 dispatches/token).
+__launch_bounds__(32, 4)
+static __global__ void mul_mat_vec_q_rocmi4_f32_act(
+        const void * __restrict__ vx,
+        const float * __restrict__ vy_f32,
+        float * __restrict__ dst,
+        const uint32_t ncols_x,
+        const uint32_t nrows_x,
+        const uint32_t stride_row_x) {
+
+    constexpr int qk  = QK_ROCMI4;  // 32
+    constexpr int qi  = QI_ROCMI4;  // 4
+    constexpr int vdr = VDR_ROCMI4_Q8_1_MMVQ;  // 2
+    constexpr int warp_size = 32;
+    constexpr int blocks_per_iter = vdr * warp_size / qi;  // 16
+
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    const int blocks_per_row_x = ncols_x / qk;
+
+    // Shared memory for q8_1 activation
+    extern __shared__ char smem[];
+    block_q8_1 * y_smem = (block_q8_1 *) smem;
+    const int n_blocks_y = ncols_x / QK8_1;
+
+    // Cooperative quantization: F32 → q8_1 in shared memory
+    // Uses float4 vectorized loads + register caching to reduce memory traffic.
+    for (int b = tid; b < n_blocks_y; b += warp_size) {
+        const float4 * src4 = (const float4 *) (vy_f32 + b * QK8_1);
+
+        float4 vals[QK8_1 / 4];
+        float max_abs = 0.0f;
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < QK8_1 / 4; ++i) {
+            vals[i] = src4[i];
+            max_abs = fmaxf(max_abs, fmaxf(fmaxf(fabsf(vals[i].x), fabsf(vals[i].y)),
+                                            fmaxf(fabsf(vals[i].z), fabsf(vals[i].w))));
+        }
+
+        const float scale = max_abs / 127.0f;
+        const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+
+        int8_t * qs = y_smem[b].qs;
+#pragma unroll
+        for (int i = 0; i < QK8_1 / 4; ++i) {
+            qs[4*i + 0] = (int8_t)max(-128, min(127, __float2int_rn(vals[i].x * inv_scale)));
+            qs[4*i + 1] = (int8_t)max(-128, min(127, __float2int_rn(vals[i].y * inv_scale)));
+            qs[4*i + 2] = (int8_t)max(-128, min(127, __float2int_rn(vals[i].z * inv_scale)));
+            qs[4*i + 3] = (int8_t)max(-128, min(127, __float2int_rn(vals[i].w * inv_scale)));
+            sum += vals[i].x + vals[i].y + vals[i].z + vals[i].w;
+        }
+
+        y_smem[b].ds = make_half2(scale, sum);
+    }
+    __syncthreads();
+
+    // Main MMVQ loop with dual-accumulator DP4A
+    float tmp = 0.0f;
+    const block_rocmi4 * bq4_base = (const block_rocmi4 *) vx;
+
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx;  // qk/QK8_1 = 1 for ROCMI4
+        const int kqs = vdr * (tid % (qi/vdr));
+
+        const block_rocmi4 * bq4 = bq4_base + row * (int)stride_row_x + kbx;
+        const block_q8_1 * bq8 = &y_smem[kby];
+        const int * q8 = (const int *) bq8->qs + kqs;
+
+        int sumi0 = 0;
+        int sumi1 = 0;
+#pragma unroll
+        for (int l = 0; l < vdr; ++l) {
+            const int aux_q4 = __builtin_nontemporal_load(
+                (const int *) ((const uint8_t *) bq4->qs + 4*(kqs + l)));
+            const int2 v = rocmi4_unpack_signed_nibbles(aux_q4);
+            sumi0 = ggml_cuda_dp4a(v.x, q8[l + 0], sumi0);
+            sumi1 = ggml_cuda_dp4a(v.y, q8[l + 4], sumi1);
+        }
+        const int sumi = sumi0 + sumi1;
+
+        tmp += __low2float(bq8->ds) * rocmfpx_ue4m3_to_fp32_finite(bq4->e) * sumi;
+    }
+
+    // Warp reduce
+    tmp = warp_reduce_sum<warp_size>(tmp);
+
+    // Write result
+    if (tid == 0) {
+        dst[row] = tmp;
+    }
+}
+
+void ggml_cuda_mul_mat_vec_q_rocmi4_f32_act(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t s01  = src0->nb[1] / ggml_type_size(src0->type);
+
+    const float * src1_d = (const float *) src1->data;
+    float * dst_d = (float *) dst->data;
+
+    const int n_blocks_y = ne00 / QK8_1;
+    const size_t smem_size = n_blocks_y * sizeof(block_q8_1);
+
+    // Clear padding if needed
+    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        const size_t size_data  = ggml_nbytes(src0);
+        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+        if (size_alloc > size_data) {
+            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+            GGML_ASSERT(!src0->view_src);
+            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+        }
+    }
+
+    mul_mat_vec_q_rocmi4_f32_act<<<(unsigned int)ne01, 32, smem_size, stream>>>(
+        src0->data, src1_d, dst_d, (uint32_t)ne00, (uint32_t)ne01, (uint32_t)s01);
 }
