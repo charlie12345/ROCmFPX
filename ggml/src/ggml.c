@@ -3979,9 +3979,9 @@ struct ggml_tensor * ggml_get_rows(
     GGML_ASSERT(b->ne[3] == 1);
     GGML_ASSERT(b->type == GGML_TYPE_I32);
 
-    // TODO: implement non F32 return
+    // Preserve F16 source type for state buffers; default to F32 for other types
     enum ggml_type type = GGML_TYPE_F32;
-    if (a->type == GGML_TYPE_I32) {
+    if (a->type == GGML_TYPE_I32 || a->type == GGML_TYPE_F16) {
         type = a->type;
     }
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
@@ -6528,7 +6528,7 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(v->type == GGML_TYPE_F32);
     GGML_ASSERT(g->type == GGML_TYPE_F32);
     GGML_ASSERT(beta->type == GGML_TYPE_F32);
-    GGML_ASSERT(state->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32 || state->type == GGML_TYPE_F16);
 
     const int64_t S_v      = v->ne[0];
     const int64_t H        = v->ne[1];
