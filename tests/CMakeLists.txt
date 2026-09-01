@@ -116,6 +116,12 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+if (WIN32 AND NOT BUILD_SHARED_LIBS)
+    llama_build(test-mmap-windows-lazy.cpp)
+    target_include_directories(test-mmap-windows-lazy PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_test(test-mmap-windows-lazy)
+endif()
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 

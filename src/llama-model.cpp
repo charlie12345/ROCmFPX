@@ -1638,11 +1638,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
 #ifdef _WIN32
-    if (params.ple_storage == LLAMA_PLE_STORAGE_DIRECT) {
+    if (params.ple_storage == LLAMA_PLE_STORAGE_DIRECT ||
+        ml.has_lazy_tensor_ranges()) {
         if (!EmptyWorkingSet(GetCurrentProcess())) {
-            LLAMA_LOG_WARN("PLE direct pager: EmptyWorkingSet failed with error %lu\n", GetLastError());
+            LLAMA_LOG_WARN("PLE pager: EmptyWorkingSet failed with error %lu\n", GetLastError());
         } else {
-            LLAMA_LOG_INFO("PLE direct pager: loading-page trim completed\n");
+            LLAMA_LOG_INFO("PLE pager: loading-page trim completed\n");
         }
     }
 #endif
@@ -2380,6 +2381,7 @@ llama_model_params llama_model_default_params() {
         /*.ple_storage                 =*/ LLAMA_PLE_STORAGE_OFF,
         /*.ple_io_depth                =*/ 32,
         /*.ple_buffer_size             =*/ 32ull*1024*1024,
+        /*.tensor_read_lazy            =*/ LLAMA_TENSOR_READ_LAZY_OFF,
     };
 
     return result;
@@ -2793,7 +2795,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_DUPLICATED     (llama_model_loader::TENSOR_DUPLICATED),
     TENSOR_NOT_REQUIRED   (llama_model_loader::TENSOR_NOT_REQUIRED),
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
-    TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL) {}
+    TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
+    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);

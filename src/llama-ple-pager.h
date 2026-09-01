@@ -76,6 +76,10 @@ public:
             uint32_t io_depth,
             size_t buffer_bytes);
 
+    static std::unique_ptr<llama_ple_pager> open_mmap_from_file_id(
+            int file_id,
+            const llama_ple_source & source);
+
     ~llama_ple_pager();
 
     llama_ple_pager(const llama_ple_pager &) = delete;

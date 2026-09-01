@@ -2352,6 +2352,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--tensor-read-lazy"}, "off|auto|on",
+        "leave architecture-marked large tensors file-backed and demand-paged (requires mmap; default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_OFF;
+            } else if (value == "auto") {
+                params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO;
+            } else if (value == "on") {
+                params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_ON;
+            } else {
+                throw std::invalid_argument("invalid value for --tensor-read-lazy (expected off, auto, or on)");
+            }
+        }
+    ).set_env("LLAMA_ARG_TENSOR_READ_LAZY"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

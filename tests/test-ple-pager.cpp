@@ -141,6 +141,7 @@ int main() {
             4096,
         };
         auto pager = llama_ple_pager::open_from_file_id(fd, test_source, 4, 8192);
+        auto mmap_pager = llama_ple_pager::open_mmap_from_file_id(fd, test_source);
         _close(fd);
 
         const std::vector<int32_t> requested = {0, 24, 24, 25};
@@ -167,7 +168,23 @@ int main() {
         assert(stats.reads > 0);
         assert(stats.failures == 0);
 
-        DeleteFileW(path.c_str());
+        std::fill(output.begin(), output.end(), 0.0f);
+        mmap_pager->read_rows(requested, output.data(), output.size());
+        for (size_t n = 0; n < requested.size(); ++n) {
+            const auto * expected = expected_rows.data() + (size_t) requested[n] * row_elements;
+            for (size_t i = 0; i < row_elements; ++i) {
+                assert(std::abs(output[n * row_elements + i] - expected[i]) < 1e-6f);
+            }
+        }
+        const auto mmap_stats = mmap_pager->snapshot_stats();
+        assert(mmap_stats.rows == requested.size());
+        assert(mmap_stats.bytes == requested.size() * row_bytes);
+        assert(mmap_stats.reads == requested.size());
+        assert(mmap_stats.failures == 0);
+
+        mmap_pager.reset();
+        pager.reset();
+        assert(DeleteFileW(path.c_str()));
     }
 #endif
 

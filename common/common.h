@@ -566,6 +566,7 @@ struct common_params {
     enum llama_ple_storage_type ple_storage = LLAMA_PLE_STORAGE_OFF; // Qwen4Exp PLE storage mode
     uint32_t ple_io_depth = 32;       // bounded outstanding PLE reads
     size_t ple_buffer_size = 32ull*1024*1024; // bounded PLE staging buffer
+    enum llama_tensor_read_lazy tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_OFF; // demand-page marked tensors
     bool use_mlock         = false; // use mlock to keep model in memory
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation

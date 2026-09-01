@@ -158,6 +158,9 @@ a.out.*
 
 # AGENTS
 
+# Local benchmark output
+/benchmark-results/
+
 AGENTS.local.md
 .pi/SYSTEM.md
 

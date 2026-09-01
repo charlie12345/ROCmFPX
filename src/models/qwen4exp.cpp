@@ -127,12 +127,19 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         const auto * ple_w = ml.get_weight(ple_name.c_str());
         GGML_ASSERT(ple_w != nullptr && "qwen4exp is missing the PLE n-gram table");
         const int64_t ple_rows = ple_w->tensor->ne[1];
-        if (params.ple_storage == LLAMA_PLE_STORAGE_DIRECT) {
+        constexpr size_t auto_lazy_min_size = 4ull * 1024 * 1024 * 1024;
+        const bool ple_mmap_lazy = params.tensor_read_lazy == LLAMA_TENSOR_READ_LAZY_ON ||
+            (params.tensor_read_lazy == LLAMA_TENSOR_READ_LAZY_AUTO &&
+             ggml_nbytes(ple_w->tensor) > auto_lazy_min_size);
+        if (params.ple_storage == LLAMA_PLE_STORAGE_DIRECT || ple_mmap_lazy) {
 #ifndef _WIN32
-            throw std::runtime_error("Qwen4Exp --ple-ssd direct is only supported on Windows");
+            throw std::runtime_error("Qwen4Exp PLE pager is only supported on Windows");
 #else
-            if (params.use_mlock) {
+            if (params.ple_storage == LLAMA_PLE_STORAGE_DIRECT && params.use_mlock) {
                 throw std::runtime_error("Qwen4Exp direct PLE cannot be combined with --mlock");
+            }
+            if (ple_mmap_lazy && !params.use_mmap) {
+                throw std::runtime_error("Qwen4Exp --tensor-read-lazy requires mmap");
             }
             const auto tensor_source = ml.get_tensor_source(ple_name.c_str());
             if (tensor_source.type != GGML_TYPE_Q8_0 || tensor_source.ne0 != hparams.ple_head_dim ||
@@ -153,16 +160,24 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                 row_bytes,
                 4096,
             };
-            ple_pager = llama_ple_pager::open_from_file_id(
-                tensor_source.file_id, ple_source, params.ple_io_depth, params.ple_buffer_size);
-            LLAMA_LOG_WARN("PLE direct pager active: alignment=%" PRIu64 " io_depth=%u budget_mib=%zu\n",
-                ple_source.alignment, params.ple_io_depth, params.ple_buffer_size/(1024*1024));
+            if (params.ple_storage == LLAMA_PLE_STORAGE_DIRECT) {
+                ple_pager = llama_ple_pager::open_from_file_id(
+                    tensor_source.file_id, ple_source, params.ple_io_depth, params.ple_buffer_size);
+                LLAMA_LOG_WARN("PLE direct pager active: alignment=%" PRIu64 " io_depth=%u budget_mib=%zu\n",
+                    ple_source.alignment, params.ple_io_depth, params.ple_buffer_size/(1024*1024));
+            } else {
+                ple_pager = llama_ple_pager::open_mmap_from_file_id(tensor_source.file_id, ple_source);
+                LLAMA_LOG_WARN("PLE mmap pager active: rows=%" PRIu64 " row_bytes=%" PRIu64
+                               " tensor_mib=%" PRIu64 "\n",
+                    ple_source.row_count, ple_source.row_bytes, ple_source.tensor_bytes/(1024*1024));
+            }
             per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                               { hparams.ple_head_dim, ple_rows }, TENSOR_SKIP);
+                                               { hparams.ple_head_dim, ple_rows },
+                                               TENSOR_SKIP | (ple_mmap_lazy ? TENSOR_READ_LAZY : 0));
 #endif
         } else {
             per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                               { hparams.ple_head_dim, ple_rows }, 0);
+                                               { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
         }
     }
 
@@ -1227,7 +1242,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         if (!pmodel.ple_stats_logged) {
             const auto stats = pmodel.ple_pager->snapshot_stats();
             LLAMA_LOG_WARN(
-                "PLE direct pager stats: rows=%" PRIu64 " sectors=%" PRIu64 " dedup=%" PRIu64
+                "PLE pager stats: rows=%" PRIu64 " sectors=%" PRIu64 " dedup=%" PRIu64
                 " bytes=%" PRIu64 " reads=%" PRIu64 " failures=%" PRIu64
                 " read_us=%" PRIu64 " max_read_us=%" PRIu64 " dequant_us=%" PRIu64
                 " peak_arena_bytes=%" PRIu64 "\n",

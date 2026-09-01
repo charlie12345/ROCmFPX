@@ -19,6 +19,27 @@
 #endif
 #include <windows.h>
 #include <io.h>
+
+static LONG llama_ple_mmap_exception_filter(DWORD code, DWORD * captured_code) noexcept {
+    if (code == EXCEPTION_IN_PAGE_ERROR) {
+        *captured_code = code;
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static bool llama_ple_copy_mapped(
+        void * destination,
+        const void * source,
+        size_t bytes,
+        DWORD * captured_code) noexcept {
+    __try {
+        std::memcpy(destination, source, bytes);
+        return true;
+    } __except (llama_ple_mmap_exception_filter(GetExceptionCode(), captured_code)) {
+        return false;
+    }
+}
 #endif
 
 static bool checked_add_u64(uint64_t a, uint64_t b, uint64_t & out) {
@@ -193,6 +214,8 @@ struct llama_ple_pager::impl {
     uint64_t file_bytes = 0;
     uint8_t * arena = nullptr;
     std::vector<lane> lanes;
+    HANDLE mapping = nullptr;
+    const uint8_t * mapped_base = nullptr;
 
     static std::runtime_error win_error(const char * operation, DWORD error = GetLastError()) {
         return std::runtime_error(std::string(operation) + ": " + std::system_category().message((int) error));
@@ -223,9 +246,47 @@ struct llama_ple_pager::impl {
         if (arena != nullptr) {
             VirtualFree(arena, 0, MEM_RELEASE);
         }
+        if (mapped_base != nullptr) {
+            UnmapViewOfFile(mapped_base);
+        }
+        if (mapping != nullptr) {
+            CloseHandle(mapping);
+        }
         if (file != INVALID_HANDLE_VALUE) {
             CloseHandle(file);
         }
+    }
+
+    bool is_mapped() const {
+        return mapped_base != nullptr;
+    }
+
+    void read_mapped_rows(const std::vector<int32_t> & rows, uint8_t * compact) {
+        const auto read_start = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const uint64_t row_offset = source.tensor_offset + (uint64_t) rows[i] * source.row_bytes;
+            DWORD exception_code = ERROR_SUCCESS;
+            if (!llama_ple_copy_mapped(
+                    compact + i * (size_t) source.row_bytes,
+                    mapped_base + row_offset,
+                    (size_t) source.row_bytes,
+                    &exception_code)) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    ++stats.failures;
+                }
+                throw std::runtime_error(
+                    "PLE mmap page read failed with Windows exception " +
+                    std::to_string((unsigned long) exception_code));
+            }
+        }
+        const auto read_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - read_start).count();
+        std::lock_guard<std::mutex> lock(mutex);
+        stats.bytes += rows.size() * source.row_bytes;
+        stats.reads += rows.size();
+        stats.read_us += read_us;
+        stats.max_read_us = std::max(stats.max_read_us, read_us);
     }
 
     void probe() {
@@ -425,6 +486,53 @@ std::unique_ptr<llama_ple_pager> llama_ple_pager::open_from_file_id(
 #endif
 }
 
+std::unique_ptr<llama_ple_pager> llama_ple_pager::open_mmap_from_file_id(
+        int file_id,
+        const llama_ple_source & source) {
+#ifdef _WIN32
+    if (file_id < 0 || source.row_bytes == 0 || source.row_elements == 0 || source.row_count == 0) {
+        throw std::invalid_argument("invalid PLE mmap pager open parameters");
+    }
+
+    const intptr_t raw_handle = _get_osfhandle(file_id);
+    if (raw_handle == -1) {
+        throw std::runtime_error("PLE mmap source file descriptor has no Windows handle");
+    }
+
+    auto pager_impl = std::make_unique<impl>();
+    pager_impl->source = source;
+    pager_impl->buffer_bytes = std::max<size_t>((size_t) source.row_bytes, 4096);
+
+    const HANDLE source_handle = (HANDLE) raw_handle;
+    LARGE_INTEGER file_size{};
+    if (!GetFileSizeEx(source_handle, &file_size) || file_size.QuadPart < 0) {
+        throw impl::win_error("PLE mmap source size query");
+    }
+    pager_impl->file_bytes = (uint64_t) file_size.QuadPart;
+    uint64_t tensor_end = 0;
+    if (!checked_add_u64(source.tensor_offset, source.tensor_bytes, tensor_end) ||
+        tensor_end > pager_impl->file_bytes) {
+        throw std::runtime_error("PLE mmap tensor extent is outside the source file");
+    }
+
+    pager_impl->mapping = CreateFileMappingW(source_handle, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (pager_impl->mapping == nullptr) {
+        throw impl::win_error("PLE mmap file mapping creation");
+    }
+    pager_impl->mapped_base = (const uint8_t *) MapViewOfFile(
+        pager_impl->mapping, FILE_MAP_READ, 0, 0, 0);
+    if (pager_impl->mapped_base == nullptr) {
+        throw impl::win_error("PLE mmap view creation");
+    }
+
+    return std::unique_ptr<llama_ple_pager>(new llama_ple_pager(std::move(pager_impl)));
+#else
+    GGML_UNUSED(file_id);
+    GGML_UNUSED(source);
+    throw std::runtime_error("PLE mmap pager is only available on Windows");
+#endif
+}
+
 void llama_ple_pager::read_rows(const std::vector<int32_t> & rows, float * output, size_t output_values) {
     if (rows.empty()) {
         if (output_values != 0) {
@@ -444,7 +552,11 @@ void llama_ple_pager::read_rows(const std::vector<int32_t> & rows, float * outpu
     const auto plan = llama_ple_plan_rows(pimpl_->source, rows, pimpl_->buffer_bytes);
 #ifdef _WIN32
     std::vector<uint8_t> compact(rows.size() * (size_t) pimpl_->source.row_bytes);
-    pimpl_->read_plan(plan, compact.data());
+    if (pimpl_->is_mapped()) {
+        pimpl_->read_mapped_rows(rows, compact.data());
+    } else {
+        pimpl_->read_plan(plan, compact.data());
+    }
     const auto dequant_start = std::chrono::steady_clock::now();
     llama_ple_dequantize_q8_0_rows(compact.data(), rows.size(),
         (size_t) pimpl_->source.row_bytes, (size_t) pimpl_->source.row_elements,
