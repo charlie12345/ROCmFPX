@@ -33,18 +33,21 @@ requires `--mmap` and activates the mmap-backed PLE path in this branch.
 ## Windows memory behavior
 
 `--tensor-read-lazy on` delays tensor access and avoids eagerly prefetching the
-large PLE tensor. Windows can still retain file-mapped pages in the process
-working set or standby cache after they are touched. Therefore the tested
-Windows deployment also applies a hard working-set limit after the server is
-healthy:
+large PLE tensor. After model loading, this branch automatically performs a
+one-time `EmptyWorkingSet` trim; the log should contain
+`PLE pager: loading-page trim completed`. Windows can still retain file-mapped
+pages in the process working set or standby cache after they are touched.
+
+If the one-time trim is not enough, or a persistent hard working-set ceiling is
+required, apply the optional helper after the server is healthy:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\set-windows-working-set.ps1 -Port 8080 -MaxGiB 8
 ```
 
-The limit is per process and must be applied again after a server restart. It
-reduces resident process pages; it does not reduce GPU/UMA committed memory and
-does not provide a strict SSD-only guarantee. A lower limit can increase PLE
+The hard limit is per process and must be applied again after a server restart.
+It reduces resident process pages; it does not reduce committed GPU/UMA memory
+and does not provide a strict SSD-only guarantee. A lower limit can increase PLE
 page faults and reduce prompt-processing speed.
 
 ## Scope and limitations

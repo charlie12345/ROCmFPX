@@ -85,8 +85,13 @@ ROCm DLL 已加入当前开发环境。
 
 ## Windows 内存限制
 
-`--tensor-read-lazy on` 会让大 PLE 张量使用 mmap 延迟读取，但 Windows 仍可能
-把被访问的文件页留在进程工作集或系统缓存中。它不等于严格的“PLE 只放 SSD”。
+`--tensor-read-lazy on` 会让大 PLE 张量使用 mmap 延迟读取。当前构建在模型加载
+完成后还会自动执行一次 `EmptyWorkingSet`，清理加载阶段进入进程工作集的文件页，
+日志中会出现 `PLE pager: loading-page trim completed`。
+
+这只是一次性清理，不是持续的 8 GiB 硬上限；Windows 仍可能把之后访问的文件页
+留在进程工作集或系统缓存中，也不等于严格的“PLE 只放 SSD”。只有在自动清理后
+内存仍然紧张，或需要持续限制工作集时，才运行下面的可选脚本：
 
 模型健康启动后，在管理员 PowerShell 中执行：
 
@@ -97,8 +102,8 @@ powershell -ExecutionPolicy Bypass `
   -MaxGiB 8
 ```
 
-该限制只对当前 `llama-server.exe` PID 生效，重启模型后需要重新执行。限制过低
-可能增加 PLE 缺页读取并降低预填充速度；它也不会降低 GPU/UMA 提交量。
+脚本设置的硬上限只对当前 `llama-server.exe` PID 生效，重启模型后需要重新执行。
+限制过低可能增加 PLE 缺页读取并降低预填充速度；它也不会降低 GPU/UMA 提交量。
 
 ## DFlash
 
