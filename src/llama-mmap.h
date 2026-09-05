@@ -41,14 +41,23 @@ private:
 };
 
 struct llama_mmap {
+    // byte ranges within the mapped file that must remain demand-paged.
+    using ranges = std::vector<std::pair<size_t, size_t>>;
+
     llama_mmap(const llama_mmap &) = delete;
-    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false);
+    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
+               const ranges & lazy_ranges = {});
     ~llama_mmap();
 
     size_t size() const;
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
+
+    // Return the portions of the initial prefetch window that do not overlap
+    // demand-paged tensor ranges.
+    static ranges initial_prefetch_ranges(size_t file_size, const ranges & lazy_ranges,
+                                          size_t prefetch);
 
     static const bool SUPPORTED;
 

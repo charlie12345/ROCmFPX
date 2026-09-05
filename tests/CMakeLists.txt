@@ -116,6 +116,12 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+if (WIN32 AND NOT BUILD_SHARED_LIBS)
+    llama_build(test-mmap-windows-lazy.cpp)
+    target_include_directories(test-mmap-windows-lazy PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_test(test-mmap-windows-lazy)
+endif()
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
@@ -235,6 +241,8 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-ple-pager.cpp ../src/llama-ple-pager.cpp)
+target_include_directories(test-ple-pager PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks

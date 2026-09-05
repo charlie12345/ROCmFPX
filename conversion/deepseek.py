@@ -462,6 +462,35 @@ class DeepseekV2Model(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+
+
+@ModelBase.register("InstellaMoEForCausalLM")
+class InstellaMoEModel(DeepseekV2Model):
+    """AMD Instella-MoE: DeepSeek-V3 MLA + sigmoid MoE + gated attention + FarSkip.
+
+    Graph implements FarSkip dual-residual + gated MLA unconditionally; reject
+    checkpoints that disable either flag or use unsupported variants.
+    """
+    model_arch = gguf.MODEL_ARCH.INSTELLA
+
+    def set_gguf_parameters(self):
+        hparams = self.hparams
+
+        if not hparams.get("farskip", False):
+            raise NotImplementedError("Instella without FarSkip is not supported (graph always uses dual residual)")
+        if hparams.get("farskip_start_idx", 0) != 0 or hparams.get("farskip_end_idx", 1e4) < hparams["num_hidden_layers"] - 1:
+            raise NotImplementedError("Instella with partial FarSkip layer range is not supported")
+        if hparams.get("attn_only_farskip", False) or hparams.get("mlp_only_farskip", False):
+            raise NotImplementedError("Instella with attn_only_farskip/mlp_only_farskip is not supported")
+        if not hparams.get("gated_attention", False):
+            raise NotImplementedError("Instella without gated_attention is not supported")
+        if hparams.get("q_lora_rank") is not None:
+            raise NotImplementedError("Instella with q_lora_rank is not supported in this port")
+        if not hparams.get("rope_interleave", True):
+            raise NotImplementedError("Instella with non-interleaved RoPE is not supported")
+
+        super().set_gguf_parameters()
+
 @ModelBase.register("DeepseekV32ForCausalLM")
 class DeepseekV32Model(DeepseekV2Model):
     model_arch = gguf.MODEL_ARCH.DEEPSEEK32

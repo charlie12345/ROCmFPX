@@ -45,6 +45,7 @@ enum llm_arch {
     LLM_ARCH_QWEN3VLMOE,
     LLM_ARCH_QWEN35,
     LLM_ARCH_QWEN35MOE,
+    LLM_ARCH_QWEN4EXP,
     LLM_ARCH_PHI2,
     LLM_ARCH_PHI3,
     LLM_ARCH_PHIMOE,
@@ -72,10 +73,12 @@ enum llm_arch {
     LLM_ARCH_XVERSE,
     LLM_ARCH_COMMAND_R,
     LLM_ARCH_COHERE2,
+    LLM_ARCH_COHERE2MOE,
     LLM_ARCH_DBRX,
     LLM_ARCH_OLMO,
     LLM_ARCH_OLMO2,
     LLM_ARCH_OLMOE,
+    LLM_ARCH_MUSE_GLIMMER,
     LLM_ARCH_OPENELM,
     LLM_ARCH_ARCTIC,
     LLM_ARCH_DEEPSEEK,
@@ -83,6 +86,7 @@ enum llm_arch {
     LLM_ARCH_DEEPSEEK2OCR,
     LLM_ARCH_DEEPSEEK32,
     LLM_ARCH_DEEPSEEK4,
+    LLM_ARCH_INSTELLA,
     LLM_ARCH_CHATGLM,
     LLM_ARCH_GLM4,
     LLM_ARCH_GLM4_MOE,
@@ -144,8 +148,10 @@ enum llm_arch {
     LLM_ARCH_LLAMA_EMBED,
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
+    LLM_ARCH_BAILING_HYBRID,
     LLM_ARCH_TALKIE,
     LLM_ARCH_MELLUM,
+    LLM_ARCH_ZAYA,
     LLM_ARCH_EAGLE3,
     LLM_ARCH_MINIMAX_M3,
     LLM_ARCH_DFLASH,
@@ -267,6 +273,18 @@ enum llm_kv {
     LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,
     LLM_KV_ATTENTION_OUTPUT_LORA_RANK,
     LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,
+    LLM_KV_ATTENTION_RECURRENT_LAYERS, // qwen4exp
+    LLM_KV_HYPER_CONNECTION_LOW_RANK,   // qwen4exp
+
+    LLM_KV_PLE_LAYERS,                // qwen4exp
+    LLM_KV_PLE_NGRAM_SIZE,            // qwen4exp
+    LLM_KV_PLE_HEADS_PER_NGRAM,       // qwen4exp
+    LLM_KV_PLE_CONV_KERNEL,           // qwen4exp
+    LLM_KV_PLE_LAYER_MULTIPLIERS,     // qwen4exp
+    LLM_KV_PLE_HEAD_OFFSETS,          // qwen4exp
+    LLM_KV_PLE_HEAD_VOCAB_SIZES,      // qwen4exp
+    LLM_KV_PLE_EOS_TOKEN_ID,          // qwen4exp
+    LLM_KV_PLE_IMAGE_TOKEN_ID,        // qwen4exp
 
     LLM_KV_ROPE_DIMENSION_COUNT,
     LLM_KV_ROPE_DIMENSION_COUNT_SWA,
@@ -299,6 +317,7 @@ enum llm_kv {
 
     LLM_KV_KDA_HEAD_DIM,
     LLM_KV_KDA_GATE_LOWER_BOUND,
+    LLM_KV_KDA_LOWER_BOUND,
 
     LLM_KV_WKV_HEAD_SIZE,
 
@@ -482,6 +501,21 @@ enum llm_tensor {
     LLM_TENSOR_SSM_BETA,            // kimi: beta mixing coefficient and qwen3.5
     LLM_TENSOR_SSM_G_A,             // kimi: output gate projection A
     LLM_TENSOR_SSM_G_B,             // kimi: output gate projection B
+    // ZAYA CCA (Compressed Convolutional Attention)
+    LLM_TENSOR_CCA_CONV_GRP,        // zaya: grouped conv1d  (conv_qk.1)
+    LLM_TENSOR_CCA_K_SCALE,         // zaya: learned K temperature
+    LLM_TENSOR_CCA_VAL_PROJ1,       // zaya: V projection 1
+    LLM_TENSOR_CCA_VAL_PROJ2,       // zaya: V projection 2
+    // ZAYA residual scaling
+    LLM_TENSOR_RES_SCALE_HS,        // zaya: hidden_states_scale (+ bias)
+    LLM_TENSOR_RES_SCALE_RES,       // zaya: residual_scale (+ bias)
+    LLM_TENSOR_RES_SCALE_HS_FINAL,  // zaya: final hidden_states_scale (+ bias)
+    LLM_TENSOR_RES_SCALE_RES_FINAL, // zaya: final residual_scale (+ bias)
+    // ZAYA Router (MoE gating)
+    LLM_TENSOR_ZAYA_ROUTER_MLP2,      // zaya: router MLP layer 2 weight (+ bias)
+    LLM_TENSOR_ZAYA_ROUTER_MLP4,      // zaya: router MLP layer 4 weight
+    LLM_TENSOR_ZAYA_ROUTER_BIASES,    // zaya: router balancing_biases
+    LLM_TENSOR_ZAYA_ROUTER_EDA_SCALE, // zaya: router router_states_scale
     LLM_TENSOR_TIME_MIX_W0,
     LLM_TENSOR_TIME_MIX_W1,
     LLM_TENSOR_TIME_MIX_W2,
@@ -529,6 +563,23 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_KV_A_NORM,
     LLM_TENSOR_ATTN_OUT_A,
     LLM_TENSOR_ATTN_OUT_B,
+    LLM_TENSOR_HC_HEAD_NORM,   // qwen4exp
+    LLM_TENSOR_HC_HEAD_DOWN,   // qwen4exp
+    LLM_TENSOR_HC_HEAD_UP,     // qwen4exp
+    LLM_TENSOR_HC_ATTN_NORM,   // qwen4exp
+    LLM_TENSOR_HC_ATTN_DOWN,   // qwen4exp
+    LLM_TENSOR_HC_ATTN_UP,     // qwen4exp
+    LLM_TENSOR_HC_ATTN_INJECT, // qwen4exp
+    LLM_TENSOR_HC_FFN_NORM,    // qwen4exp
+    LLM_TENSOR_HC_FFN_DOWN,    // qwen4exp
+    LLM_TENSOR_HC_FFN_UP,      // qwen4exp
+    LLM_TENSOR_HC_FFN_INJECT,  // qwen4exp
+    LLM_TENSOR_PLE_KEY,        // qwen4exp
+    LLM_TENSOR_PLE_VALUE,      // qwen4exp
+    LLM_TENSOR_PLE_NORM_KEY,   // qwen4exp
+    LLM_TENSOR_PLE_NORM_QUERY, // qwen4exp
+    LLM_TENSOR_PLE_NORM_CONV,  // qwen4exp
+    LLM_TENSOR_PLE_CONV1D,     // qwen4exp
     LLM_TENSOR_ATTN_COMPRESSOR_APE,
     LLM_TENSOR_ATTN_COMPRESSOR_KV,
     LLM_TENSOR_ATTN_COMPRESSOR_GATE,
@@ -595,6 +646,9 @@ enum llm_tensor {
     LLM_TENSOR_INDEXER_PROJ,
     LLM_TENSOR_INDEXER_ATTN_K,
     LLM_TENSOR_INDEXER_ATTN_Q_B,
+    LLM_TENSOR_INDEXER_Q_PROJ,  // qwen4exp
+    LLM_TENSOR_INDEXER_K_PROJ,  // qwen4exp
+    LLM_TENSOR_INDEXER_Q_NORM,  // qwen4exp
     LLM_TENSOR_INDEXER_COMPRESSOR_APE,
     LLM_TENSOR_INDEXER_COMPRESSOR_KV,
     LLM_TENSOR_INDEXER_COMPRESSOR_GATE,

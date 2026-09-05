@@ -1944,17 +1944,21 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        // process() stores rows [0, n_rows - 2] in verify_h and keeps the
+        // final row in pending_h.  Populate the rollback ring before pending_h
+        // can be replaced with an earlier accepted row.
+        GGML_ASSERT(verify_h[seq_id].size() >= (size_t) std::max(0, n_rows - 1) * n_embd);
+        for (int32_t i = 0; i < n_rows - 1; ++i) {
+            ring_push(seq_id, verify_pos_first[seq_id] + i, verify_h[seq_id].data() + (size_t) i * n_embd);
+        }
+        ring_push(seq_id, verify_pos_first[seq_id] + n_rows - 1, pending_h[seq_id].data());
+
         if (i_h != n_rows - 1) {
             std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
         }
         pending_h_valid[seq_id] = 1;
         pending_h_pos[seq_id] = verify_pos_first[seq_id] + i_h;
-
-        // all verification rows are valid boundary candidates at their
-        // contiguous positions: keep them in the rollback ring
-        for (int32_t i = 0; i < n_rows; ++i) {
-            ring_push(seq_id, verify_pos_first[seq_id] + i, verify_h[seq_id].data() + (size_t) i * n_embd);
-        }
 
         if (i_h == 0) {
             if (process_boundary_valid[seq_id]) {

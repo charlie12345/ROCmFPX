@@ -359,8 +359,11 @@ static std::string llama_model_loader_compat_key(const std::string & key) {
                                                 (std::is_same<T,    uint32_t>::value)); break;
             case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T,       float>::value)); break;
             case GGUF_TYPE_STRING:  GGML_ASSERT((std::is_same<T, std::string>::value)); break;
+            case GGUF_TYPE_UINT64:  GGML_ASSERT((std::is_same<T,    uint64_t>::value)); break; // qwen4exp
+
             default:
-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32 array", found_key.c_str()));
+                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64 array", found_key.c_str()));
+
         }
 
         if constexpr (std::is_same<T, std::string>::value) {
@@ -409,8 +412,11 @@ static std::string llama_model_loader_compat_key(const std::string & key) {
                                                 (std::is_same<T,    uint32_t>::value)); break;
             case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T,       float>::value)); break;
             case GGUF_TYPE_STRING:  GGML_ASSERT((std::is_same<T, std::string>::value)); break;
+            case GGUF_TYPE_UINT64:  GGML_ASSERT((std::is_same<T,    uint64_t>::value)); break; // qwen4exp
+
             default:
-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32 array", found_key.c_str()));
+                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64 array", found_key.c_str()));
+
         }
 
         if (arr_info.length > N_MAX) {
@@ -449,6 +455,8 @@ static std::string llama_model_loader_compat_key(const std::string & key) {
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required); // qwen4exp
+    template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required); // qwen4exp
 
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
@@ -923,6 +931,22 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
     return nullptr;
 }
 
+llama_tensor_source llama_model_loader::get_tensor_source(const char * name) const {
+    const auto * weight = get_weight(name);
+    if (weight == nullptr || weight->tensor == nullptr || weight->idx >= files.size()) {
+        throw std::runtime_error(format("%s: tensor '%s' source is unavailable", __func__, name));
+    }
+    return {
+        files.at(weight->idx)->file_id(),
+        weight->idx,
+        weight->offs,
+        ggml_nbytes(weight->tensor),
+        weight->tensor->type,
+        weight->tensor->ne[0],
+        weight->tensor->ne[1],
+    };
+}
+
 const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weight(const char * name) const {
     const llama_tensor_weight * weight = get_weight(name);
     if (!weight) {
@@ -1363,6 +1387,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     ggml_tensor * t_meta = get_tensor_meta(load_name.c_str());
+
+    if ((flags & TENSOR_READ_LAZY) && use_mmap && tensor_read_lazy != LLAMA_TENSOR_READ_LAZY_OFF) {
+        constexpr size_t auto_lazy_min_size = 4ull * 1024 * 1024 * 1024;
+        if (tensor_read_lazy == LLAMA_TENSOR_READ_LAZY_ON || ggml_nbytes(t_meta) > auto_lazy_min_size) {
+            const auto & weight = require_weight(load_name.c_str());
+            lazy_tensor_ranges[weight.idx].emplace_back(weight.offs, weight.offs + ggml_nbytes(t_meta));
+        }
+    }
+
     ggml_backend_buffer_type_t buft = buft_for_tensor(t_meta);
     if (buft == nullptr) {
         return nullptr; // return type is ggml_tensor *
@@ -1448,7 +1481,8 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
-        for (const auto & file : files) {
+        for (uint32_t file_idx = 0; file_idx < files.size(); ++file_idx) {
+            const auto & file = files[file_idx];
             bool is_numa = false;
 
             auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1460,7 +1494,10 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            static const llama_mmap::ranges no_lazy_ranges;
+            const auto it_lazy = lazy_tensor_ranges.find(file_idx);
+            const auto & lazy_ranges = it_lazy != lazy_tensor_ranges.end() ? it_lazy->second : no_lazy_ranges;
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa, lazy_ranges);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

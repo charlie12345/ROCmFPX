@@ -118,6 +118,16 @@ int main(void) {
     argv = {"binary_name", "--no-mmap"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // PLE direct-storage options reject malformed and unsafe values
+    argv = {"binary_name", "--ple-ssd", "invalid"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    argv = {"binary_name", "--ple-io-depth", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    argv = {"binary_name", "--ple-buffer-mib", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
 
     printf("test-arg-parser: test valid usage\n\n");
 
@@ -138,6 +148,15 @@ int main(void) {
     assert(params.model.path == "abc.gguf");
     assert(params.n_predict == 6789);
     assert(params.n_batch == 9090);
+
+    {
+        common_params ple_params;
+        argv = {"binary_name", "--ple-ssd", "direct", "--ple-io-depth", "64", "--ple-buffer-mib", "48"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ple_params, LLAMA_EXAMPLE_SERVER));
+        assert(ple_params.ple_storage == LLAMA_PLE_STORAGE_DIRECT);
+        assert(ple_params.ple_io_depth == 64);
+        assert(ple_params.ple_buffer_size == 48ull*1024*1024);
+    }
 
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--spec-draft-n-max", "123"};

@@ -8,6 +8,8 @@
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
 #define LLAMA_MAX_EXPERTS 512 // Qwen3 Next
+#define LLAMA_MAX_PLE_NGRAM 8  // qwen4exp
+#define LLAMA_MAX_PLE_HEADS 64 // qwen4exp
 
 enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_NONE           = 0,
@@ -156,6 +158,8 @@ struct llama_hparams {
     uint32_t n_embd_head_kda = 0;
 
     float    kda_gate_lower_bound = 0.0f;   // bailingmoe3: safe-gate lower bound
+    // bailing-hybrid KDA safe gate lower bound (e.g. -5.0). 0.0 means unset.
+    float f_kda_lower_bound = 0.0f;
 
     // for hybrid state space models
     std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;
@@ -232,6 +236,28 @@ struct llama_hparams {
     float    compress_rope_freq_base = 0.0f;
     uint32_t dsv4_state_size         = 0;
     std::array<uint32_t, LLAMA_MAX_LAYERS> attn_compress_ratio;
+
+    // 0 = full rank (DeepSeek-V4)
+    uint32_t hc_low_rank = 0;
+
+    uint32_t ple_ngram_size      = 0;
+    uint32_t ple_heads_per_ngram = 0;
+    uint32_t ple_conv_kernel     = 0;
+    uint32_t ple_n_heads         = 0;   // (ngram_size - 1) * heads_per_ngram
+    uint32_t ple_head_dim        = 0;
+    uint32_t ple_eos_token_id    = 0;
+    // placeholder the PLE hash sees where an image chunk is spliced in; 0 means the
+    // file predates this key and the loader falls back to EOS
+    uint32_t ple_image_token_id  = 0;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> is_ple_impl;
+    std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>  ple_layer_multipliers;
+    std::array<uint64_t, LLAMA_MAX_PLE_HEADS>  ple_head_offsets;
+    std::array<uint64_t, LLAMA_MAX_PLE_HEADS>  ple_head_vocab_sizes;
+
+    bool is_ple(uint32_t il) const;
+
+    // PLE conv history rows: (kernel - 1) * ngram_size; 0 without a PLE module
+    uint32_t ple_conv_state() const;
 
     // qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;

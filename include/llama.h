@@ -305,6 +305,17 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    enum llama_ple_storage_type {
+        LLAMA_PLE_STORAGE_OFF    = 0,
+        LLAMA_PLE_STORAGE_DIRECT = 1,
+    };
+
+    enum llama_tensor_read_lazy {
+        LLAMA_TENSOR_READ_LAZY_OFF  = 0,
+        LLAMA_TENSOR_READ_LAZY_AUTO = 1,
+        LLAMA_TENSOR_READ_LAZY_ON   = 2,
+    };
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -341,6 +352,11 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+
+        enum llama_ple_storage_type ple_storage; // Qwen4Exp PLE storage mode
+        uint32_t ple_io_depth;                   // bounded outstanding PLE reads
+        size_t ple_buffer_size;                  // bounded PLE staging buffer in bytes
+        enum llama_tensor_read_lazy tensor_read_lazy; // demand-page tensors marked by the architecture
     };
 
     struct llama_sampler_seq_config {
