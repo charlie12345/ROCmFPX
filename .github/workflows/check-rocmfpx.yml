@@ -125,7 +125,7 @@ jobs:
           for cm1 in ON OFF; do
             cmake -B build-vulkan-cm1 -S . -DCMAKE_BUILD_TYPE=Release \
               -DGGML_NATIVE=OFF -DGGML_VULKAN=ON -DGGML_HIP=OFF \
-              -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_UI=OFF \
+              -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
               -DGGML_VULKAN_ROCMFP4_COOPMAT="$cm1"
             cmake --build build-vulkan-cm1 --target llama-cli -j 2
             shader_header=build-vulkan-cm1/ggml/src/ggml-vulkan/ggml-vulkan-shaders.hpp
