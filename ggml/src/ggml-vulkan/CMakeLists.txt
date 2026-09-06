@@ -65,6 +65,10 @@ if (Vulkan_FOUND)
                             )
 
     set(VULKAN_SHADER_GEN_CMAKE_ARGS "")
+    list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_ROCMFP4_COOPMAT=${GGML_VULKAN_ROCMFP4_COOPMAT})
+    if (GGML_VULKAN_ROCMFP4_COOPMAT)
+        target_compile_definitions(ggml-vulkan PRIVATE GGML_VULKAN_ROCMFP4_COOPMAT)
+    endif()
 
     # Test all shader extensions
     test_shader_extension_support(
@@ -214,12 +218,16 @@ if (Vulkan_FOUND)
               CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.cpp"
                                 "${_ggml_vk_input_dir}/*.h")
 
+    set(_ggml_vk_rocmfp4_config "${CMAKE_CURRENT_BINARY_DIR}/rocmfp4-coopmat-config.txt")
+    file(GENERATE OUTPUT "${_ggml_vk_rocmfp4_config}" CONTENT "${GGML_VULKAN_ROCMFP4_COOPMAT}\n")
+
     add_custom_command(
         OUTPUT ${_ggml_vk_header}
         COMMAND ${_ggml_vk_genshaders_cmd}
             --output-dir ${_ggml_vk_output_dir}
             --target-hpp ${_ggml_vk_header}
         DEPENDS ${_ggml_vk_shaders_gen_sources}
+                ${_ggml_vk_rocmfp4_config}
                 vulkan-shaders-gen
         COMMENT "Generate vulkan shaders header"
     )
@@ -240,6 +248,7 @@ if (Vulkan_FOUND)
                 --target-cpp ${_ggml_vk_target_cpp}
             DEPENDS ${file_full}
                     ${_ggml_vk_shaders_gen_sources}
+                    ${_ggml_vk_rocmfp4_config}
                     vulkan-shaders-gen
             COMMENT "Generate vulkan shaders for ${file}"
         )

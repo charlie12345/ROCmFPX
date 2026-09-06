@@ -594,7 +594,12 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
                                   tname == "rocmfpx_fp2" || tname == "rocmfpx_fp3" ||
                                   tname == "rocmfpx_fp5" || tname == "rocmfpx_fp6" ||
                                   tname == "rocmfpx_fp7" || tname == "rocmfpx_fp8";
-        if (rocmfpx_type && (coopmat || coopmat2)) {
+#ifdef GGML_VULKAN_ROCMFP4_COOPMAT
+        const bool rocmfp4_type = tname == "rocmfp4" || tname == "rocmfp4_fast";
+#else
+        const bool rocmfp4_type = false;
+#endif
+        if (rocmfpx_type && (coopmat2 || (coopmat && !rocmfp4_type))) {
             continue;
         }
 

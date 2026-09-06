@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.19)
 project("vulkan-shaders-gen" C CXX)
 
 find_package (Threads REQUIRED)
+if (GGML_VULKAN_ROCMFP4_COOPMAT)
+    add_compile_definitions(GGML_VULKAN_ROCMFP4_COOPMAT)
+endif()
 
 if (GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     add_compile_definitions(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
