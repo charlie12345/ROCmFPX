@@ -9639,6 +9639,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // this case is verified (pass) in Intel(R) Data Center GPU Max 1100 (sycl backend) and NV A30 (cuda backend)
     // test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 512, 262144, 9216, {1, 1}, {1, 1}));
 
+    // ROCmFP4 matrix tiles and MoE tails, with scalar and CM1 backends.
+    for (ggml_type type : {GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4_FAST}) {
+        for (int n : {37, 257}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 513, n, 4096, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 8, false, 769, n, 4096));
+        }
+    }
+
     // test large experts*tokens
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, b, 32, 1024, 16));

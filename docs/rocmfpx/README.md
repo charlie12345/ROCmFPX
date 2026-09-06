@@ -38,6 +38,7 @@ individual block layout.
 - [Hyperloom adapter](../../tools/hyperloom/README.md)
 - [CI policy](CI.md)
 - [AMD support tiers](SUPPORT.md)
+- [Optional Vulkan ROCmFP4 CM1 acceleration and Qwen example](VULKAN-CM1.md)
 - [Release process](RELEASES.md)
 - Existing detailed benchmark and handoff documents in `docs/ROCmFP*.md`
 

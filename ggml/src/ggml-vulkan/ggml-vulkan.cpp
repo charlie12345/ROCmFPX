@@ -4253,8 +4253,20 @@ struct CompileTask {
     uint32_t required_subgroup_size;
 };
 
+static bool ggml_vk_rocmfp4_coopmat_enabled(const vk_device& device) {
+#ifdef GGML_VULKAN_ROCMFP4_COOPMAT
+    const char * fp4_coopmat_env = getenv("GGML_VK_ROCMFP4_COOPMAT");
+    return fp4_coopmat_env && strcmp(fp4_coopmat_env, "1") == 0 &&
+           device->coopmat_support && !device->coopmat2 && device->coopmat_acc_f32_support;
+#else
+    GGML_UNUSED(device);
+    return false;
+#endif
+}
+
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
+    const bool fp4_coopmat = ggml_vk_rocmfp4_coopmat_enabled(device);
 
     // some shaders have a minimum subgroup size
     const uint32_t subgroup_size_8 = std::max(device->subgroup_size, 8u);
@@ -4921,6 +4933,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             CREATE_MM2(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4],   matmul_id_subgroup_mxfp4_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
             CREATE_MM2(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4],   matmul_id_subgroup_nvfp4_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         }
+#ifdef GGML_VULKAN_ROCMFP4_COOPMAT
+        if (fp4_coopmat) {
+            CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0_ROCMFP4].f32acc, matmul_rocmfp4_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+            CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4_FAST, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc, matmul_rocmfp4_fast_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+            CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4].f32acc, matmul_id_subgroup_rocmfp4_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+            CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4_FAST, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc, matmul_id_subgroup_rocmfp4_fast_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        }
+#endif
 #undef CREATE_MM2
 #undef CREATE_MM
     } else
@@ -5262,11 +5282,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
     // reusing CREATE_MM from the fp32 path
-    if ((device->coopmat2 || device->coopmat_support)
-#if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
-        && !device->coopmat_bf16_support
-#endif
-        ) {
+    {
         const uint32_t s_warptile_wm = device->subgroup_size == 8 ? 8 : 32;
 
         // use scalar tile sizes
@@ -5278,12 +5294,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         m_wg_denoms = { 64,  64, 1 };
         s_wg_denoms = { 32,  32, 1 };
 
-        // ROCmFPX does not yet provide cooperative-matrix shader variants for
-        // the current upstream Vulkan backend. Keep its native scalar matrix
-        // shaders available on cooperative-matrix devices rather than falling
-        // back to a separate dequantize-to-f16 pass.
-        CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4,      pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0_ROCMFP4].f32acc,      matmul_rocmfp4_f32,      , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
-        CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4_FAST, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc, matmul_rocmfp4_fast_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
+        // Keep scalar ROCmFPX shaders as the default. Only FP4 can opt into CM1.
+        if (!fp4_coopmat) {
+            CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4,      pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0_ROCMFP4].f32acc,      matmul_rocmfp4_f32,      , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
+            CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4_FAST, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc, matmul_rocmfp4_fast_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
+        }
         CREATE_MM(GGML_TYPE_Q2_0_ROCMFPX,      pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0_ROCMFPX].f32acc,      matmul_rocmfpx_fp2_f32,   , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_Q3_0_ROCMFPX,      pipeline_dequant_mul_mat_mat[GGML_TYPE_Q3_0_ROCMFPX].f32acc,      matmul_rocmfpx_fp3_f32,   , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_Q5_0_ROCMFPX,      pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_0_ROCMFPX].f32acc,      matmul_rocmfpx_fp5_f32,   , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
@@ -5293,8 +5308,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         // ROCmFPX scalar ID shaders use scalar workgroup geometry even when cooperative matrices are available.
         if (device->subgroup_ballot && device->subgroup_require_full_support && subgroup_min_size_16) {
-            CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4,      pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4].f32acc,      matmul_id_subgroup_rocmfp4_f32,      , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
-            CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4_FAST, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc, matmul_id_subgroup_rocmfp4_fast_f32, , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+            if (!fp4_coopmat) {
+                CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4,      pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4].f32acc,      matmul_id_subgroup_rocmfp4_f32,      , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+                CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4_FAST, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc, matmul_id_subgroup_rocmfp4_fast_f32, , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+            }
             CREATE_MM(GGML_TYPE_Q2_0_ROCMFPX,      pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_0_ROCMFPX].f32acc,      matmul_id_subgroup_rocmfpx_fp2_f32,   , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
             CREATE_MM(GGML_TYPE_Q3_0_ROCMFPX,      pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_0_ROCMFPX].f32acc,      matmul_id_subgroup_rocmfpx_fp3_f32,   , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
             CREATE_MM(GGML_TYPE_Q5_0_ROCMFPX,      pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_0_ROCMFPX].f32acc,      matmul_id_subgroup_rocmfpx_fp5_f32,   , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
@@ -5302,8 +5319,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             CREATE_MM(GGML_TYPE_Q7_0_ROCMFPX,      pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q7_0_ROCMFPX].f32acc,      matmul_id_subgroup_rocmfpx_fp7_f32,   , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
             CREATE_MM(GGML_TYPE_Q8_0_ROCMFPX,      pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0_ROCMFPX].f32acc,      matmul_id_subgroup_rocmfpx_fp8_f32,   , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
         } else {
-            CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4,      pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4].f32acc,      matmul_id_rocmfp4_f32,      , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
-            CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4_FAST, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc, matmul_id_rocmfp4_fast_f32, , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+            if (!fp4_coopmat) {
+                CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4,      pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4].f32acc,      matmul_id_rocmfp4_f32,      , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+                CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4_FAST, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc, matmul_id_rocmfp4_fast_f32, , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+            }
             CREATE_MM(GGML_TYPE_Q2_0_ROCMFPX,      pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_0_ROCMFPX].f32acc,      matmul_id_rocmfpx_fp2_f32,   , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
             CREATE_MM(GGML_TYPE_Q3_0_ROCMFPX,      pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_0_ROCMFPX].f32acc,      matmul_id_rocmfpx_fp3_f32,   , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
             CREATE_MM(GGML_TYPE_Q5_0_ROCMFPX,      pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_0_ROCMFPX].f32acc,      matmul_id_rocmfpx_fp5_f32,   , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
@@ -5312,8 +5331,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             CREATE_MM(GGML_TYPE_Q8_0_ROCMFPX,      pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0_ROCMFPX].f32acc,      matmul_id_rocmfpx_fp8_f32,   , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
         }
 
-        CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
-        CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_id_bf16, matmul_id_bf16, , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+        if ((device->coopmat2 || device->coopmat_support)
+#if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
+            && !device->coopmat_bf16_support
+#endif
+            ) {
+            CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
+            CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_id_bf16, matmul_id_bf16, , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+        }
     }
 #undef CREATE_MM
 
@@ -7176,6 +7201,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 vkGetDeviceProcAddr(device->device, "vkGetDeviceFaultInfoEXT");
         }
 
+        const char * fp4_coopmat_env = getenv("GGML_VK_ROCMFP4_COOPMAT");
+        if (fp4_coopmat_env && strcmp(fp4_coopmat_env, "1") == 0) {
+            GGML_LOG_INFO("ggml_vulkan: %s ROCmFP4 CM1 request: %s\n", device->name.c_str(),
+                          ggml_vk_rocmfp4_coopmat_enabled(device) ? "enabled (experimental, F32 accumulation)" : "scalar fallback (build or device unsupported)");
+        }
+
         // Queues
         device->compute_queue = ggml_vk_create_queue(device, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
 
@@ -7970,9 +8001,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     }
 
     if (ggml_vk_is_rocmfpx_weight_type(src0_type)) {
-        // ROCmFPX currently uses its native scalar matrix shader even when the
-        // device exposes cooperative matrices. The scalar variant is
-        // registered explicitly during pipeline creation above.
+        // ROCmFPX uses F32 accumulation on both the scalar and opt-in FP4 CM1 paths.
         return ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
     }
 
