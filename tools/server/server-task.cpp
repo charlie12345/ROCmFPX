@@ -3027,8 +3027,6 @@ bool server_prompt_cache::load(
         state_spec->clear();
     }
 
-    const size_t n_new = std::max<size_t>(1, tokens_new.size());
-
     // Worth of what the slot already holds. Like every candidate below it is measured in
     // tokens the slot would actually keep: a diverging tail on a recurrent/hybrid target
     // means rolling back to the newest checkpoint at or before the divergence.
@@ -3037,10 +3035,13 @@ bool server_prompt_cache::load(
         server_prompt_cache_eff_tokens(prompt.tokens.size(), lcp_base, partial_seq_rm,
                                        server_prompt_cache_ckpt_at_or_below(prompt.checkpoints, lcp_base));
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(eff_base) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(eff_base) / n_new;
+    // Candidates are ranked by eff tokens alone: a slot switch first saves the slot's own
+    // state to the cache, so nothing is lost by taking the entry that keeps the most of
+    // the request. (vanilla's additional f_keep criterion would prefer an older, shorter
+    // version of the same conversation over a newer one with a longer discarded tail.)
+    size_t eff_best = eff_base; // empty slot: any usable cache entry wins
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f (lcp = %zu, eff = %zu)\n", f_keep_best, f_sim_best, lcp_base, eff_base);
+    SRV_TRC(" - looking for better prompt, base eff = %zu (lcp = %zu, cached = %zu, request = %zu)\n", eff_base, lcp_base, prompt.tokens.size(), tokens_new.size());
 
     auto it_best_ram  = states.end();
     auto it_best_disk = disk_states.end();
@@ -3054,18 +3055,16 @@ bool server_prompt_cache::load(
                                                               server_prompt_cache_ckpt_at_or_below(it->prompt.checkpoints, lcp_cur));
 
         const float f_keep_cur = float(eff_cur) / std::max<size_t>(1, it->prompt.tokens.size());
-        const float f_sim_cur  = float(eff_cur) / n_new;
 
-        SRV_TRC("   - prompt with length %7zu, lcp = %7zu, eff = %7zu, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, eff_cur, f_keep_cur, f_sim_cur);
+        SRV_TRC("   - prompt with length %7zu, lcp = %7zu, eff = %7zu, f_keep = %.3f\n", it->prompt.tokens.size(), lcp_cur, eff_cur, f_keep_cur);
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
+        if (eff_cur > eff_best) {
+            eff_best = eff_cur;
 
             it_best_ram  = it;
             lcp_selected = lcp_cur;
@@ -3096,15 +3095,14 @@ bool server_prompt_cache::load(
         }
 
         const float f_keep_cur = float(eff_cur) / std::max<size_t>(1, it->tokens.size());
-        const float f_sim_cur  = float(eff_cur) / n_new;
 
         if (f_keep_cur < 0.25f) {
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
+        // strictly better only: on a tie the hot RAM copy (or the slot itself) wins
+        if (eff_cur > eff_best) {
+            eff_best = eff_cur;
 
             it_best_ram  = states.end();
             it_best_disk = it;
@@ -3113,13 +3111,13 @@ bool server_prompt_cache::load(
     }
 
     if (it_best_disk != disk_states.end()) {
-        SRV_INF(" - found better disk prompt with f_keep = %.3f, f_sim = %.3f, lcp = %zu\n",
-                f_keep_best, f_sim_best, lcp_selected);
+        SRV_INF(" - found better disk prompt: entry=%" PRIu64 " eff=%zu lcp=%zu cached_tokens=%zu request_tokens=%zu\n",
+                it_best_disk->id, eff_best, lcp_selected, it_best_disk->tokens.size(), tokens_new.size());
         return load_disk(it_best_disk, prompt, ctx_tgt, ctx_dft, id_slot, lcp_selected, state_spec);
     }
 
     if (it_best_ram != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+        SRV_TRC(" - found better RAM prompt with eff = %zu, lcp = %zu\n", eff_best, lcp_selected);
 
         {
             auto & data = it_best_ram->data.main;
