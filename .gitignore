@@ -55,7 +55,6 @@
 /autogen-*.md
 /bench-reports/
 /common/build-info.cpp
-/tools/server/public
 
 # Deprecated
 
@@ -93,11 +92,6 @@
 !/examples/*/*/*.kts
 !/examples/sycl/*.bat
 !/examples/sycl/*.sh
-
-# Server Web UI temporary files
-
-/tools/server/webui/node_modules
-/tools/server/webui/dist
 
 # Python
 

@@ -1,6 +1,6 @@
 // ggml_compute_forward_dsv4_hc_split_sinkhorn
 
-void ggml_compute_forward_dsv4_hc_split_sinkhorn(
+static void ggml_compute_forward_dsv4_hc_split_sinkhorn(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     const ggml_tensor * mixes = dst->src[0];
@@ -129,7 +129,7 @@ void ggml_compute_forward_dsv4_hc_split_sinkhorn(
 
 // ggml_compute_forward_dsv4_hc_weighted_sum
 
-void ggml_compute_forward_dsv4_hc_weighted_sum(
+static void ggml_compute_forward_dsv4_hc_weighted_sum(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     const ggml_tensor * x       = dst->src[0];
@@ -177,7 +177,7 @@ void ggml_compute_forward_dsv4_hc_weighted_sum(
 
 // ggml_compute_forward_dsv4_hc_expand
 
-void ggml_compute_forward_dsv4_hc_expand(
+static void ggml_compute_forward_dsv4_hc_expand(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     const ggml_tensor * block_out = dst->src[0];
@@ -270,7 +270,7 @@ static float ggml_dsv4_e4m3fn_dequant(float x) {
     return sign * val;
 }
 
-void ggml_compute_forward_dsv4_fp8_kv_quantize(
+static void ggml_compute_forward_dsv4_fp8_kv_quantize(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];

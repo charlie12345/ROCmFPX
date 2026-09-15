@@ -61,10 +61,6 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
-list(APPEND GGML_SOURCES_ROCM
-    "../../rocmfp4/rocmfp4_hip.cu"
-    "fattn-kv-batched.cu"
-    "fattn-vec-turbo-mixed.cu")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
@@ -82,15 +78,8 @@ else()
     list(APPEND GGML_SOURCES_ROCM
         ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0_rocmfp4-q4_0_rocmfp4.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0_rocmfp4_fast-q4_0_rocmfp4_fast.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q3_0_rocmfpx-q3_0_rocmfpx.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q6_0_rocmfpx-q6_0_rocmfpx.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0_rocmfpx-q8_0_rocmfpx.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu)
+        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
 endif()
 
 ggml_add_backend_library(ggml-hip
@@ -105,7 +94,7 @@ endif()
 
 add_compile_definitions(GGML_USE_HIP)
 
-if (GGML_HIP_FORCE_MMQ OR GGML_CUDA_FORCE_MMQ)
+if (GGML_CUDA_FORCE_MMQ)
     add_compile_definitions(GGML_CUDA_FORCE_MMQ)
 endif()
 
@@ -146,13 +135,6 @@ endif()
 
 if (GGML_HIP_ROCMI4_W4A4)
     add_compile_definitions(GGML_ROCMI4_W4A4=1)
-    message(WARNING
-        "GGML_HIP_ROCMI4_W4A4 is a lossy, experimental ROCmI4 prefill path "
-        "verified only on gfx1151. Exact MMQ is used on other architectures.")
-endif()
-
-if (GGML_HIP_ROCWMMA_FATTN)
-    add_compile_definitions(GGML_HIP_ROCWMMA_FATTN)
 endif()
 
 if (NOT GGML_HIP_MMQ_MFMA)
@@ -192,10 +174,3 @@ if (GGML_HIP_RCCL)
 endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
-
-# NOTE: do not add -ffast-math / -funsafe-math-optimizations here. Upstream
-# tried both and removed them (ggml-org/llama.cpp#25495, #26696): they imply
-# -fassociative-math, which reassociates FP reductions and can flip greedy
-# argmax on RDNA3.5, making MTP speculative decode diverge from the
-# non-speculative baseline. gfx1151 is RDNA3.5, and -ffinite-math-only also
-# breaks inf handling outright (EXPM1 returned NaN where the CPU returns inf).

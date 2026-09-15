@@ -37,7 +37,6 @@ struct quantize_perf_params {
     bool op_dequantize_row_q = false;
     bool op_quantize_row_q_dot = false;
     bool op_vec_dot_q = false;
-    bool use_imatrix = false;
     int64_t iterations = ITERATIONS;
 };
 
@@ -65,12 +64,6 @@ inline int64_t cpu_cycles() {
 static void generate_data(float offset, size_t n, float * dst) {
     for (size_t i = 0; i < n; i++) {
         dst[i] = 0.1 + 2*cosf(i + offset);
-    }
-}
-
-static void generate_importance_data(size_t n, float * dst) {
-    for (size_t i = 0; i < n; i++) {
-        dst[i] = 0.5f + fabsf(sinf(0.125f * i));
     }
 }
 
@@ -140,7 +133,6 @@ static void usage(char * argv[]) {
     printf(" (all)\n");
     printf("  --alignment-offset OFFSET\n");
     printf("                        set alignment offset as OFFSET (0)\n");
-    printf("  --imatrix             benchmark quantize_row_q through ggml_quantize_chunk with synthetic imatrix data\n");
     printf("  -i NUM, --iterations NUM\n");
     printf("                        set test iteration number (%d)\n", ITERATIONS);
 }
@@ -216,8 +208,6 @@ int main(int argc, char * argv[]) {
                 break;
             }
             params.alignment_offset = alignment;
-        } else if (arg == "--imatrix") {
-            params.use_imatrix = true;
         } else if ((arg == "-i") || (arg == "--iterations")) {
             if (++i >= argc) {
                 invalid_param = true;
@@ -255,21 +245,18 @@ int main(int argc, char * argv[]) {
 
     std::vector<uint8_t> test_data1_v(largest*4 + MAX_ALIGNMENT*2);
     std::vector<uint8_t> test_data2_v(largest*4 + MAX_ALIGNMENT*2);
-    std::vector<uint8_t> test_weight_v(largest*4 + MAX_ALIGNMENT*2);
     std::vector<uint8_t> test_q1_v   (largest*4 + MAX_ALIGNMENT*2);
     std::vector<uint8_t> test_q2_v   (largest*4 + MAX_ALIGNMENT*2);
     std::vector<uint8_t> test_out_v  (largest*4 + MAX_ALIGNMENT*2);
 
     float * test_data1 = (float *) align_with_offset(test_data1_v.data(), params.alignment_offset);
     float * test_data2 = (float *) align_with_offset(test_data2_v.data(), params.alignment_offset);
-    float * test_weight = (float *) align_with_offset(test_weight_v.data(), params.alignment_offset);
     float * test_q1    = (float *) align_with_offset(test_q1_v.data(),    params.alignment_offset);
     float * test_q2    = (float *) align_with_offset(test_q2_v.data(),    params.alignment_offset);
     float * test_out   = (float *) align_with_offset(test_out_v.data(),   params.alignment_offset);
 
     generate_data(0, largest, test_data1);
     generate_data(1, largest, test_data2);
-    generate_importance_data(largest, test_weight);
 
     int64_t iterations = params.iterations;
 
@@ -307,11 +294,7 @@ int main(int argc, char * argv[]) {
                 for (size_t size : params.test_sizes) {
                     printf("    %zu values (%.2f MB)\n", size, 4*size/(float)(1024*1024));
                     auto quantize_fn = [&](void) -> float {
-                        if (params.use_imatrix) {
-                            ggml_quantize_chunk(type, test_data1, test_q1, 0, 1, size, test_weight);
-                        } else {
-                            qfns_cpu->from_float(test_data1, test_q1, size);
-                        }
+                        qfns_cpu->from_float(test_data1, test_q1, size);
                         return test_q1[0];
                     };
                     size_t quantized_size = ggml_row_size(type, size);

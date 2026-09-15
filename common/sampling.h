@@ -37,7 +37,9 @@ struct common_sampler;
 // llama_sampler API overloads
 
 // note: can mutate params in some cases
-struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params);
+struct common_sampler * common_sampler_init(
+        const struct llama_model * model,
+        struct common_params_sampling & params);
 
 void common_sampler_free(struct common_sampler * gsmpl);
 
@@ -45,6 +47,7 @@ void common_sampler_free(struct common_sampler * gsmpl);
 void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
+void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);
 
 // arguments can be nullptr to skip printing
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);
@@ -63,10 +66,6 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 // useful in cases where all the resulting candidates (not just the sampled one) must fit the grammar
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
-
-// MTP draft helper: fill current candidates with top-k probabilities and
-// select the highest-probability token without running the final RNG sampler.
-llama_token_data_array * common_sampler_sample_top_k_probs(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, int32_t top_k);
 
 // generalized version of common_sampler_sample
 //
@@ -90,6 +89,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
+
+// force the reasoning budget sampler (if any) to begin forcing its end sequence now.
+bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 
 // helpers
 

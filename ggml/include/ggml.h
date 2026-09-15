@@ -429,16 +429,24 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_Q4_0_ROCMFP4      = 100, // ROCmFP4 experimental UE4M3 scales + packed AMD FP4 blocks
-        GGML_TYPE_Q4_0_ROCMFP4_FAST = 101, // ROCmFP4 single-scale speed layout
-        GGML_TYPE_Q6_0_ROCMFPX      = 102, // ROCmFPx experimental 6-bit UE4M3-scale reference layout
-        GGML_TYPE_Q8_0_ROCMFPX      = 103, // ROCmFPx experimental 8-bit UE4M3-scale reference layout
-        GGML_TYPE_Q3_0_ROCMFPX      = 104, // ROCmFPx experimental 3-bit UE4M3-scale reference layout
-        GGML_TYPE_TURBO3_0          = 105, // TurboQuant 3-bit KV-cache (3.5 bpw)
-        GGML_TYPE_TURBO4_0          = 106, // TurboQuant 4-bit KV-cache (4.5 bpw)
-        GGML_TYPE_Q2_0_ROCMFPX      = 107, // ROCmFPx experimental 2-bit S40 codebook + dual UE4M3 scales
-        GGML_TYPE_Q4_0_ROCMI4       = 108, // native signed-nibble 4-bit + UE4M3 scale (no codebook)
-        GGML_TYPE_COUNT   = 109,
+        GGML_TYPE_Q2_0    = 42,
+        // Downstream ROCmFPX formats live in a reserved range so new upstream
+        // GGML types can continue to use the compact, append-only sequence.
+        GGML_TYPE_Q4_0_ROCMFP4      = 100, // dual UE4M3 scales + packed AMD FP4 blocks
+        GGML_TYPE_Q4_0_ROCMFP4_FAST = 101, // single-scale speed layout
+        GGML_TYPE_Q6_0_ROCMFPX      = 102, // 6-bit UE4M3-scale layout
+        GGML_TYPE_Q8_0_ROCMFPX      = 103, // 8-bit UE4M3-scale layout
+        GGML_TYPE_Q3_0_ROCMFPX      = 104, // 3-bit UE4M3-scale layout
+        GGML_TYPE_TURBO3_0          = 105, // TurboQuant 3-bit KV cache
+        GGML_TYPE_TURBO4_0          = 106, // TurboQuant 4-bit KV cache
+        // Type 107 was emitted with two incompatible 10-byte ROCmFP2 layouts.
+        // It is retained only so readers can reject ambiguous legacy files.
+        GGML_TYPE_Q2_0_ROCMFPX_LEGACY_AMBIGUOUS = 107,
+        GGML_TYPE_Q4_0_ROCMI4       = 108, // exact signed-nibble 4-bit + UE4M3 scale
+        GGML_TYPE_Q5_0_ROCMFPX      = 109, // 5-bit signed linear + dual UE4M3 scales
+        GGML_TYPE_Q7_0_ROCMFPX      = 110, // 7-bit signed linear + dual UE4M3 scales
+        GGML_TYPE_Q2_0_ROCMFPX      = 111, // 2-bit S40 codebook + dual UE4M3 scales
+        GGML_TYPE_COUNT             = 112,
     };
 
     // precision
@@ -482,18 +490,29 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4          = 100, // except 1d tensors
-        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN     = 101, // ROCmFP4 with Q5_K token embeddings
-        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT = 102, // ROCmFP4 with Q6_K token embeddings
-        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST     = 103, // ROCmFP4 single-scale speed layout
-        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT = 104, // ROCmFP4 fast with Q6_K token embeddings
-        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX    = 105, // ROCmFP4 Strix Halo quality/speed recipe
-        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN = 106, // ROCmFP4 Strix Halo size-biased K/V recipe
-        GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX          = 110, // ROCmFPx experimental 6-bit reference layout
-        GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX          = 111, // ROCmFPx experimental 8-bit reference layout
-        GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX          = 112, // ROCmFPx experimental 3-bit reference layout
-        GGML_FTYPE_MOSTLY_Q2_0_ROCMFPX          = 113, // ROCmFPx experimental 2-bit S40 codebook layout
-        GGML_FTYPE_MOSTLY_Q4_0_ROCMI4           = 118, // native signed 4-bit integer path
+        GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4              = 100,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN         = 101,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT     = 102,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST         = 103,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT = 104,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX        = 105,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN   = 106,
+        GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX              = 110,
+        GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX              = 111,
+        GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX              = 112,
+        GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX_AGENT        = 113,
+        GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT        = 114,
+        GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT        = 115,
+        GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN         = 116,
+        GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN   = 117,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMI4               = 118,
+        GGML_FTYPE_MOSTLY_Q2_0_ROCMFPX              = 119,
+        GGML_FTYPE_MOSTLY_Q5_0_ROCMFPX              = 120,
+        GGML_FTYPE_MOSTLY_Q5_0_ROCMFPX_AGENT        = 121,
+        GGML_FTYPE_MOSTLY_Q7_0_ROCMFPX              = 122,
+        GGML_FTYPE_MOSTLY_Q7_0_ROCMFPX_AGENT        = 123,
+        GGML_FTYPE_MOSTLY_Q2_0_ROCMFPX_AGENT        = 124,
     };
 
     // available tensor operations:
@@ -589,11 +608,10 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
-        GGML_OP_DSV4_HC_SPLIT_SINKHORN,
-        GGML_OP_DSV4_HC_WEIGHTED_SUM,
-        GGML_OP_DSV4_HC_EXPAND,
-        GGML_OP_DSV4_FP8_KV_QUANTIZE,
-        GGML_OP_DSV4_ROPE_TAIL,
+        GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_DSV4_HC_COMB,
+        GGML_OP_DSV4_HC_PRE,
+        GGML_OP_DSV4_HC_POST,
 
         GGML_OP_UNARY,
 
@@ -647,6 +665,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SWIGLU_CLAMP,
 
         GGML_GLU_OP_COUNT,
     };
@@ -773,7 +792,6 @@ extern "C" {
     "use ggml_row_size() instead");
 
     GGML_API const char * ggml_type_name(enum ggml_type type);
-    GGML_API enum ggml_type ggml_type_from_name(const char * name); // GGML_TYPE_COUNT if unknown
     GGML_API const char * ggml_op_name  (enum ggml_op   op);
     GGML_API const char * ggml_op_symbol(enum ggml_op   op);
 
@@ -803,6 +821,10 @@ extern "C" {
     GGML_API bool ggml_is_contiguous_0(const struct ggml_tensor * tensor); // same as ggml_is_contiguous()
     GGML_API bool ggml_is_contiguous_1(const struct ggml_tensor * tensor); // contiguous for dims >= 1
     GGML_API bool ggml_is_contiguous_2(const struct ggml_tensor * tensor); // contiguous for dims >= 2
+
+    GGML_API bool ggml_is_contiguous_to_1(const struct ggml_tensor * tensor); // contiguous for dims < 1
+    GGML_API bool ggml_is_contiguous_to_2(const struct ggml_tensor * tensor); // contiguous for dims < 2
+    GGML_API bool ggml_is_contiguous_to_3(const struct ggml_tensor * tensor); // contiguous for dims < 3
 
     // returns whether the tensor elements are allocated as one contiguous block of memory (no gaps, but permutation ok)
     GGML_API bool ggml_is_contiguously_allocated(const struct ggml_tensor * tensor);
@@ -1217,8 +1239,8 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
-    // a - x
-    // b - dy
+    // a - dy
+    // b - x
     GGML_API struct ggml_tensor * ggml_silu_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1382,6 +1404,12 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             float                 alpha,
+            float                 limit);
+
+    GGML_API struct ggml_tensor * ggml_swiglu_clamp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
             float                 limit);
 
     // normalize along rows
@@ -1741,6 +1769,19 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   n_past);
 
+    GGML_API struct ggml_tensor * ggml_clamp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 min,
+            float                 max);
+
+    // in-place, returns view(a)
+    GGML_API struct ggml_tensor * ggml_clamp_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 min,
+            float                 max);
+
     GGML_API struct ggml_tensor * ggml_soft_max(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
@@ -1998,14 +2039,14 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow);
 
-
-    // clamp
-    // in-place, returns view(a)
-    GGML_API struct ggml_tensor * ggml_clamp(
-            struct ggml_context * ctx,
+    // set the offset dims for RoPE
+    // a must be GGML_OP_ROPE or GGML_OP_ROPE_BACK
+    // vision RoPE is not supported
+    // example: (marking: x = rotated, 0 = unrotated)
+    //     n_embd = 10, n_dims = 4, offset = 2 --> [00xxxx0000]
+    GGML_API struct ggml_tensor * ggml_rope_set_offset(
             struct ggml_tensor  * a,
-            float                 min,
-            float                 max);
+            int                   n_offs);
 
     // im2col
     // converts data into a format that effectively results in a convolution when combined with matrix multiplication
@@ -2450,6 +2491,12 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // Use finite mask entries as a sparse K/V set. Set 0 to disable.
+    // n_kv_max must bound the number of finite entries in every mask row.
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+            struct ggml_tensor * a,
+            int32_t              n_kv_max);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
@@ -2476,7 +2523,8 @@ extern "C" {
             struct ggml_tensor  * A,
             struct ggml_tensor  * B,
             struct ggml_tensor  * C,
-            struct ggml_tensor  * ids);
+            struct ggml_tensor  * ids,
+            int64_t               K);
 
     // partition into non-overlapping windows with padding if needed
     // example:
@@ -2600,48 +2648,62 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
-    // DeepSeek V4 hyperconnection helpers.
-    GGML_API struct ggml_tensor * ggml_dsv4_hc_split_sinkhorn(
+    // DSA lightning indexer
+    //
+    // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
+    // k:       [n_embd_idx, 1,          n_kv,    ne3 ]
+    // weights: [n_head_idx, n_batch,    1,       ne3 ] !! prescaled !!
+    // mask:    [n_kv,       n_batch,    1,       ne33] !! f16 !!
+    // res:     [n_kv,       n_batch,    1,       ne3 ]
+    //
+    // broadcast:
+    //   ne3 % ne33 == 0
+    //
+    GGML_API struct ggml_tensor * ggml_lightning_indexer(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask);
+
+    // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
+    // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
+    // using a richer representation through streams.
+    //
+    // hc_comb: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
+    //          -> [dst_hc, src_hc, n_tokens]
+    // logits[dst, src, t] = mixes[2*hc + dst + hc*src, t]*scale[2]
+    //                         + base[2*hc + dst + hc*src]
+    // Softmax over dst, add eps, normalize over src, then repeat normalization
+    // over dst followed by src for iterations 1 through n_iter - 1.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_comb(
             struct ggml_context * ctx,
             struct ggml_tensor  * mixes,
             struct ggml_tensor  * scale,
             struct ggml_tensor  * base,
-            int                   n_hc,
-            int                   sinkhorn_iters,
-            float                 eps);
+            float                 eps,
+            int32_t               n_iter);
 
-    GGML_API struct ggml_tensor * ggml_dsv4_hc_weighted_sum(
+    // hc_pre: x [n_embd, hc, n_tokens], weights [hc, n_tokens] -> [n_embd, n_tokens]
+    //   result[i, t] = sum_h x[i, h, t]*weights[h, t]
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
             struct ggml_tensor  * weights);
 
-    GGML_API struct ggml_tensor * ggml_dsv4_hc_expand(
+    // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
+    //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
+    //          -> [n_embd, hc, n_tokens]
+    //   result[i, dst, t] = x[i, t]*post[dst, t]
+    //                       + sum_src residual[i, src, t]*comb[dst, src, t]
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
             struct ggml_context * ctx,
-            struct ggml_tensor  * block_out,
+            struct ggml_tensor  * x,
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
-
-    GGML_API struct ggml_tensor * ggml_dsv4_fp8_kv_quantize(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            int                   n_rot);
-
-    GGML_API struct ggml_tensor * ggml_dsv4_rope_tail(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            struct ggml_tensor  * pos,
-            struct ggml_tensor  * freq_factors,
-            int                   n_dims,
-            int                   mode,
-            int                   n_ctx_orig,
-            float                 freq_base,
-            float                 freq_scale,
-            float                 ext_factor,
-            float                 attn_factor,
-            float                 beta_fast,
-            float                 beta_slow,
-            bool                  inverse);
 
     // custom operators
 
@@ -2788,6 +2850,12 @@ extern "C" {
             int                   idx);
 
     GGML_API void ggml_build_forward_expand(
+            struct ggml_cgraph * cgraph,
+            struct ggml_tensor * tensor);
+
+    // add the tensor and its parents to the graph without marking them for compute
+    // the flag is set later, when the tensor is reached from a node that computes
+    GGML_API void ggml_build_forward_order(
             struct ggml_cgraph * cgraph,
             struct ggml_tensor * tensor);
 

@@ -46,6 +46,26 @@ f16vec4 dequantFuncQ1_0_v(const in decodeBufQ1_0 bl, const in uint blockCoords[2
         (qs_nib & 8u) != 0u ? d : md);
 }
 
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ2_0 {
+   block_q2_0 block;
+};
+
+float16_t dequantFuncQ2_0(const in decodeBufQ2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float16_t d = bl.block.d;
+    const uint idx = coordInBlock[1];
+    const uint bits = uint(bl.block.qs[idx >> 2]) >> (2u * (idx & 3u));
+    return (float16_t(bits & 3u) - float16_t(1.0)) * d;
+}
+
+f16vec4 dequantFuncQ2_0_v(const in decodeBufQ2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float16_t d = bl.block.d;
+    const uint idx = coordInBlock[1];
+    const uint bits = uint(bl.block.qs[idx >> 2]);
+    return f16vec4((vec4(bits & 3u, (bits >> 2u) & 3u, (bits >> 4u) & 3u, bits >> 6u) - 1.0f) * float(d));
+}
+
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ4_0 {
    block_q4_0_packed16 block;
 };
@@ -225,6 +245,44 @@ f16vec4 dequantFuncQ8_0_v(const in decodeBufQ8_0 bl, const in uint blockCoords[2
                  | (uint(uint16_t(bl.block.qs[base + 1u])) << 16u);
     const i8vec4 qi = unpack8(int32_t(w));
     return f16vec4(vec4(qi) * vec4(float(d)));
+}
+
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ2_0 {
+   block_tq2_0 block;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ2_0_packed16 {
+   block_tq2_0_packed16 block;
+};
+
+float16_t dequantFuncTQ2_0(const in decodeBufTQ2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    decodeBufTQ2_0_packed16 bl16 = decodeBufTQ2_0_packed16(bl);
+    const uint idx = coordInBlock[1];
+
+    const uint qsshift = (idx & 0x60) >> 4;             // 0,2,4,6
+
+    uint qs = uint32_t(bl16.block.qs[((idx & 0x80) >> 3) + ((idx & 0x1E) >> 1)]);
+    qs = (qs >> qsshift) & 0x0303;
+    qs = unpack8(qs)[idx & 1];
+
+    return bl.block.d * (float16_t(int(qs)) - float16_t(1.0));
+}
+
+f16vec4 dequantFuncTQ2_0_v(const in decodeBufTQ2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint idx = coordInBlock[1];
+
+    const uint qsshift = (idx & 0x60) >> 4;             // 0,2,4,6
+    const uint qsi = ((idx & 0x80) >> 2) + (idx & 0x1C); // byte index of 4-aligned group
+
+    const uint qsw = (uint(bl.block.qs[qsi]))
+                   | (uint(bl.block.qs[qsi + 1]) << 8)
+                   | (uint(bl.block.qs[qsi + 2]) << 16)
+                   | (uint(bl.block.qs[qsi + 3]) << 24);
+    const u8vec4 q = unpack8((qsw >> qsshift) & 0x03030303);
+
+    return bl.block.d * (f16vec4(q) - f16vec4(1.0));
 }
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer decodeBufQ2_K {
@@ -1232,11 +1290,15 @@ float16_t dequantFuncMXFP4(const in decodeBufMXFP4 bl, const in uint blockCoords
     const uint idx = coordInBlock[1];
     const uint iqs = idx & 0xF;
     const uint shift = (idx & 0x10) >> 2;
+#ifdef USE_OCP_FP4
+    return float16_t(bitcastExtractfe2m1EXT(bl.block.qs[iqs], shift)) * float16_t(d);
+#else
     uint32_t qs = bl.block.qs[iqs];
     qs >>= shift;
     qs &= 0xF;
     float16_t ret = float16_t(kvalues_mxfp4[qs] * d * 0.5);
     return ret;
+#endif
 }
 
 f16vec4 dequantFuncMXFP4_v(const in decodeBufMXFP4 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
@@ -1245,6 +1307,16 @@ f16vec4 dequantFuncMXFP4_v(const in decodeBufMXFP4 bl, const in uint blockCoords
     const uint idx = coordInBlock[1];
     const uint iqs = idx & 0xF;
     const uint shift = (idx & 0x10) >> 2;
+#ifdef USE_OCP_FP4
+    const fe2m1vec4 qv = bitcastExtractfe2m1EXT(
+        u8vec4(
+            bl.block.qs[iqs],
+            bl.block.qs[iqs + 1u],
+            bl.block.qs[iqs + 2u],
+            bl.block.qs[iqs + 3u]),
+        shift);
+    return f16vec4(qv) * float16_t(d);
+#else
     uvec4 qv = uvec4(
         uint(bl.block.qs[iqs]),
         uint(bl.block.qs[iqs + 1u]),
@@ -1257,6 +1329,7 @@ f16vec4 dequantFuncMXFP4_v(const in decodeBufMXFP4 bl, const in uint blockCoords
         float(kvalues_mxfp4[qv.z]),
         float(kvalues_mxfp4[qv.w])) * d * 0.5f;
     return f16vec4(ret);
+#endif
 }
 #endif
 
@@ -1275,10 +1348,15 @@ float16_t dequantFuncNVFP4(const in decodeBufNVFP4 bl, const in uint blockCoords
     const uint sub = (idx & 0x30) >> 4;
     const uint iqs = ((idx & 0x30) >> 1) + (idx & 0x7);
     const uint shift = (idx & 0x8) >> 1;
+#ifdef USE_OCP_FP4
+    const float16_t d = float16_t(ue4m3_from_bits(bl.block.d[sub]));
+    return float16_t(bitcastExtractfe2m1EXT(bl.block.qs[iqs], shift)) * d;
+#else
     const float d = ue4m3_to_fp32(bl.block.d[sub]);
     uint qs = uint(bl.block.qs[iqs]);
     qs = (qs >> shift) & 0xF;
     return float16_t(kvalues_mxfp4[qs] * d * 0.5);
+#endif
 }
 
 f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
@@ -1288,9 +1366,14 @@ f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords
     const uint sub   = idx >> 4;
     const uint qs_w  = ((idx & 0x30) >> 3) + ((idx & 0x4u) >> 2);  // iqs / 4, in [0,8)
     const uint shift = (idx & 0x8) >> 1;
-    const float d    = ue4m3_to_fp32(bl.block.d[sub]);
 
     const uint qsw  = uint32_t(bl32.block.qs[qs_w]);
+#ifdef USE_OCP_FP4
+    const float16_t d = float16_t(ue4m3_from_bits(bl.block.d[sub]));
+    const fe2m1vec4 qv = bitcastExtractfe2m1EXT(unpack8(qsw), shift);
+    return f16vec4(qv) * d;
+#else
+    const float d = ue4m3_to_fp32(bl.block.d[sub]);
     const u8vec4 qv = unpack8((qsw >> shift) & 0x0F0F0F0Fu);
     const vec4 ret = vec4(
         float(kvalues_mxfp4[qv.x]),
@@ -1298,185 +1381,16 @@ f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords
         float(kvalues_mxfp4[qv.z]),
         float(kvalues_mxfp4[qv.w])) * d * 0.5f;
     return f16vec4(ret);
-}
 #endif
-
-#if defined(DATA_A_ROCMFP4)
-layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufROCMFP4 {
-   block_rocmfp4 block;
-};
-
-float16_t dequantFuncROCMFP4(const in decodeBufROCMFP4 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
-{
-    const uint idx = coordInBlock[1];
-    const uint iqs = idx & 0xF;
-    const uint shift = (idx & 0x10) >> 2;
-    const uint sub = idx >> 4;
-    const float d = ue4m3_to_fp32(bl.block.e[sub]);
-    uint32_t qs = bl.block.qs[iqs];
-    qs >>= shift;
-    qs &= 0xF;
-    float16_t ret = float16_t(float(kvalues_rocmfp4[qs]) * d);
-    return ret;
-}
-#endif
-
-#if defined(DATA_A_ROCMFP4_FAST)
-layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufROCMFP4Fast {
-   block_rocmfp4_fast block;
-};
-
-float16_t dequantFuncROCMFP4Fast(const in decodeBufROCMFP4Fast bl, const in uint blockCoords[2], const in uint coordInBlock[2])
-{
-    const uint idx = coordInBlock[1];
-    const uint iqs = idx & 0xF;
-    const uint shift = (idx & 0x10) >> 2;
-    const float d = ue4m3_to_fp32(bl.block.e);
-    uint32_t qs = bl.block.qs[iqs];
-    qs >>= shift;
-    qs &= 0xF;
-    float16_t ret = float16_t(float(kvalues_rocmfp4[qs]) * d);
-    return ret;
-}
-#endif
-
-#if defined(DATA_A_ROCMFPX_FP2)
-layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufROCMFPXFP2 {
-   block_rocmfpx_fp2 block;
-};
-
-int rocmfpx_cm2_fp2_decode(uint code)
-{
-    return int(kvalues_rocmfpx_fp2_const[code & 3u]);
-}
-
-float16_t dequantFuncROCMFPXFP2(const in decodeBufROCMFPXFP2 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
-{
-    const uint idx = coordInBlock[1];
-    const uint packed = uint(bl.block.qs[idx >> 2u]);
-    const uint code = (packed >> (2u * (idx & 3u))) & 3u;
-    const float d = ue4m3_to_fp32(bl.block.e[idx >= 16u ? 1u : 0u]);
-    return float16_t(float(rocmfpx_cm2_fp2_decode(code)) * d);
-}
-
-f16vec4 dequantFuncROCMFPXFP2_v(const in decodeBufROCMFPXFP2 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
-{
-    const uint idx = coordInBlock[1];
-    const uint packed = uint(bl.block.qs[idx >> 2u]);
-    const vec4 q = vec4(rocmfpx_cm2_fp2_decode( packed        & 3u),
-                        rocmfpx_cm2_fp2_decode((packed >> 2u) & 3u),
-                        rocmfpx_cm2_fp2_decode((packed >> 4u) & 3u),
-                        rocmfpx_cm2_fp2_decode((packed >> 6u) & 3u));
-    return f16vec4(q * vec4(ue4m3_to_fp32(bl.block.e[(idx + 0u) >= 16u ? 1u : 0u]),
-                            ue4m3_to_fp32(bl.block.e[(idx + 1u) >= 16u ? 1u : 0u]),
-                            ue4m3_to_fp32(bl.block.e[(idx + 2u) >= 16u ? 1u : 0u]),
-                            ue4m3_to_fp32(bl.block.e[(idx + 3u) >= 16u ? 1u : 0u])));
-}
-#endif
-
-#if defined(DATA_A_ROCMFPX_FP3)
-layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufROCMFPXFP3 {
-   block_rocmfpx_fp3 block;
-};
-
-uint rocmfpx_cm2_fp3_get_bits(const in decodeBufROCMFPXFP3 bl, uint bit_pos)
-{
-    uint code = 0u;
-    [[unroll]] for (uint bit = 0u; bit < 3u; ++bit) {
-        const uint src_bit = bit_pos + bit;
-        code |= ((uint(bl.block.qs[src_bit >> 3u]) >> (src_bit & 7u)) & 1u) << bit;
-    }
-    return code;
-}
-
-int rocmfpx_cm2_fp3_decode(uint code)
-{
-    return int(kvalues_rocmfpx_fp3_const[code & 7u]);
-}
-
-float16_t dequantFuncROCMFPXFP3(const in decodeBufROCMFPXFP3 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
-{
-    const uint idx = coordInBlock[1];
-    const float d = ue4m3_to_fp32(bl.block.e[idx >= 16u ? 1u : 0u]);
-    return float16_t(float(rocmfpx_cm2_fp3_decode(rocmfpx_cm2_fp3_get_bits(bl, idx * 3u))) * d);
-}
-
-int32_t rocmfpx_cm2_fp3_pack4_window(const in decodeBufROCMFPXFP3 bl, uint idx)
-{
-    const uint bit_pos = idx * 3u;
-    const uint byte_pos = bit_pos >> 3u;
-    const uint sh = bit_pos & 7u;
-    uint bits = uint(bl.block.qs[byte_pos]) |
-                (uint(bl.block.qs[byte_pos + 1u]) << 8);
-    if (sh > 4u) {
-        bits |= uint(bl.block.qs[byte_pos + 2u]) << 16;
-    }
-    bits = (bits >> sh) & 0xFFFu;
-    return pack32(i8vec4(kvalues_rocmfpx_fp3_const[ bits        & 7u],
-                         kvalues_rocmfpx_fp3_const[(bits >> 3) & 7u],
-                         kvalues_rocmfpx_fp3_const[(bits >> 6) & 7u],
-                         kvalues_rocmfpx_fp3_const[(bits >> 9) & 7u]));
-}
-
-f16vec4 dequantFuncROCMFPXFP3_v(const in decodeBufROCMFPXFP3 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
-{
-    const uint idx = coordInBlock[1];
-    const vec4 q = vec4(unpack8(rocmfpx_cm2_fp3_pack4_window(bl, idx)));
-    return f16vec4(q * vec4(ue4m3_to_fp32(bl.block.e[(idx + 0u) >= 16u ? 1u : 0u]),
-                            ue4m3_to_fp32(bl.block.e[(idx + 1u) >= 16u ? 1u : 0u]),
-                            ue4m3_to_fp32(bl.block.e[(idx + 2u) >= 16u ? 1u : 0u]),
-                            ue4m3_to_fp32(bl.block.e[(idx + 3u) >= 16u ? 1u : 0u])));
-}
-#endif
-
-#if defined(DATA_A_ROCMFPX_FP6)
-layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufROCMFPXFP6 {
-   block_rocmfpx_fp6 block;
-};
-
-float16_t dequantFuncROCMFPXFP6(const in decodeBufROCMFPXFP6 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
-{
-    const uint idx = coordInBlock[1];
-    const float d = ue4m3_to_fp32(bl.block.e[idx >= 16u ? 1u : 0u]);
-    return float16_t(float(int(bl.block.qs[idx])) * d);
-}
-
-f16vec4 dequantFuncROCMFPXFP6_v(const in decodeBufROCMFPXFP6 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
-{
-    const uint idx = coordInBlock[1];
-    return f16vec4(float16_t(float(int(bl.block.qs[idx + 0u])) * ue4m3_to_fp32(bl.block.e[(idx + 0u) >= 16u ? 1u : 0u])),
-                   float16_t(float(int(bl.block.qs[idx + 1u])) * ue4m3_to_fp32(bl.block.e[(idx + 1u) >= 16u ? 1u : 0u])),
-                   float16_t(float(int(bl.block.qs[idx + 2u])) * ue4m3_to_fp32(bl.block.e[(idx + 2u) >= 16u ? 1u : 0u])),
-                   float16_t(float(int(bl.block.qs[idx + 3u])) * ue4m3_to_fp32(bl.block.e[(idx + 3u) >= 16u ? 1u : 0u])));
-}
-#endif
-
-#if defined(DATA_A_ROCMFPX_FP8)
-layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufROCMFPXFP8 {
-   block_rocmfpx_fp8 block;
-};
-
-float16_t dequantFuncROCMFPXFP8(const in decodeBufROCMFPXFP8 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
-{
-    const uint idx = coordInBlock[1];
-    const float d = ue4m3_to_fp32(bl.block.e);
-    return float16_t(float(int(bl.block.qs[idx])) * d);
-}
-
-f16vec4 dequantFuncROCMFPXFP8_v(const in decodeBufROCMFPXFP8 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
-{
-    const uint idx = coordInBlock[1];
-    const float d = ue4m3_to_fp32(bl.block.e);
-    return f16vec4(vec4(float(int(bl.block.qs[idx + 0u])),
-                        float(int(bl.block.qs[idx + 1u])),
-                        float(int(bl.block.qs[idx + 2u])),
-                        float(int(bl.block.qs[idx + 3u]))) * d);
 }
 #endif
 
 #if defined(DATA_A_Q1_0)
 #define dequantFuncA dequantFuncQ1_0
 #define dequantFuncA_v dequantFuncQ1_0_v
+#elif defined(DATA_A_Q2_0)
+#define dequantFuncA dequantFuncQ2_0
+#define dequantFuncA_v dequantFuncQ2_0_v
 #elif defined(DATA_A_Q4_0)
 #define dequantFuncA dequantFuncQ4_0
 #define dequantFuncA_v dequantFuncQ4_0_v
@@ -1492,6 +1406,9 @@ f16vec4 dequantFuncROCMFPXFP8_v(const in decodeBufROCMFPXFP8 bl, const in uint b
 #elif defined(DATA_A_Q8_0)
 #define dequantFuncA dequantFuncQ8_0
 #define dequantFuncA_v dequantFuncQ8_0_v
+#elif defined(DATA_A_TQ2_0)
+#define dequantFuncA dequantFuncTQ2_0
+#define dequantFuncA_v dequantFuncTQ2_0_v
 #elif defined(DATA_A_Q2_K)
 #define dequantFuncA dequantFuncQ2_K
 #define dequantFuncA_v dequantFuncQ2_K_v
@@ -1541,22 +1458,6 @@ f16vec4 dequantFuncROCMFPXFP8_v(const in decodeBufROCMFPXFP8 bl, const in uint b
 #elif defined(DATA_A_MXFP4)
 #define dequantFuncA dequantFuncMXFP4
 #define dequantFuncA_v dequantFuncMXFP4_v
-#elif defined(DATA_A_ROCMFP4)
-#define dequantFuncA dequantFuncROCMFP4
-#elif defined(DATA_A_ROCMFP4_FAST)
-#define dequantFuncA dequantFuncROCMFP4Fast
-#elif defined(DATA_A_ROCMFPX_FP2)
-#define dequantFuncA dequantFuncROCMFPXFP2
-#define dequantFuncA_v dequantFuncROCMFPXFP2_v
-#elif defined(DATA_A_ROCMFPX_FP3)
-#define dequantFuncA dequantFuncROCMFPXFP3
-#define dequantFuncA_v dequantFuncROCMFPXFP3_v
-#elif defined(DATA_A_ROCMFPX_FP6)
-#define dequantFuncA dequantFuncROCMFPXFP6
-#define dequantFuncA_v dequantFuncROCMFPXFP6_v
-#elif defined(DATA_A_ROCMFPX_FP8)
-#define dequantFuncA dequantFuncROCMFPXFP8
-#define dequantFuncA_v dequantFuncROCMFPXFP8_v
 #elif defined(DATA_A_NVFP4)
 #define dequantFuncA dequantFuncNVFP4
 #define dequantFuncA_v dequantFuncNVFP4_v

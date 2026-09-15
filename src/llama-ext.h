@@ -9,14 +9,6 @@
 #include <cstdint>
 #include <map>
 
-// Process a batch of tokens while temporarily limiting the physical
-// micro-batch size for this call. A value of 0 uses the context default.
-// The logical decode remains a single call and retains all output rows.
-LLAMA_API int32_t llama_decode_with_ubatch(
-        struct llama_context * ctx,
-          struct llama_batch   batch,
-                   uint32_t     n_ubatch);
-
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
@@ -98,32 +90,22 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
-//
-// pre-norm embeddings (hidden state before the final output norm)
-//
-
-// Set whether the context outputs pre-norm embeddings.
-// If masked == true, output only rows where batch.logits != 0.
-// If masked == false, output embeddings for all tokens in the batch regardless of batch.logits.
-LLAMA_API void llama_set_embeddings_pre_norm(struct llama_context * ctx, bool value, bool masked = false);
-LLAMA_API void llama_set_mtp_source(struct llama_context * ctx, struct llama_context * src);
-LLAMA_API int32_t llama_model_n_embd_pre_norm(const struct llama_model * model);
+// Set whether the context outputs nextn embeddings or not
+// If masked == true,  output the embeddings only for the tokens with batch.logits != 0
+// If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
-// Select the speculative NextN step used to validate reusable MTP graph inputs.
-// This is process-thread state rather than context state and defaults to zero.
-LLAMA_API void llama_set_mtp_speculative_step(int32_t step);
-
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
-LLAMA_API float * llama_get_embeddings_pre_norm    (struct llama_context * ctx);
+LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
-LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, int32_t i);
+LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
@@ -138,7 +120,15 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 // model/context data extraction
 //
 
+LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
+
 // returns pointer to the target-model layer indices
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+// retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
+// returns total number of elements or 0 on error
+// if out is nullptr, returns the number of tokens without writing to out
+// caller must allocate enough memory for out before calling
+LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);

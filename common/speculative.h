@@ -14,11 +14,37 @@ const char * common_speculative_all_types_str();
 // parse user provided types
 std::vector<enum common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names);
 
+// infer the spec types from the GGUF metadata of a draft model; empty if unknown
+std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
+
 // convert string to type
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);
 
 // convert type to string
 std::string common_speculative_type_to_str(enum common_speculative_type type);
+
+// return the max number of draft tokens based on the speculative parameters
+int32_t common_speculative_n_max(const common_params_speculative * spec);
+
+// return the max number of draft tokens from the initialized implementations
+int32_t common_speculative_n_max(const common_speculative * spec);
+
+// validate and resolve the unconditional synthetic acceptance rates
+std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max);
+
+// return the conditional synthetic acceptance probabilities
+const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec);
+
+common_params common_base_params_to_speculative(const common_params & params);
+
+struct common_speculative_output_limits {
+    int32_t total;
+    int32_t per_seq;
+};
+
+// return the output limits needed for speculative decoding
+common_speculative_output_limits common_speculative_get_output_limits(
+        int32_t n_batch, int32_t n_parallel, int32_t n_draft);
 
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
@@ -36,15 +62,6 @@ struct common_speculative_draft_params {
     int32_t n_max = -1;
 
     llama_pos   n_past;
-
-    // RoPE position that the target model would assign to id_last's successor.
-    // Equals n_past for text-only prompts, but they diverge under M-RoPE: an
-    // image chunk occupies n_tokens KV slots while advancing position by only
-    // n_pos. Only the draft-mtp implementation consumes this; -1 means "caller
-    // supplied no M-RoPE-aware position", and consumers fall back to n_past so
-    // behaviour is byte-identical to before for every other caller and impl.
-    llama_pos   pos_next = -1;
-
     llama_token id_last;
 
     // TODO: remove in the future by keeping track of the prompt from the _begin() call and the consecutive accept calls
@@ -52,9 +69,6 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
-
-    int32_t n_min = -1;
-    float   p_min = -1.0f;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -65,12 +79,6 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
-// true if any implementation requires target post-norm embeddings to be extracted
-bool common_speculative_need_embd(common_speculative * spec);
-
-// true if any implementation requires target pre-norm embeddings to be extracted
-bool common_speculative_need_embd_pre_norm(common_speculative * spec);
-
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
@@ -79,17 +87,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
-bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
-bool common_speculative_state_required(const common_speculative * spec);
-
-// (optional) rewind the internal state to a previously seen position, so that
-// processing can resume from there after the target/draft memories rolled back
-// (bounded prompt-cache boundary salvage). Returns false when the position is
-// not recoverable.
-bool common_speculative_rollback_state(common_speculative * spec, llama_seq_id seq_id, llama_pos pos);
-
-// rebase per-sequence positions after the corresponding target/draft contexts shift
-void common_speculative_shift_state(common_speculative * spec, llama_seq_id seq_id, llama_pos delta);
+void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
@@ -99,3 +97,19 @@ struct common_speculative_deleter {
 };
 
 typedef std::unique_ptr<common_speculative, common_speculative_deleter> common_speculative_ptr;
+
+struct common_speculative_init_result {
+    common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+    ~common_speculative_init_result();
+
+    llama_model   * model();
+    llama_context * context();
+
+private:
+    struct impl;
+    std::unique_ptr<impl> pimpl;
+};
+
+using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
+
+common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);

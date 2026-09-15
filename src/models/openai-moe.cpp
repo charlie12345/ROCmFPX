@@ -14,7 +14,7 @@ void llama_model_openai_moe::load_arch_hparams(llama_model_loader & ml) {
     hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
     ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
 
-    switch (hparams.n_layer) {
+    switch (hparams.n_layer()) {
         case 24: type = LLM_TYPE_20B; break;
         case 36: type = LLM_TYPE_120B; break;
         default: type = LLM_TYPE_UNKNOWN;
@@ -116,7 +116,7 @@ llama_model_openai_moe::graph::graph(const llama_model & model, const llm_graph_
 
             cb(cur, "attn_out", il);
         }
-        if (il == n_layer - 1) {
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             // skip computing output for unused tokens
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
@@ -153,6 +153,12 @@ llama_model_openai_moe::graph::graph(const llama_model & model, const llm_graph_
         inpL = cur;
     }
     cur = inpL;
+
+    res->t_h_nextn = cur;
+
+    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,

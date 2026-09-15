@@ -1,0 +1,96 @@
+name: ROCmFPX release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-cpu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build and test
+        run: |
+          cmake -S . -B build -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON
+          cmake --build build --target llama-cli llama-server llama-bench llama-quantize test-quantize-fns test-rocmfpx-plugin test-llama-archs -j 2
+          ./scripts/check-rocmfpx-reference.sh
+          ctest --test-dir build --output-on-failure -R '^(test-quantize-fns|test-rocmfpx-plugin)$'
+          ./build/bin/test-llama-archs -a qwen4exp
+      - name: Package
+        run: |
+          mkdir -p stage/bin stage/include/rocmfpx stage/share/rocmfpx
+          cp build/bin/llama-cli build/bin/llama-server build/bin/llama-bench build/bin/llama-quantize stage/bin/
+          cp include/rocmfpx-plugin.h stage/include/rocmfpx/
+          cp LICENSE NOTICE stage/share/rocmfpx/
+          cp -a docs/rocmfpx stage/share/rocmfpx/docs
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf rocmfpx-linux-x86_64.tar.gz -C stage .
+          sha256sum rocmfpx-linux-x86_64.tar.gz > rocmfpx-linux-x86_64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rocmfpx-linux-x86_64
+          path: rocmfpx-linux-x86_64.tar.gz*
+
+  container:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: docker/setup-buildx-action@v3
+      - name: Normalize image name
+        id: image
+        env:
+          IMAGE_NAME: ghcr.io/${{ github.repository }}
+        run: echo "name=${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build OCI image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .devops/rocmfpx.Dockerfile
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          load: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+      - name: Smoke-test OCI image
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            docker pull "$IMAGE"
+          fi
+          docker run --rm --entrypoint llama-server "$IMAGE" --version
+
+  github-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-cpu, container]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rocmfpx-linux-x86_64
+          path: dist
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --prerelease --generate-notes dist/*

@@ -19,6 +19,7 @@
 static inline uint32_t wrap_around(int32_t x, uint32_t n) {
     return (uint32_t)(((x % (int32_t)n) + (int32_t)n) % (int32_t)n);
 }
+
 /* Decompose a flat dst row index into (i1, i2, i3) */
 static inline void pad_decompose_row(uint32_t ir, uint32_t ne1, uint32_t ne2,
                                      uint32_t *i1, uint32_t *i2, uint32_t *i3) {
@@ -543,3 +544,4 @@ int op_pad(struct htp_ops_context * octx) {
 
     return HTP_STATUS_OK;
 }
+

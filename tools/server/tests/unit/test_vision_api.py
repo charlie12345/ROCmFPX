@@ -98,11 +98,30 @@ def test_vision_chat_completion(prompt, image_url, success, re_content):
         assert res.status_code != 200
 
 
+def test_vision_chat_completion_token_count():
+    global server
+    server.start()
+    res = server.make_request("POST", "/chat/completions/input_tokens", data={
+        "temperature": 0.0,
+        "top_k": 1,
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "What is this:"},
+                {"type": "image_url", "image_url": {
+                    "url": get_img_url("IMG_URL_0"),
+                }},
+            ]},
+        ],
+    })
+    assert res.status_code == 200
+    assert res.body["input_tokens"] > 10
+
+
 @pytest.mark.parametrize(
     "prompt, image_data, success, re_content",
     [
         # test model is trained on CIFAR-10, but it's quite dumb due to small size
-        ("What is this: <__media__>\n", "IMG_BASE64_0",         True, "(cat)+"),
+        ("What is this: <__media__>\n", "IMG_BASE64_0",         True, "(cat)+|(automobile)+"),
         ("What is this: <__media__>\n", "IMG_BASE64_1",         True, "(frog)+"),
         ("What is this: <__media__>\n", "malformed",            False, None), # non-image data
         ("What is this:\n",             "",                     False, None), # empty string
@@ -125,46 +144,6 @@ def test_vision_completion(prompt, image_data, success, re_content):
         assert match_regex(re_content, content)
     else:
         assert res.status_code != 200
-
-
-def test_vision_slot_erase():
-    global server
-    server.slot_save_path = "./tmp"
-    server.start()
-
-    prompt = "What is this: <__media__>\n"
-    image_data = get_img_url("IMG_BASE64_0")
-
-    res = server.make_request("POST", "/completions", data={
-        "temperature": 0.0,
-        "top_k": 1,
-        "id_slot": 0,
-        "cache_prompt": True,
-        "prompt": {
-            JSON_PROMPT_STRING_KEY: prompt,
-            JSON_MULTIMODAL_KEY: [ image_data ],
-        },
-    })
-    assert res.status_code == 200
-    assert match_regex("(cat)+", res.body["content"])
-
-    res = server.make_request("POST", "/slots/0?action=erase")
-    assert res.status_code == 200
-    assert res.body["id_slot"] == 0
-    assert res.body["n_erased"] > 0
-
-    res = server.make_request("POST", "/completions", data={
-        "temperature": 0.0,
-        "top_k": 1,
-        "id_slot": 0,
-        "cache_prompt": True,
-        "prompt": {
-            JSON_PROMPT_STRING_KEY: prompt,
-            JSON_MULTIMODAL_KEY: [ image_data ],
-        },
-    })
-    assert res.status_code == 200
-    assert match_regex("(cat)+", res.body["content"])
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,11 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_16bit_storage : require
 
+#ifdef USE_OCP_FP4
+#extension GL_EXT_float_e2m1 : require
+#extension GL_EXT_float_e4m3 : require
+#endif
+
 #if defined(DATA_A_F32)
 #define QUANT_K 1
 #define QUANT_R 1
@@ -206,6 +211,30 @@ struct block_q1_0
 #define A_TYPE block_q1_0
 #endif
 
+#define QUANT_K_Q2_0 64
+#define QUANT_R_Q2_0 1
+
+struct block_q2_0
+{
+    float16_t d;
+    uint8_t qs[QUANT_K_Q2_0 / 4];
+};
+
+struct block_q2_0_packed16
+{
+    float16_t d;
+    uint16_t qs[QUANT_K_Q2_0 / 8];
+};
+
+#if defined(DATA_A_Q2_0)
+#define QUANT_K QUANT_K_Q2_0
+#define QUANT_R QUANT_R_Q2_0
+#define QUANT_AUXF 1
+#define A_TYPE block_q2_0
+#define A_TYPE_PACKED16 block_q2_0_packed16
+#define DATA_A_QUANT_LEGACY
+#endif
+
 #define QUANT_K_Q8_1 32
 #define QUANT_R_Q8_1 1
 
@@ -271,6 +300,30 @@ struct block_q2_K_packed32
 #define A_TYPE_PACKED16 block_q2_K_packed16
 #define A_TYPE_PACKED32 block_q2_K_packed32
 #define SCALES_PER_32 2
+#define DATA_A_QUANT_K
+#endif
+
+#define QUANT_K_TQ2_0 256
+
+// ternary (BitNet): 2-bit codes, w = (q - 1) * d; qs layout matches q2_K's
+// two 32-byte groups with four bit-levels per byte
+struct block_tq2_0
+{
+    uint8_t qs[QUANT_K_TQ2_0/4];
+    float16_t d;
+};
+
+struct block_tq2_0_packed16
+{
+    uint16_t qs[QUANT_K_TQ2_0/4/2];
+    float16_t d;
+};
+
+#if defined(DATA_A_TQ2_0)
+#define QUANT_K QUANT_K_TQ2_0
+#define QUANT_R 1
+#define A_TYPE block_tq2_0
+#define A_TYPE_PACKED16 block_tq2_0_packed16
 #define DATA_A_QUANT_K
 #endif
 
@@ -1767,16 +1820,22 @@ struct block_rocmfpx_fp3
     uint8_t e[2];
 };
 
-struct block_rocmfpx_fp6
+struct block_rocmfpx_fp5
 {
-    int8_t qs[32];
+    uint8_t qs[20];
     uint8_t e[2];
 };
 
-struct block_rocmfpx_fp6_packed16
+struct block_rocmfpx_fp6
 {
-    int16_t qs[16];
-    uint16_t e;
+    uint8_t qs[24];
+    uint8_t e[2];
+};
+
+struct block_rocmfpx_fp7
+{
+    uint8_t qs[28];
+    uint8_t e[2];
 };
 
 struct block_rocmfpx_fp8
@@ -1799,12 +1858,25 @@ struct block_rocmfpx_fp8
 #define A_TYPE block_rocmfpx_fp3
 #endif
 
+#if defined(DATA_A_ROCMFPX_FP5)
+#define QUANT_K QUANT_K_ROCMFPX_FP8
+#define QUANT_R QUANT_R_ROCMFPX_FP8
+#define QUANT_AUXF 1
+#define A_TYPE block_rocmfpx_fp5
+#endif
+
 #if defined(DATA_A_ROCMFPX_FP6)
 #define QUANT_K QUANT_K_ROCMFPX_FP8
 #define QUANT_R QUANT_R_ROCMFPX_FP8
 #define QUANT_AUXF 1
 #define A_TYPE block_rocmfpx_fp6
-#define A_TYPE_PACKED16 block_rocmfpx_fp6_packed16
+#endif
+
+#if defined(DATA_A_ROCMFPX_FP7)
+#define QUANT_K QUANT_K_ROCMFPX_FP8
+#define QUANT_R QUANT_R_ROCMFPX_FP8
+#define QUANT_AUXF 1
+#define A_TYPE block_rocmfpx_fp7
 #endif
 
 #if defined(DATA_A_ROCMFPX_FP8)
@@ -1814,7 +1886,7 @@ struct block_rocmfpx_fp8
 #define A_TYPE block_rocmfpx_fp8
 #endif
 
-#if defined(DATA_A_ROCMFPX_FP2) || defined(DATA_A_ROCMFPX_FP3) || defined(DATA_A_ROCMFPX_FP6) || defined(DATA_A_ROCMFPX_FP8)
+#if defined(DATA_A_ROCMFPX_FP2) || defined(DATA_A_ROCMFPX_FP3) || defined(DATA_A_ROCMFPX_FP5) || defined(DATA_A_ROCMFPX_FP6) || defined(DATA_A_ROCMFPX_FP7) || defined(DATA_A_ROCMFPX_FP8)
 #define DATA_A_ROCMFPX_FAMILY
 #endif
 
@@ -1857,6 +1929,12 @@ struct block_nvfp4
     uint8_t qs[QUANT_K_NVFP4 / 2];
 };
 
+struct block_nvfp4_packed16
+{
+    uint16_t d[QUANT_K_NVFP4 / 16 / 2];
+    uint16_t qs[QUANT_K_NVFP4 / 2 / 2];
+};
+
 struct block_nvfp4_packed32
 {
     uint32_t d[QUANT_K_NVFP4 / 16 / 4];
@@ -1868,11 +1946,51 @@ struct block_nvfp4_packed32
 #define QUANT_R QUANT_R_NVFP4
 #define QUANT_AUXF 1
 #define A_TYPE block_nvfp4
+#define A_TYPE_PACKED16 block_nvfp4_packed16
 #define A_TYPE_PACKED32 block_nvfp4_packed32
 #endif
 
-#if defined(DATA_A_NVFP4) || defined(DATA_A_ROCMFPX_FAMILY) || defined(FA_ROCMFPX_FAMILY)
-// UE4M3 scale bytes use only 7 bits; sign (bit 7) is always zero.
+#if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
+const int8_t kvalues_iq4nl_const[16] = {
+    int8_t(-127), int8_t(-104), int8_t(-83), int8_t(-65), int8_t(-49), int8_t(-35), int8_t(-22), int8_t(-10),
+    int8_t(1), int8_t(13), int8_t(25), int8_t(38), int8_t(53), int8_t(69), int8_t(89), int8_t(113)
+};
+
+shared FLOAT_TYPE kvalues_iq4nl[16];
+
+#define NEEDS_INIT_IQ_SHMEM
+void init_iq_shmem(uvec3 wgsize)
+{
+    // copy the table into shared memory and sync
+    for (uint i = gl_LocalInvocationIndex.x; i < kvalues_iq4nl.length(); i += wgsize.x) {
+        kvalues_iq4nl[i] = FLOAT_TYPE(kvalues_iq4nl_const[i]);
+    }
+    barrier();
+}
+#endif
+
+#if defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4) || defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST) || defined(DATA_A_ROCMFPX_FAMILY) || defined(FA_ROCMFPX_FAMILY)
+#if !defined(USE_OCP_FP4)
+const int8_t kvalues_mxfp4_const[16] = {
+    int8_t(0), int8_t(1), int8_t(2), int8_t(3), int8_t(4), int8_t(6), int8_t(8), int8_t(12),
+    int8_t(0), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-6), int8_t(-8), int8_t(-12),
+};
+
+shared int8_t kvalues_mxfp4[16];
+#endif
+
+#if defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
+const int8_t kvalues_rocmfp4_const[16] = {
+    int8_t(0), int8_t(1), int8_t(2), int8_t(3), int8_t(4), int8_t(6), int8_t(8), int8_t(10),
+    int8_t(0), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-6), int8_t(-8), int8_t(-10),
+};
+
+shared int8_t kvalues_rocmfp4[16];
+shared float rocmfp4_ue4m3_fp32_lut[128];
+#endif
+
+#if (defined(DATA_A_NVFP4) && !defined(USE_OCP_FP4)) || defined(DATA_A_ROCMFPX_FAMILY) || defined(FA_ROCMFPX_FAMILY)
+// UE4M3 scale in NVFP4 blocks use only 7 bits; sign (bit 7) is always zero.
 shared float ue4m3_fp32_lut[128];
 
 float ue4m3_to_fp32_build(uint u) {
@@ -1896,49 +2014,6 @@ float ue4m3_to_fp32_build(uint u) {
 }
 #endif
 
-#if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
-const int8_t kvalues_iq4nl_const[16] = {
-    int8_t(-127), int8_t(-104), int8_t(-83), int8_t(-65), int8_t(-49), int8_t(-35), int8_t(-22), int8_t(-10),
-    int8_t(1), int8_t(13), int8_t(25), int8_t(38), int8_t(53), int8_t(69), int8_t(89), int8_t(113)
-};
-
-shared FLOAT_TYPE kvalues_iq4nl[16];
-
-#define NEEDS_INIT_IQ_SHMEM
-void init_iq_shmem(uvec3 wgsize)
-{
-    // copy the table into shared memory and sync
-    for (uint i = gl_LocalInvocationIndex.x; i < kvalues_iq4nl.length(); i += wgsize.x) {
-        kvalues_iq4nl[i] = FLOAT_TYPE(kvalues_iq4nl_const[i]);
-    }
-#if defined(FA_ROCMFPX_FAMILY)
-    for (uint i = gl_LocalInvocationIndex.x; i < 128u; i += wgsize.x) {
-        ue4m3_fp32_lut[i] = ue4m3_to_fp32_build(i);
-    }
-#endif
-    barrier();
-}
-#endif
-
-#if defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)
-const int8_t kvalues_mxfp4_const[16] = {
-    int8_t(0), int8_t(1), int8_t(2), int8_t(3), int8_t(4), int8_t(6), int8_t(8), int8_t(12),
-    int8_t(0), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-6), int8_t(-8), int8_t(-12),
-};
-
-shared int8_t kvalues_mxfp4[16];
-#endif
-
-#if defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
-const int8_t kvalues_rocmfp4_const[16] = {
-    int8_t(0), int8_t(1), int8_t(2), int8_t(3), int8_t(4), int8_t(6), int8_t(8), int8_t(10),
-    int8_t(0), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-6), int8_t(-8), int8_t(-10),
-};
-
-shared int8_t kvalues_rocmfp4[16];
-shared float rocmfp4_ue4m3_fp32_lut[128];
-#endif
-
 #if defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
 float rocmfp4_ue4m3_to_fp32_build(uint u) {
     if (u == 0u || u == 127u) {
@@ -1949,15 +2024,12 @@ float rocmfp4_ue4m3_to_fp32_build(uint u) {
     if (exp == 0u) {
         return float(man) * (1.0 / 1024.0);
     }
-
-    // ROCmFP4 codebook values are stored at half scale, so return the
-    // already-halved UE4M3 value and keep shader call sites multiply-free.
     const uint bits = (exp + 119u) << 23 | (man << 20);
     return uintBitsToFloat(bits);
 }
 #endif
 
-#if defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4) || defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST) || defined(DATA_A_ROCMFPX_FAMILY)
+#if !defined(USE_OCP_FP4)
 #define NEEDS_INIT_IQ_SHMEM
 void init_iq_shmem(uvec3 wgsize)
 {
@@ -1975,13 +2047,14 @@ void init_iq_shmem(uvec3 wgsize)
         rocmfp4_ue4m3_fp32_lut[i] = rocmfp4_ue4m3_to_fp32_build(i);
     }
 #endif
-#if defined(DATA_A_NVFP4) || defined(DATA_A_ROCMFPX_FAMILY)
+#if defined(DATA_A_NVFP4) || defined(DATA_A_ROCMFPX_FAMILY) || defined(FA_ROCMFPX_FAMILY)
     for (uint i = gl_LocalInvocationIndex.x; i < 128u; i += wgsize.x) {
         ue4m3_fp32_lut[i] = ue4m3_to_fp32_build(i);
     }
 #endif
     barrier();
 }
+#endif
 #endif
 
 // returns the bfloat value in the low 16b.
@@ -2025,12 +2098,31 @@ float ue4m3_to_fp32(uint8_t x) {
     return ue4m3_fp32_lut[min(uint(x), 127u)];
 }
 #elif defined(DATA_A_NVFP4)
+#if defined(USE_OCP_FP4)
+floate4m3_t ue4m3_from_bits(uint8_t x) {
+    if (x == uint8_t(0x7F)) {
+        return floate4m3_t(0.0);
+    }
+    return uintBitsToFloate4m3EXT(x);
+}
+#endif
+
 float ue4m3_to_fp32(uint8_t x) {
+#if defined(USE_OCP_FP4)
+    return float(ue4m3_from_bits(x));
+#else
     return ue4m3_fp32_lut[uint(x)];
+#endif
 }
 #endif
 
 #if defined(DATA_A_ROCMFPX_FAMILY)
+int rocmfpx_decode_linear_code(uint code, uint bits) {
+    const uint sign = 1u << (bits - 1u);
+    const int magnitude = int(code & (sign - 1u));
+    return (code & sign) != 0u ? -(magnitude == 0 ? int(sign) : magnitude) : magnitude;
+}
+
 const int8_t kvalues_rocmfpx_fp2_const[4] = {
     int8_t(-4), int8_t(-1), int8_t(1), int8_t(4)
 };

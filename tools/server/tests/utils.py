@@ -5,7 +5,6 @@
 
 import subprocess
 import os
-import signal
 
 TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
 import re
@@ -31,6 +30,9 @@ import wget
 
 
 DEFAULT_HTTP_TIMEOUT = 60
+
+# per-request timeout, a hung server fails the test instead of stalling the CI for hours
+DEFAULT_REQUEST_TIMEOUT = 600
 
 
 class ServerResponse:
@@ -65,7 +67,6 @@ class ServerProcess:
     model_draft: str | None = None
     n_threads: int | None = None
     n_gpu_layer: int | None = None
-    n_gpu_layer_draft: int | None = None
     n_batch: int | None = None
     n_ubatch: int | None = None
     n_ctx: int | None = None
@@ -85,6 +86,7 @@ class ServerProcess:
     server_reranking: bool | None = False
     server_metrics: bool | None = False
     kv_unified: bool | None = False
+    swa_full: bool | None = False
     server_slots: bool | None = False
     pooling: str | None = None
     api_key: str | None = None
@@ -94,9 +96,12 @@ class ServerProcess:
     no_models_autoload: bool | None = None
     lora_files: List[str] | None = None
     enable_ctx_shift: int | None = False
+    spec_type: str | None = None
     spec_draft_n_min: int | None = None
     spec_draft_n_max: int | None = None
-    no_webui: bool | None = None
+    spec_synth_len: float | None = None
+    spec_synth_rates: List[float] | None = None
+    no_ui: bool | None = None
     jinja: bool | None = None
     reasoning_format: Literal['deepseek', 'none', 'nothink'] | None = None
     reasoning: Literal['on', 'off', 'auto'] | None = None
@@ -104,16 +109,20 @@ class ServerProcess:
     chat_template_file: str | None = None
     server_path: str | None = None
     mmproj_url: str | None = None
+    no_mmproj: bool | None = None
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
-    cache_disk: str | None = None
-    cache_disk_limit: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
-    webui_mcp_proxy: bool = False
+    ui_mcp_proxy: bool = False
     backend_sampling: bool = False
     gcp_compat: bool = False
+    server_tools: str | None = None
+    server_tools_runtime: str | None = None
+    mcp_servers_config: str | None = None
+    mcp_servers_json: str | None = None
+    cors_origins: str | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -128,7 +137,10 @@ class ServerProcess:
         self.external_server = "DEBUG_EXTERNAL" in os.environ
 
     def start(self, timeout_seconds: int = DEFAULT_HTTP_TIMEOUT) -> None:
-        env = {**os.environ}
+        env = {
+            **os.environ,
+            "LLAMA_SERVER_DEBUG_FAKE_TIMING": "1",
+        }
         if "LLAMA_CACHE" not in os.environ:
             env["LLAMA_CACHE"] = "tmp"
         if self.external_server:
@@ -170,16 +182,16 @@ class ServerProcess:
             server_args.extend(["--models-max", self.models_max])
         if self.models_preset:
             server_args.extend(["--models-preset", self.models_preset])
+        if self.cors_origins:
+            server_args.extend(["--cors-origins", self.cors_origins])
         if self.n_batch:
             server_args.extend(["--batch-size", self.n_batch])
         if self.n_ubatch:
             server_args.extend(["--ubatch-size", self.n_ubatch])
         if self.n_threads:
             server_args.extend(["--threads", self.n_threads])
-        if self.n_gpu_layer is not None:
+        if self.n_gpu_layer:
             server_args.extend(["--n-gpu-layers", self.n_gpu_layer])
-        if self.n_gpu_layer_draft is not None:
-            server_args.extend(["--n-gpu-layers-draft", self.n_gpu_layer_draft])
         if self.server_continuous_batching:
             server_args.append("--cont-batching")
         if self.server_embeddings:
@@ -190,6 +202,8 @@ class ServerProcess:
             server_args.append("--metrics")
         if self.kv_unified:
             server_args.append("--kv-unified")
+        if self.swa_full:
+            server_args.append("--swa-full")
         if self.server_slots:
             server_args.append("--slots")
         else:
@@ -225,14 +239,21 @@ class ServerProcess:
                 server_args.extend(["--lora", lora_file])
         if self.enable_ctx_shift:
             server_args.append("--context-shift")
+        if self.spec_type:
+            server_args.extend(["--spec-type", self.spec_type])
         if self.api_key:
             server_args.extend(["--api-key", self.api_key])
         if self.spec_draft_n_max:
             server_args.extend(["--spec-draft-n-max", self.spec_draft_n_max])
         if self.spec_draft_n_min:
             server_args.extend(["--spec-draft-n-min", self.spec_draft_n_min])
-        if self.no_webui:
-            server_args.append("--no-webui")
+        if self.spec_synth_len is not None:
+            server_args.extend(["--spec-synth-len", self.spec_synth_len])
+        if self.spec_synth_rates is not None:
+            rates = ",".join(str(rate) for rate in self.spec_synth_rates)
+            server_args.extend(["--spec-synth-rates", rates])
+        if self.no_ui:
+            server_args.append("--no-ui")
         if self.no_models_autoload:
             server_args.append("--no-models-autoload")
         if self.jinja:
@@ -249,20 +270,26 @@ class ServerProcess:
             server_args.extend(["--chat-template-file", self.chat_template_file])
         if self.mmproj_url:
             server_args.extend(["--mmproj-url", self.mmproj_url])
+        if self.no_mmproj:
+            server_args.append("--no-mmproj")
         if self.media_path:
             server_args.extend(["--media-path", self.media_path])
         if self.sleep_idle_seconds is not None:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.cache_ram is not None:
             server_args.extend(["--cache-ram", self.cache_ram])
-        if self.cache_disk is not None:
-            server_args.extend(["--cache-disk", self.cache_disk])
-        if self.cache_disk_limit is not None:
-            server_args.extend(["--cache-disk-limit", self.cache_disk_limit])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
-        if self.webui_mcp_proxy:
-            server_args.append("--webui-mcp-proxy")
+        if self.ui_mcp_proxy:
+            server_args.append("--ui-mcp-proxy")
+        if self.server_tools:
+            server_args.extend(["--tools", self.server_tools])
+        if self.server_tools_runtime:
+            server_args.extend(["--tools-runtime", self.server_tools_runtime])
+        if self.mcp_servers_config:
+            server_args.extend(["--mcp-servers-config", self.mcp_servers_config])
+        if self.mcp_servers_json:
+            server_args.extend(["--mcp-servers-json", self.mcp_servers_json])
         if self.backend_sampling:
             server_args.append("--backend_sampling")
         if self.gcp_compat:
@@ -273,9 +300,9 @@ class ServerProcess:
 
         flags = 0
         if "nt" == os.name:
-            # Keep the child in this console so CTRL_BREAK can request a
-            # graceful shutdown of its dedicated process group.
+            flags |= subprocess.DETACHED_PROCESS
             flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+            flags |= subprocess.CREATE_NO_WINDOW
 
         if self.log_path:
             self._log = open(self.log_path, "w")
@@ -295,6 +322,7 @@ class ServerProcess:
 
         # wait for server to start
         start_time = time.time()
+        last_print_time = start_time
         while time.time() - start_time < timeout_seconds:
             try:
                 response = self.make_request("GET", "/health", headers={
@@ -309,8 +337,10 @@ class ServerProcess:
             if self.process.poll() is not None:
                 raise RuntimeError(f"Server process died with return code {self.process.returncode}")
 
-            print(f"Waiting for server to start...")
-            time.sleep(0.5)
+            if time.time() - last_print_time >= 1.0:
+                print(f"Waiting for server to start...")
+                last_print_time = time.time()
+            time.sleep(0.01)
         raise TimeoutError(f"Server did not start within {timeout_seconds} seconds")
 
     def stop(self) -> None:
@@ -321,16 +351,7 @@ class ServerProcess:
             server_instances.remove(self)
         if self.process:
             print(f"Stopping server with pid={self.process.pid}")
-            if os.name == "nt":
-                # Popen.terminate() calls TerminateProcess on Windows, which
-                # bypasses llama-server's cleanup and C++ destructors.
-                try:
-                    self.process.send_signal(signal.CTRL_BREAK_EVENT)
-                except OSError as e:
-                    print(f"Could not signal server process group gracefully: {e}")
-                    self.process.terminate()
-            else:
-                self.process.terminate()
+            self.process.terminate()
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -349,7 +370,7 @@ class ServerProcess:
         path: str,
         data: dict | Any | None = None,
         headers: dict | None = None,
-        timeout: float | None = None,
+        timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
     ) -> ServerResponse:
         url = f"http://{self.server_host}:{self.server_port}{path}"
         parse_body = False
@@ -358,6 +379,9 @@ class ServerProcess:
             parse_body = True
         elif method == "POST":
             response = requests.post(url, headers=headers, json=data, timeout=timeout)
+            parse_body = True
+        elif method == "DELETE":
+            response = requests.delete(url, headers=headers, timeout=timeout)
             parse_body = True
         elif method == "OPTIONS":
             response = requests.options(url, headers=headers, timeout=timeout)
@@ -369,7 +393,7 @@ class ServerProcess:
         if parse_body:
             try:
                 result.body = response.json()
-            except JSONDecodeError:
+            except (JSONDecodeError, requests.exceptions.JSONDecodeError):
                 result.body = response.text
         else:
             result.body = None
@@ -405,7 +429,7 @@ class ServerProcess:
         path: str,
         data: dict | None = None,
         headers: dict | None = None,
-        timeout: float | None = None,
+        timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
     ) -> dict:
         stream = data.get('stream', False)
         if stream:
@@ -606,7 +630,7 @@ class ServerPreset:
         server.model_hf_repo = "ggml-org/tinygemma3-GGUF:Q8_0"
         server.model_alias = "tinygemma3"
         server.n_ctx = 1024
-        server.n_batch = 32
+        server.n_batch = 512
         server.n_slots = 2
         server.n_predict = 4
         server.seed = 42

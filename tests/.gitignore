@@ -1,8 +1,5 @@
 *
 !*.*
-!fixtures/
-!fixtures/**/
-!fixtures/**/*.*
 !snapshots/
 *.o
 ggml-common.h

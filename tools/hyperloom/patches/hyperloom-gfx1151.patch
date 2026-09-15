@@ -1,0 +1,51 @@
+diff --git a/src/hyperloom/common/gpu_identity.py b/src/hyperloom/common/gpu_identity.py
+index 669f89cb..b294de87 100644
+--- a/src/hyperloom/common/gpu_identity.py
++++ b/src/hyperloom/common/gpu_identity.py
+@@ -22,0 +23 @@ AMD_GPU_DISPATCH_IDENTITIES: dict[str, tuple[str, int]] = {
++    "strixhalo": ("gfx1151", 40),
+diff --git a/src/hyperloom/inference_optimizer/gpu_types.py b/src/hyperloom/inference_optimizer/gpu_types.py
+index fcbf98fe..89bf633b 100644
+--- a/src/hyperloom/inference_optimizer/gpu_types.py
++++ b/src/hyperloom/inference_optimizer/gpu_types.py
+@@ -20,0 +21,5 @@ _PRODUCT_TAGS: tuple[str, ...] = tuple(sorted((t.upper() for t in _AMD_GPU_TYPES
++_PRODUCT_ALIASES: dict[str, str] = {
++    "RADEON 8060S": "strixhalo",
++    "RYZEN AI MAX+ 395": "strixhalo",
++}
++
+@@ -28,0 +34 @@ _GFX_TO_RUNNER: dict[str, str] = {
++    "gfx1151": "strixhalo",
+@@ -62 +68 @@ def _autodetect_gpu_type() -> str | None:
+-    """Return mi300x|mi308x|mi325x|mi355x or None if undetectable."""
++    """Return a supported AMD board type, or None if undetectable."""
+@@ -74,0 +81,3 @@ def _autodetect_gpu_type() -> str | None:
++        for product, gpu_type in _PRODUCT_ALIASES.items():
++            if product in out:
++                return gpu_type
+diff --git a/src/hyperloom/inference_optimizer/tests/test_gpu_board_list_single_source.py b/src/hyperloom/inference_optimizer/tests/test_gpu_board_list_single_source.py
+index d6c48af2..7e02ebbb 100644
+--- a/src/hyperloom/inference_optimizer/tests/test_gpu_board_list_single_source.py
++++ b/src/hyperloom/inference_optimizer/tests/test_gpu_board_list_single_source.py
+@@ -16,0 +17,2 @@ from hyperloom.inference_optimizer.gpu_types import (
++    _GFX_TO_RUNNER,
++    _PRODUCT_ALIASES,
+@@ -17,0 +20 @@ from hyperloom.inference_optimizer.gpu_types import (
++    _autodetect_gpu_type,
+@@ -85,0 +89,16 @@ def test_a_tag_never_precedes_one_it_is_a_prefix_of():
++
++
++def test_strix_halo_dispatch_identity():
++    assert amd_gpu_dispatch_identity("strixhalo") == ("gfx1151", 40)
++    assert _GFX_TO_RUNNER["gfx1151"] == "strixhalo"
++
++
++def test_strix_halo_product_alias_autodetect(monkeypatch):
++    import subprocess
++
++    class Result:
++        stdout = "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
++
++    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: Result())
++    assert _PRODUCT_ALIASES["RADEON 8060S"] == "strixhalo"
++    assert _autodetect_gpu_type() == "strixhalo"

@@ -28,6 +28,7 @@ def quant_shape_from_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizati
 # This is faster than np.vectorize and np.apply_along_axis because it works on more than one row at a time
 def _apply_over_grouped_rows(func: Callable[[np.ndarray], np.ndarray], arr: np.ndarray, otype: DTypeLike, oshape: tuple[int, ...]) -> np.ndarray:
     rows = arr.reshape((-1, arr.shape[-1]))
+    assert len(rows.shape)
     osize = 1
     for dim in oshape:
         osize *= dim
@@ -453,12 +454,41 @@ class Q6_0_ROCMFPX(__Quant, qtype=GGMLQuantizationType.Q6_0_ROCMFPX):
         qs, e = np.hsplit(blocks, [24])
 
         codes = _rocmfpx_unpack_codes(qs, 6, cls.block_size)
-        mag = (codes & np.uint8(31)).astype(np.int8)
-        vals = np.where((codes & np.uint8(32)) != 0, -mag, mag).astype(np.float32)
+        mag = (codes & np.uint8(31)).astype(np.int16)
+        neg_mag = np.where(mag == 0, 32, mag)
+        vals = np.where((codes & np.uint8(32)) != 0, -neg_mag, mag).astype(np.float32)
 
         scales = _rocmfpx_ue4m3_to_fp32(e).reshape(n_blocks, 2, 1)
         vals = vals.reshape(n_blocks, 2, cls.block_size // 2)
 
+        return (vals * scales).reshape(n_blocks, cls.block_size)
+
+
+class Q5_0_ROCMFPX(__Quant, qtype=GGMLQuantizationType.Q5_0_ROCMFPX):
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+        qs, e = np.hsplit(blocks, [20])
+        codes = _rocmfpx_unpack_codes(qs, 5, cls.block_size)
+        mag = (codes & np.uint8(15)).astype(np.int16)
+        neg_mag = np.where(mag == 0, 16, mag)
+        vals = np.where((codes & np.uint8(16)) != 0, -neg_mag, mag).astype(np.float32)
+        scales = _rocmfpx_ue4m3_to_fp32(e).reshape(n_blocks, 2, 1)
+        vals = vals.reshape(n_blocks, 2, cls.block_size // 2)
+        return (vals * scales).reshape(n_blocks, cls.block_size)
+
+
+class Q7_0_ROCMFPX(__Quant, qtype=GGMLQuantizationType.Q7_0_ROCMFPX):
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+        qs, e = np.hsplit(blocks, [28])
+        codes = _rocmfpx_unpack_codes(qs, 7, cls.block_size)
+        mag = (codes & np.uint8(63)).astype(np.int16)
+        neg_mag = np.where(mag == 0, 64, mag)
+        vals = np.where((codes & np.uint8(64)) != 0, -neg_mag, mag).astype(np.float32)
+        scales = _rocmfpx_ue4m3_to_fp32(e).reshape(n_blocks, 2, 1)
+        vals = vals.reshape(n_blocks, 2, cls.block_size // 2)
         return (vals * scales).reshape(n_blocks, cls.block_size)
 
 
