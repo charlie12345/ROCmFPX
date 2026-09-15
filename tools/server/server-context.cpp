@@ -309,29 +309,23 @@ struct server_slot {
             return false;
         }
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
-
-        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
-
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
-        if (cur == nullptr) {
-            return false;
+        // exact-boundary speculative state (e.g. the MTP drafter's deferred boundary row);
+        // optional - the drafter re-derives it from the first re-processed token otherwise
+        std::vector<uint8_t> state_spec;
+        if (spec) {
+            common_speculative_get_state(spec, id, state_spec);
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        }
-
-        return true;
+        return prompt_cache.save(prompt, ctx_tgt, ctx_dft, id, state_spec);
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        std::vector<uint8_t> state_spec;
+
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, &state_spec);
+        if (res && spec && !state_spec.empty()) {
+            common_speculative_set_state(spec, id, state_spec);
+        }
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -1400,17 +1394,58 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0) {
-            if (params_base.cache_ram_mib < 0) {
-                SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
-            } else {
-                SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
-            }
-            SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+        const bool cache_disk_enabled = !params_base.cache_disk_path.empty() && params_base.cache_disk_limit_mib > 0;
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+        if (params_base.cache_ram_mib != 0 || cache_disk_enabled) {
+            if (params_base.cache_ram_mib < 0) {
+                SRV_INF("prompt cache RAM enabled: limit=%s\n", "unlimited");
+            } else if (params_base.cache_ram_mib > 0) {
+                SRV_INF("prompt cache RAM enabled: limit_mib=%d\n", params_base.cache_ram_mib);
+            } else {
+                SRV_INF("%s", "prompt cache RAM disabled: limit_mib=0\n");
+            }
+
+            if (cache_disk_enabled) {
+                SRV_INF("prompt cache SSD enabled: path=%s limit_mib=%d target_and_draft=true\n",
+                        params_base.cache_disk_path.c_str(), params_base.cache_disk_limit_mib);
+            }
+
+            // Identity stamp for the disk cache: a later run adopts a previous run's
+            // entries only if all of this matches (the state files are only meaningful
+            // for the same model file, context size and KV cache types).
+            std::string cache_identity;
+            {
+                std::error_code iec;
+                const auto msz = std::filesystem::file_size(std::filesystem::u8path(params_base.model.path), iec);
+                cache_identity = params_base.model.path
+                    + "|size=" + std::to_string(iec ? 0 : (unsigned long long) msz)
+                    + "|n_ctx=" + std::to_string(n_ctx)
+                    + "|ctk=" + ggml_type_name(params_base.cache_type_k)
+                    + "|ctv=" + ggml_type_name(params_base.cache_type_v)
+                    + "|ctkd=" + ggml_type_name(params_base.speculative.draft.cache_type_k)
+                    + "|ctvd=" + ggml_type_name(params_base.speculative.draft.cache_type_v)
+                    + "|spec_n_max=" + std::to_string(params_base.speculative.draft.n_max)
+                    + "|mtp=" + ((std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end()) ? "1" : "0")
+                    + "|state_v=" + std::to_string(LLAMA_STATE_SEQ_VERSION);
+            }
+            prompt_cache = std::make_unique<server_prompt_cache>(
+                params_base.cache_ram_mib,
+                n_ctx,
+                params_base.cache_disk_path,
+                params_base.cache_disk_limit_mib,
+                cache_identity);
+
+            // a cached prompt longer than the request can be truncated in place only when
+            // both contexts support unbounded partial removal (dense KV); recurrent/hybrid
+            // entries are usable at their exact boundary or through a checkpoint
+            prompt_cache->partial_seq_rm =
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
+                (!ctx_dft || ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART);
+            SRV_INF("prompt cache: entries longer than the request are %s\n",
+                    prompt_cache->partial_seq_rm ? "truncated in place" : "usable at their exact boundary or via a checkpoint (recurrent/hybrid memory)");
         } else {
-            SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+            SRV_INF("%s", "prompt cache is disabled - use `--cache-ram N` or `--cache-disk PATH` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1470,8 +1505,8 @@ private:
         metrics.init();
 
         if (params_base.cache_idle_slots) {
-            if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
+            if (!prompt_cache) {
+                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram or --cache-disk, disabling\n");
                 params_base.cache_idle_slots = false;
             } else {
                 if (params_base.kv_unified) {
