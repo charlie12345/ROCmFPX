@@ -1458,7 +1458,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
-        reset_acc_ema(seq_id);
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
