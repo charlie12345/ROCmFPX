@@ -18,6 +18,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <limits>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -2460,37 +2461,53 @@ private:
                     [](const common_prompt_checkpoint & ck) { return !ck.pinned; });
         };
 
-        // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
-        // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-        int64_t last = -1;
-        for (auto it = slot.prompt.checkpoints.begin();
-                n_unpinned() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
-                it != slot.prompt.checkpoints.end(); ) {
-            if (!it->pinned && it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
-
-                it = slot.prompt.checkpoints.erase(it);
-                continue;
-            }
-
-            last = it->n_tokens;
-            ++it;
-        }
-
+        // Checkpoint budget. When the list is full, evict the checkpoint whose removal leaves the
+        // smallest gap between its neighbours. The --ctx-checkpoints budget then always spreads over
+        // the whole prompt: a short conversation keeps closely spaced rollback points, a long one
+        // coarser ones, and the 2-3 checkpoints each request leaves within a few hundred tokens of
+        // its prompt end collapse to one as soon as room is needed. (Evicting the oldest instead
+        // would leave only the tail covered, and a client that rewrites or compacts older history
+        // could roll back no further than the pinned system-prompt boundary.)
+        // Never evicted: the pinned checkpoint, the newest one, and those of the current task.
         while (!pinned && n_unpinned() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed: the oldest one that is not pinned
-            const auto it_old = std::find_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
-                    [](const common_prompt_checkpoint & ck) { return !ck.pinned; });
-            if (it_old == slot.prompt.checkpoints.end()) {
-                break;
+            std::vector<std::list<common_prompt_checkpoint>::iterator> order;
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
+                order.push_back(it);
+            }
+            std::sort(order.begin(), order.end(), [](const auto & a, const auto & b) { return a->n_tokens < b->n_tokens; });
+
+            auto    it_victim = slot.prompt.checkpoints.end();
+            int64_t gap_best  = std::numeric_limits<int64_t>::max();
+            for (size_t i = 0; i + 1 < order.size(); ++i) { // i + 1 < size: the newest is not a candidate
+                if (order[i]->pinned || order[i]->id_task == id_task) {
+                    continue;
+                }
+                const int64_t n_prev = i > 0 ? order[i - 1]->n_tokens : 0;
+                // A checkpoint within ~1k tokens after another one is a near-duplicate of it, and of a
+                // cluster it is the EARLIEST member that is worth keeping: it still serves a prompt that
+                // diverges anywhere after it (for a few hundred extra tokens), the later ones miss
+                // everything that diverges just before them. So such a checkpoint goes first.
+                const bool    is_dup = i > 0 && order[i]->n_tokens - n_prev < 1024;
+                const int64_t gap    = is_dup ? order[i]->n_tokens - n_prev : order[i + 1]->n_tokens - n_prev;
+                if (gap < gap_best) {
+                    gap_best  = gap;
+                    it_victim = order[i];
+                }
             }
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    it_old->pos_min, it_old->pos_max, it_old->n_tokens, (float) it_old->size() / 1024 / 1024);
+            if (it_victim == slot.prompt.checkpoints.end()) {
+                // everything else is protected: fall back to the oldest one that is not pinned
+                it_victim = std::find_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                        [](const common_prompt_checkpoint & ck) { return !ck.pinned; });
+                if (it_victim == slot.prompt.checkpoints.end()) {
+                    break;
+                }
+            }
 
-            slot.prompt.checkpoints.erase(it_old);
+            SLT_TRC(slot, "erasing context checkpoint to stay within budget (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", gap after removal = %" PRId64 ", size = %.3f MiB)\n",
+                    it_victim->pos_min, it_victim->pos_max, it_victim->n_tokens, gap_best, (float) it_victim->size() / 1024 / 1024);
+
+            slot.prompt.checkpoints.erase(it_victim);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate

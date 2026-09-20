@@ -2750,6 +2750,12 @@ bool server_prompt_cache::save_disk(
             if (!ck->pinned && !picked.empty() &&
                 picked.back()->n_tokens - ck->n_tokens < (int64_t) disk_min_gain &&
                 picked.back()->n_tokens >= ck->n_tokens) {
+                // Of the newest cluster keep the newest member: it sits where the next request of this
+                // conversation diverges. Of an older cluster keep the EARLIEST: it still serves a prompt
+                // that diverges anywhere after it, the later members miss whatever diverges just before them.
+                if (picked.size() > 1 && !picked.back()->pinned) {
+                    picked.back() = &*ck;
+                }
                 continue;
             }
             picked.push_back(&*ck);
