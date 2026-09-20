@@ -2263,6 +2263,8 @@ bool common_prompt_checkpoint::empty() const {
 void common_prompt_checkpoint::clear() {
     n_tokens = 0;
 
+    pinned = false;
+
     pos_min = 0;
     pos_max = 0;
 

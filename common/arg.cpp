@@ -1749,6 +1749,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_LIMIT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-min-tokens"}, "N",
+        string_format("prompts shorter than N tokens are never written to the SSD prompt cache "
+            "(default: %d, 0 - save everything)", params.cache_disk_min_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache disk min tokens must be non-negative");
+            }
+            params.cache_disk_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-checkpoints"}, "N",
+        string_format("max context checkpoints persisted with each SSD prompt-cache entry, newest first "
+            "(default: %d, -1 - all, 0 - none)", params.cache_disk_checkpoints),
+        [](common_params & params, int value) {
+            params.cache_disk_checkpoints = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-prefix-step"}, "N",
+        string_format("write shared SSD prompt-cache entries every N tokens inside the system prompt + tools block "
+            "and at its end, so new conversations with the same or a partly identical system prompt start from them "
+            "(default: %d, 0 - disable)", params.cache_disk_prefix_step),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache disk prefix step must be non-negative");
+            }
+            params.cache_disk_prefix_step = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_PREFIX_STEP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

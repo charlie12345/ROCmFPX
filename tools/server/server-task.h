@@ -615,31 +615,36 @@ struct server_prompt_cache_state {
 };
 
 // The context checkpoint payloads may contain large host vectors. Disk-cache entries
-// keep only the small scheduling metadata in RAM; the newest checkpoint is persisted
-// in full next to the entry (see save_disk) and restored as a live checkpoint.
+// keep only the small scheduling metadata in RAM; the checkpoints themselves are persisted
+// in full next to the entry (see save_disk) and restored as live checkpoints.
 struct server_prompt_checkpoint_meta {
     int64_t   n_tokens = 0;
     llama_pos pos_min  = 0;
     llama_pos pos_max  = 0;
 };
 
+// one context checkpoint persisted next to a disk entry (<stem>-ckpt<k>.bin)
+struct server_prompt_disk_ckpt {
+    std::string path;
+    size_t      size = 0;
+    server_prompt_checkpoint_meta meta;
+};
+
 struct server_prompt_disk_state {
     server_tokens tokens;
-    std::vector<server_prompt_checkpoint_meta> checkpoints;
     std::vector<uint8_t> spec;
 
     std::string path_main;
     std::string path_drft;
 
-    // The newest context checkpoint is persisted alongside the entry. It lets a request
-    // that EXTENDS the cached prompt only up to a point inside the last assistant turn
-    // (e.g. a client that re-sends that turn without reasoning_content, so it
-    // re-tokenizes differently) still restore this entry: the slot rolls back to the
-    // checkpoint exactly as it does in-slot and re-prefills just the tail. Without it,
-    // entries on recurrent/hybrid targets are usable only on an exact-boundary match.
-    std::string path_ckpt;
-    size_t      size_ckpt = 0;
-    server_prompt_checkpoint_meta ckpt_meta;
+    // The context checkpoints persisted alongside the entry, oldest first. A recurrent/hybrid
+    // state cannot be truncated, so without them the entry is usable only when the request
+    // extends it exactly. With them, a request that diverges anywhere past a checkpoint
+    // (a client that re-sends the last assistant turn without reasoning_content, an agent
+    // that rewrote or compacted older history, ...) still restores the entry: the slot rolls
+    // back to the newest checkpoint at or before the divergence, exactly as it does in-slot,
+    // and re-prefills from there.
+    std::vector<server_prompt_disk_ckpt> ckpts;
 
     // speculative-impl state blob persisted next to the entry so it survives a restart
     std::string path_spec;
@@ -647,13 +652,32 @@ struct server_prompt_disk_state {
     size_t size_main = 0;
     size_t size_drft = 0;
 
-    bool has_ckpt() const { return !path_ckpt.empty(); }
+    bool has_ckpt() const { return !ckpts.empty(); }
+
+    size_t size_ckpt() const {
+        size_t res = 0;
+        for (const auto & ck : ckpts) {
+            res += ck.size;
+        }
+        return res;
+    }
+
+    // newest persisted checkpoint boundary at or before `lcp` (0 = none)
+    int64_t ckpt_at_or_below(size_t lcp) const {
+        int64_t res = 0;
+        for (const auto & ck : ckpts) {
+            if (ck.meta.n_tokens > res && (size_t) ck.meta.n_tokens <= lcp) {
+                res = ck.meta.n_tokens;
+            }
+        }
+        return res;
+    }
 
     uint64_t id = 0;
     bool usable = true;
 
     size_t size() const {
-        return size_main + size_drft + size_ckpt;
+        return size_main + size_drft + size_ckpt();
     }
 
     int n_tokens() const {
@@ -725,6 +749,18 @@ struct server_prompt_cache {
     // created for this server process.
     bool disk_save_disabled = false;
 
+    // Prompts shorter than this are never written to disk: keep-alive pings, title
+    // generation and similar one-shot requests would otherwise each leave an entry whose
+    // size is dominated by the fixed recurrent state (~160 MiB for a few hundred tokens).
+    size_t disk_min_tokens = 0;
+
+    // max context checkpoints persisted with each entry, newest first (-1 = all, 0 = none)
+    int32_t disk_max_ckpts = -1;
+
+    // a disk entry replaces what the slot already holds only when it keeps at least this
+    // many tokens more - below that the read costs more than the prefill it saves
+    size_t disk_min_gain = 1024;
+
     bool disk_enabled() const { return !disk_owned_path.empty(); }
 
     size_t size() const;
@@ -750,9 +786,26 @@ struct server_prompt_cache {
                     size_t state_size_drft,
         const std::vector<uint8_t> & state_spec);
 
+    // Persist a shared exact-boundary entry for `tokens_prefix`. The contexts must hold
+    // exactly these tokens for id_slot, i.e. this is called mid-prefill, between two batches.
+    // Used for the system prompt + tools block, which many conversations have in common:
+    // a new conversation then starts from the entry instead of prefilling the block again.
+    // An existing entry with the same tokens is only touched (kept most-recently-used).
+    bool save_prefix(
+        const server_tokens & tokens_prefix,
+              llama_context * ctx_tgt,
+              llama_context * ctx_dft,
+               llama_seq_id   id_slot,
+        const std::vector<uint8_t> & state_spec);
+
+    // true when a usable disk entry holds exactly the first n_tokens of `tokens`
+    bool has_disk_prefix(const server_tokens & tokens, size_t n_tokens) const;
+
     // restore the most useful entry (RAM or disk) for tokens_new into the slot, if any is
     // better than what the slot already holds. On a hit, `prompt` is replaced and
     // `state_spec` (optional) receives the entry's exact-boundary speculative state.
+    // `probe` marks a lookup made while the slot keeps serving the same conversation
+    // (near-miss logging is then demoted to debug).
     // Returns false only when a restore was attempted and failed (the slot must be cleared).
     bool load(
               server_prompt & prompt,
@@ -760,7 +813,8 @@ struct server_prompt_cache {
               llama_context * ctx_tgt,
               llama_context * ctx_dft,
                     int32_t   id_slot,
-       std::vector<uint8_t> * state_spec);
+       std::vector<uint8_t> * state_spec,
+                       bool   probe = false);
 
     void update();
 
