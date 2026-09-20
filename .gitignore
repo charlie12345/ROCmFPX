@@ -162,3 +162,6 @@ AGENTS.local.md
 # Internal AI/reviewer handoff + one-off conversion helper — kept local, not published
 /ROCMFPX-SPEEDUP-HANDOFF.md
 /scripts/convert-step37-nvfp4-to-rocmfp4.sh
+
+# local server API keys - never commit
+/api-keys.txt

@@ -1,5 +1,156 @@
 ![ROCmFPX — Max Performance. Open Power.](media/rocmfpx-banner.png)
 
+# Qwen3.8-27B for agents on a Radeon RX 7900 XT / XTX
+
+This fork is an optimised runtime for **Qwen3.8-27B with 80k context on a 20 GB
+RX 7900 XT** (more on the 24 GB XTX), tuned for **agentic work**: long tool-calling
+sessions, several agents sharing one GPU, and clients that keep rewriting their
+own history. It is [ROCmFPX](#rocmfpx-llamacpp) (ROCm/HIP, ROCmFP4 weights) plus a
+server-side prompt cache on SSD that makes switching between conversations cost
+seconds instead of minutes.
+
+Everything below was measured on one machine: RX 7900 XT 20 GB, Ryzen 9 7900,
+32 GB RAM, Windows 11, ROCm 7.2 HIP SDK, one NVMe for models and cache. The XTX
+numbers are **not** measured - only the context headroom is extrapolated.
+
+## Why a cache, and why this one
+
+Qwen3.8 is a hybrid: 16 attention layers and 49 recurrent (gated delta-net)
+layers. Recurrent state cannot be truncated, so the usual llama.cpp trick of
+reusing the longest common prefix does not work - a prompt can only resume from
+a saved **checkpoint** at or before the point where it diverges from what the
+server holds. With one slot (20 GB leaves room for exactly one 80k context) and
+several agents, that went badly. Over 9,600 real agent requests:
+
+| where prefill time went | share |
+|---|---|
+| normal continuation of the conversation in the slot | 22% |
+| returning to a conversation that had lost the slot: **full re-prefill** | **57%** |
+| same conversation, but the agent rewrote earlier history: re-prefill | 14% |
+| restored from cache | 6% |
+
+A 50k-token conversation is ~110 s of prefill on this card. The changes in
+this fork (all in `tools/server`) attack exactly that:
+
+- **SSD prompt cache** (`--cache-disk`): a conversation that loses the slot is
+  written to disk with its recurrent state and restored when it returns.
+  Survives server restarts.
+- **Every checkpoint is persisted**, not only the newest, so a returning prompt
+  that diverges mid-history (compaction, pruned tool output, stripped reasoning)
+  still resumes from the nearest earlier checkpoint.
+- **Shared system-prompt entries** (`--cache-disk-prefix-step`): while the
+  system prompt + tool definitions are prefilled the first time, the server
+  saves exact states every 4096 tokens inside that block and at its end. Any
+  later conversation that starts with the same tokens - a new session, a
+  spawned worker, a compacted history - resumes from the deepest one it still
+  shares. Entries are keyed by token content, so there is nothing to
+  invalidate: a changed system prompt simply stops matching where it changed.
+- **Pinned checkpoint** at the first user message, never evicted.
+- **Checkpoint budget spread over the whole prompt**: when `--ctx-checkpoints`
+  is full, the checkpoint whose removal leaves the smallest gap goes, instead
+  of the oldest. Eight checkpoints then cover an entire 60k conversation rather
+  than its last two requests.
+- **Disk lookup on partial rewrites**, not only when more than half of the slot
+  would be lost.
+- **No junk** (`--cache-disk-min-tokens`): keep-alive pings and title requests
+  are not written (each cost ~160 MB of fixed recurrent state).
+
+Measured on the live server, same 49.6k-token conversation, 23.5k-token system
+prompt + tools:
+
+| situation | before | now |
+|---|---|---|
+| new session, same system prompt | 23.5k tokens, 50 s | **24 tokens, 0.8 s** |
+| new session, system prompt differs near its end (date line) | 23.5k, 50 s | 3.1k, 8 s |
+| another request takes the slot (save 49.6k) | 11 s | **1.7 s** |
+| return to the 49.6k conversation | full re-prefill, 110 s | **27 tokens, 2 s** |
+| agent rewrote mid-history, conversation still in slot | 49.6k, 110 s | 19.9k, 55 s |
+| same, restored from SSD | 49.6k, 110 s | 13.4k, 39 s |
+| server restart, 9.8k system prompt | 27 s | 15 tokens, 0.5 s |
+
+## The recipe
+
+**Model.** Qwen3.8-27B in ROCmFP4 (`MQ-Q4`, ~14.6 GB) with its MTP head, plus the
+f16 `mmproj` for vision. We run a requant that promotes 61 sensitive tensors
+(output, MTP projection, attention k/v/o on the full-attention layers, boundary
+`ffn_down`) to `Q6_0_ROCMFPX`: wikitext-2 perplexity 7.107 vs 7.143 at the same
+speed and VRAM.
+
+**Build** (ROCm 7.2 clang, Ninja):
+
+```
+cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+  -DCMAKE_C_COMPILER="%HIP_PATH%bin\clang.exe" -DCMAKE_CXX_COMPILER="%HIP_PATH%bin\clang++.exe" ^
+  -DCMAKE_PREFIX_PATH="%HIP_PATH%" -DGGML_HIP=ON -DGPU_TARGETS=gfx1100 -DCMAKE_HIP_ARCHITECTURES=gfx1100 ^
+  -DGGML_HIP_GRAPHS=ON -DGGML_HIP_NO_VMM=ON -DGGML_HIP_FORCE_MMQ=ON -DGGML_CUDA_FA_ALL_QUANTS=ON ^
+  -DGGML_CUDA_GRAPHS=ON -DGGML_NATIVE=ON -DGGML_OPENMP=ON -DGGML_SCHED_MAX_COPIES=4 ^
+  -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF ^
+  -DLLAMA_BUILD_WEBUI=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
+cmake --build build-hip --target llama-server -j 12
+```
+
+Leave `GGML_HIP_ROCWMMA_FATTN` **off**: the head dimension is 256, which the fast
+RDNA3 attention path does not take, and the rocWMMA kernel measured slower than
+the generic one here (325 vs 497 t/s at 16k).
+
+**Run:**
+
+```
+set "PATH=%HIP_PATH%bin;%PATH%"
+set GGML_CUDA_NO_PINNED=1
+set LLAMA_MAX_QUEUED=3
+
+llama-server -m Qwen3.8-27B-ROCMFPX-MQ-Q4.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
+  -dev ROCm0 -ngl 999 -fa on --jinja ^
+  -c 81920 -np 1 -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -b 2048 -ub 256 ^
+  --ctx-checkpoints 8 --checkpoint-min-step 2048 ^
+  --cache-ram 0 --cache-disk D:\llama-cache --cache-disk-limit 65536 --cache-disk-checkpoints 4 ^
+  --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.60 ^
+  --no-reasoning-preserve --temp 1 --sleep-idle-seconds -1 ^
+  --alias qwen/qwen3.8-27b --host 0.0.0.0 --port 1234 --api-key-file api-keys.txt
+```
+
+What each choice buys:
+
+| setting | why |
+|---|---|
+| `-c 81920`, q4_0 KV | 18.9 GB at load with ~0 GB spilled. KV is ~18 KB/token, 0.58 GiB per 32k. Past the card's limit Windows silently pages VRAM to system RAM: 96k costs <1% prefill, 112k 6%, **128k halves it**. On a 24 GB XTX the same curve should start ~4 GB later (untested). |
+| `-np 1` | one full-size context is all that fits; the SSD cache is what makes one slot workable for several agents. |
+| `-ub 256` | smallest compute buffer that keeps prefill speed; bigger costs VRAM you need for context. |
+| MTP draft, `n-max 4` | 35 -> 48 t/s decode on prose, ~75 t/s on code; 8-12% faster over a whole long session. 2 loses 20%, 6 is a wash. |
+| `--ctx-checkpoints 8` | host RAM, ~200 MiB each. With the gap-based eviction they cover the whole conversation. |
+| `--cache-disk-checkpoints 4` | caps what is written per SSD entry (newest first, >=1024 tokens apart); each is ~200 MB. |
+| `--no-reasoning-preserve` | otherwise the template keeps the thinking of every past turn: a permanent context tax. |
+| `GGML_CUDA_NO_PINNED=1` | pinned host memory roughly doubled the shared-memory creep for no speed gain. |
+| `--temp 1` | Qwen3.8 degrades under greedy decoding. |
+
+Speed at depth, for planning: prefill ~650 t/s at the start of a context, ~460 at
+20k, ~330 at 46k, ~245 at 80k; decode ~48 t/s shallow, ~29 at 55k. The slope is
+attention over the growing KV cache - the recurrent layers cost the same at any
+depth - so an agent that keeps its sessions at 20-40k runs markedly faster than
+one that lives at 60k.
+
+**Things that cost us the most, none of them in the code:**
+
+- **The cache directory must not be NTFS-compressed.** Ours was (inherited from
+  the volume): a Gen4 NVMe wrote at a flat 143 MB/s and read at 500 MB/s, for a
+  compression ratio of 1.0 on KV states. `compact /U /S:<dir>` took a 50k-token
+  save from 11 s to 1.7 s and server start from 27 s to 12 s. Check with
+  `(Get-Item <dir>).Attributes`.
+- **Age-based cleanup of the cache directory** is safe: the server refreshes a
+  file's timestamp whenever it uses it, so "older than N hours" means unused.
+- **Windows demotes an idle process's VRAM** on a nearly full card; the first
+  request after a pause then crawls. A one-token request every 5 minutes of idle
+  keeps it resident.
+- **Make the agent stop rewriting history.** Every rewrite is a cache break. In
+  our agent framework, compaction fired at 64k, only got down to ~50k, and so
+  re-fired every 15-20 minutes - each time a multi-minute summary call plus a
+  50k re-prefill. Triggering at 40k keeps sessions in the fast part of the
+  window. Auxiliary calls (titles, summaries, vision) that hit the same server
+  take the slot too; the cache makes that cheap, not free.
+
+---
+
 # ROCmFPX llama.cpp
 
 This public downstream tracks current upstream `llama.cpp` while
