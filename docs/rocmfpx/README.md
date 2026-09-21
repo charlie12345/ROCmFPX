@@ -33,6 +33,7 @@ individual block layout.
 
 - [Formats and compatibility](FORMATS.md)
 - [Quant mixing](QUANT-MIXING.md)
+- [Swift-Qwen3.8-27B MQ-Q4S recipe for the RX 7900 XT](swift-qwen3.8-27b-mq-q4s.md)
 - [Plugin and sidecar ABI](PLUGINS.md)
 - [Windows AMD multi-GPU bridge](../../README.md#windows-amd-multi-gpu-bridge)
 - [Hyperloom adapter](../../tools/hyperloom/README.md)
