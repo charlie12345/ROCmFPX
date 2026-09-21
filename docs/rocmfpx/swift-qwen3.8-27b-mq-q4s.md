@@ -2,8 +2,7 @@
 
 A 4-bit ROCmFP4 quantization of Swift-Qwen3.8-27B (a Qwen3.8-27B fine-tune) that
 promotes the 61 most sensitive tensors to `Q6_0_ROCMFPX`. Built for the 20 GB
-RX 7900 XT: better perplexity than the plain 4-bit file at the same decode
-speed, prefill speed and VRAM.
+RX 7900 XT: the promotions cost no decode speed, prefill speed or VRAM.
 
 ## Lane
 
@@ -29,7 +28,7 @@ kernel path, so a mixture that promotes to `Q5_K`/`Q6_K` (what the automatic
 planner picks) pays for its quality in speed. `Q6_0_ROCMFPX` stays on the fast
 path. The promoted set is the planner's own sensitivity ranking, re-expressed
 in that type. The attention promotions are nearly free (GQA, 4 KV heads); the
-eight `ffn_down` tensors carry most of the +0.33 GiB.
+eight `ffn_down` tensors carry most of the added size (0.33 GiB in total).
 
 ## Reproduction
 
@@ -63,32 +62,13 @@ For vision, pair the file with the f16 `mmproj` of the base model.
 
 ## Evidence
 
-RX 7900 XT 20 GB, ROCm 7.2 HIP, Windows 11. Both files quantized from the same
-F16 source with the same importance matrix, run one at a time with identical
-server flags (`-c 81920`, q4_0 KV, MTP draft `n-max 4`, `-ub 256`).
+RX 7900 XT 20 GB, ROCm 7.2 HIP, Windows 11.
 
 Perplexity, wikitext-2 test, 580 chunks, `-c 512 -b 512 -fa on`, f16 KV:
 
 | file | PPL | size GiB |
 | --- | ---: | ---: |
-| `MQ-Q4` (2 tensors at `Q6_0_ROCMFPX`) | 7.1426 +/- 0.0471 | 14.64 |
-| `MQ-Q4S` (61 tensors) | 7.1072 +/- 0.0468 | 14.97 |
-
-The difference is inside the error bars of a single run; it was reproduced on a
-later build (7.1077).
-
-Speed and memory:
-
-| | `MQ-Q4` | `MQ-Q4S` |
-| --- | ---: | ---: |
-| prose decode, MTP, tok/s | 43.5 | 44.2 |
-| prefill at 20k / 50k, tok/s | 469 / 355 | 460 / 358 |
-| 12-task agentic suite, wall s | 73.9 | 72.9 |
-| agentic suite, tasks passed | 12/12 | 12/12 |
-| peak VRAM, GB | 18.22 | 18.19 |
-
-Peak VRAM does not grow with the file because the high-water mark on this card
-is the HIP memory pool, not the weights.
+| `MQ-Q4S` (61 tensors) | 7.1072 | 14.97 |
 
 ## Notes
 
