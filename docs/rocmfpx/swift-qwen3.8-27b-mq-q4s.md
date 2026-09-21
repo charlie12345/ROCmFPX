@@ -70,6 +70,20 @@ Perplexity, wikitext-2 test, 580 chunks, `-c 512 -b 512 -fa on`, f16 KV:
 | --- | ---: | ---: |
 | `MQ-Q4S` (61 tensors) | 7.1072 | 14.97 |
 
+Speed and memory, served with `-c 81920`, q4_0 KV, MTP draft `n-max 4`,
+`-ub 256`:
+
+| measure | value |
+| --- | ---: |
+| prose decode, MTP, tok/s | 44.2 |
+| prefill at 20k / 50k, tok/s | 460 / 358 |
+| 12-task agentic suite, wall s | 72.9 |
+| agentic suite, tasks passed | 12/12 |
+| peak VRAM, GB | 18.19 |
+
+Peak VRAM is set by the HIP memory pool's high-water mark on this card, not by
+the size of the weights.
+
 ## Notes
 
 - If a variant of this recipe spills VRAM on your card, drop the eight
