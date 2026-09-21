@@ -13,6 +13,107 @@ The `llama-server` application supports several implementations of speculative d
 A much smaller model (called the _draft model_) generates drafts.
 A draft model is the most used approach in speculative decoding.
 
+### EAGLE-3 (`draft-eagle3`)
+
+EAGLE-3 uses a small draft model that reads the target model's hidden states to predict the next tokens, so it
+reaches higher acceptance than a standalone draft model of the same size. The draft is a one-layer transformer
+trained for a specific target model; it shares the target model's tokenizer and, optionally, uses a reduced draft
+vocabulary with its own `lm_head`, which is mapped back using a `d2t` table.
+
+Convert the EAGLE-3 checkpoint with `--target-model-dir` so it inherits the target's tokenizer and the layer
+indices to read. Both the SpecForge `LlamaForCausalLMEagle3` and the vLLM/AngelSlim `Eagle3LlamaForCausalLM`
+checkpoint formats are supported (for example [`AngelSlim/Qwen3-4B_eagle3`](https://huggingface.co/AngelSlim/Qwen3-4B_eagle3)
+for `Qwen/Qwen3-4B`):
+
+```bash
+python convert_hf_to_gguf.py AngelSlim/Qwen3-4B_eagle3 \
+    --target-model-dir Qwen/Qwen3-4B --outtype bf16 --outfile Qwen3-4B-eagle3.gguf
+
+llama-server -m Qwen3-4B.gguf -md Qwen3-4B-eagle3.gguf --spec-type draft-eagle3
+```
+
+Supported EAGLE-3 draft models include:
+
+- [yuhuili/EAGLE3-LLaMA3.1-Instruct-8B](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B)
+- [yuhuili/EAGLE3-LLaMA3.3-Instruct-70B](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.3-Instruct-70B)
+- [RedHatAI/gemma-4-31B-it-speculator.eagle3](https://huggingface.co/RedHatAI/gemma-4-31B-it-speculator.eagle3)
+- [RedHatAI/gemma-4-26B-A4B-it-speculator.eagle3](https://huggingface.co/RedHatAI/gemma-4-26B-A4B-it-speculator.eagle3)
+- [Tengyunw/qwen3_8b_eagle3](https://huggingface.co/Tengyunw/qwen3_8b_eagle3)
+- [Tengyunw/qwen3_30b_moe_eagle3](https://huggingface.co/Tengyunw/qwen3_30b_moe_eagle3)
+- [AngelSlim/Qwen3-1.7B_eagle3](https://huggingface.co/AngelSlim/Qwen3-1.7B_eagle3)
+- [AngelSlim/Qwen3-4B_eagle3](https://huggingface.co/AngelSlim/Qwen3-4B_eagle3)
+- [AngelSlim/Qwen3-8B_eagle3](https://huggingface.co/AngelSlim/Qwen3-8B_eagle3)
+- [AngelSlim/Qwen3-14B_eagle3](https://huggingface.co/AngelSlim/Qwen3-14B_eagle3)
+- [AngelSlim/Qwen3-32B_eagle3](https://huggingface.co/AngelSlim/Qwen3-32B_eagle3)
+- [AngelSlim/Qwen3-a3B_eagle3](https://huggingface.co/AngelSlim/Qwen3-a3B_eagle3)
+- [RedHatAI/gpt-oss-20b-speculator.eagle3](https://huggingface.co/RedHatAI/gpt-oss-20b-speculator.eagle3)
+- [lmsys/EAGLE3-gpt-oss-120b-bf16](https://huggingface.co/lmsys/EAGLE3-gpt-oss-120b-bf16)
+- [nvidia/gpt-oss-120b-Eagle3-long-context](https://huggingface.co/nvidia/gpt-oss-120b-Eagle3-long-context)
+
+For the full and up-to-date list of supported models, see #18039.
+
+### DFlash (`draft-dflash`)
+
+DFlash produces an entire block of draft tokens in a single forward pass (block diffusion) and
+injects the target model's hidden states into the draft model's attention, instead of drafting one
+token at a time. This keeps the draft model small while making drafting GPU-friendly. Unlike EAGLE-3
+(a single-layer autoregressive draft), the DFlash draft uses several transformer layers but emits a
+whole block per draft step.
+
+The draft is a small block-diffusion model trained for a specific target (for example
+`z-lab/Qwen3-4B-DFlash` for `Qwen/Qwen3-4B`). Convert it with `--target-model-dir` so it inherits the
+target's tokenizer and token embeddings:
+
+```bash
+python convert_hf_to_gguf.py z-lab/Qwen3-4B-DFlash \
+    --target-model-dir Qwen/Qwen3-4B --outtype bf16 --outfile Qwen3-4B-DFlash.gguf
+
+llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
+    --spec-type draft-dflash --spec-draft-n-max 15 -fa on --jinja
+```
+
+`--spec-draft-n-max` is clamped to the draft model's trained block size.
+
+See:
+
+- #22105
+
+### DSpark (`draft-dspark`)
+
+DSpark extends DFlash with a semi-autoregressive _Markov head_: the draft still emits a whole
+block per forward pass, but each block position's logits are biased by a low-rank term keyed on
+the previous token, chained in-graph across the block. This keeps drafting at one decode per
+block while recovering some of the left-to-right signal that pure block diffusion loses.
+
+The draft is a small DeepSpec checkpoint trained for a specific target (for example
+[`deepseek-ai/dspark_qwen3_4b_block7`](https://huggingface.co/deepseek-ai/dspark_qwen3_4b_block7)
+for `Qwen/Qwen3-4B`). Convert it with `--target-model-dir` so it inherits the target's tokenizer
+and token embeddings:
+
+```bash
+python convert_hf_to_gguf.py deepseek-ai/dspark_qwen3_4b_block7 \
+    --target-model-dir Qwen/Qwen3-4B --outtype bf16 --outfile Qwen3-4B-DSpark.gguf
+
+llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
+    --spec-type draft-dspark --spec-draft-n-max 7 -fa on --jinja
+```
+
+`--spec-draft-n-max` is clamped to the draft model's trained block size.
+
+`--spec-draft-conf-min P` truncates each drafted block at the first position whose predicted
+acceptance (from the draft's confidence head, if present) falls below `P` (default 0 = disabled).
+
+Currently only drafts with a Qwen3 backbone are supported; support for other backbones
+(e.g. Gemma4) is planned.
+
+DSpark drafts exported in the [speculators](https://github.com/vllm-project/speculators) format
+(for example [`RedHatAI/gemma-4-31B-it-speculator.dspark`](https://huggingface.co/RedHatAI/gemma-4-31B-it-speculator.dspark))
+convert the same way.
+
+See:
+
+- #25173
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.
@@ -105,14 +206,30 @@ Example Video:
 
 If a draft model is combined with a draftless decoding the draftless decoding has higher precedence.
 
+### Backend Sampling
+
+Use `--backend-sampling` to run supported target-model samplers on the model backend. Draft-model sampling uses the backend by default and can be controlled with `--spec-draft-backend-sampling` and `--no-spec-draft-backend-sampling`.
+
+Unsupported samplers and device layouts fall back to CPU sampling. Tensor split mode does not support backend sampling. A fixed seed produces repeatable random draws, but stochastic CPU and backend sampling can still select different tokens because floating-point operations can differ between implementations and devices. Use greedy sampling when exact output matching is required.
+
+### Synthetic Acceptance
+
+`llama-server` and `llama-cli` can replace normal speculative verification with synthetic decisions for benchmarking. The generated output is not valid model output because accepted draft tokens do not have to match the target model.
+
+Use exactly one of these options:
+
+- `--spec-synth-rates P0,P1,...` sets unconditional per-position acceptance probabilities. Entry `i` is the probability that the first `i+1` draft tokens are all accepted. The number of entries must match the effective maximum draft length. Values must be finite, within `[0, 1]`, and monotonically non-increasing.
+- `--spec-synth-len L` sets the target mean acceptance length, including the target token. For `K` maximum draft tokens, `L` must be within `[1, K+1]`. The server finds a constant conditional probability `p` such that `p + p^2 + ... + p^K = L - 1`, then uses unconditional rates `[p, p^2, ..., p^K]`.
+
 ### General Speculative Parameters
 
 ```
---spec-type [none|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
-                                        type of speculative decoding to use when no draft model is provided
+--spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dspark|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
+                                        comma-separated list of types of speculative decoding to use
                                         (default: none)
                                         (env: LLAMA_ARG_SPEC_TYPE)
---spec-default                          use default speculative decoding
+--spec-default                          use default speculative decoding config
+                                        (enables ngram-mod)
 ```
 
 ### Draft Model Parameters
@@ -123,8 +240,9 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
                                         (env: LLAMA_ARG_SPEC_DRAFT_MODEL)
 --spec-draft-hf, -hfd, -hfrd, --hf-repo-draft  <user>/<model>[:quant]
                                         HuggingFace repository for the draft model
+                                        (env: LLAMA_ARG_SPEC_DRAFT_HF_REPO)
 --spec-draft-n-max                      N
-                                        number of tokens to draft for speculative decoding (default: 16)
+                                        number of tokens to draft for speculative decoding (default: 3)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MAX)
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
@@ -133,18 +251,64 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)
 --spec-draft-p-min, --draft-p-min       P
-                                        minimum speculative decoding probability (greedy) (default: 0.75)
+                                        minimum speculative decoding probability (greedy) (default: 0.00)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_MIN)
---spec-draft-ctx-size, -cd, --ctx-size-draft  N
-                                        size of the prompt context for the draft model (default: 0, 0 = loaded from model)
-                                        (env: LLAMA_ARG_SPEC_DRAFT_CTX_SIZE)
 --spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft  N
                                         max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)
                                         (env: LLAMA_ARG_N_GPU_LAYERS_DRAFT)
 --spec-draft-device, -devd, --device-draft  <dev1,dev2,..>
                                         comma-separated list of devices to use for offloading the draft model
---spec-draft-replace, --spec-replace    TARGET  DRAFT
-                                        translate the string in TARGET into DRAFT if the draft model and main model are not compatible
+                                        (use --list-devices to see available devices)
+```
+
+### Draft Model CPU Scheduling Parameters
+
+```
+--spec-draft-threads, -td, --threads-draft  N
+                                        number of CPU threads to use during generation
+--spec-draft-threads-batch, -tbd, --threads-batch-draft  N
+                                        number of threads to use during batch and prompt processing (default: same as --threads-draft)
+--spec-draft-cpu-mask, -Cd, --cpu-mask-draft  M
+                                        Draft model CPU affinity mask. Complements cpu-range-draft
+--spec-draft-cpu-range, -Crd, --cpu-range-draft  lo-hi
+                                        Ranges of CPUs for affinity. Complements --cpu-mask-draft
+--spec-draft-cpu-strict, --cpu-strict-draft  <0|1>
+                                        Use strict CPU placement for draft model (default: same as --cpu-strict)
+--spec-draft-prio, --prio-draft  N
+                                        set draft process/thread priority : 0-normal, 1-medium, 2-high, 3-realtime
+--spec-draft-poll, --poll-draft  <0|1>
+                                        Use polling to wait for draft model work (default: same as --poll)
+--spec-draft-cpu-mask-batch, -Cbd, --cpu-mask-batch-draft  M
+                                        Draft model CPU affinity mask for batch. Complements cpu-range-batch-draft
+--spec-draft-cpu-range-batch, -Crbd, --cpu-range-batch-draft  lo-hi
+                                        Ranges of CPUs for affinity for batch. Complements --cpu-mask-batch-draft
+--spec-draft-cpu-strict-batch, --cpu-strict-batch-draft  <0|1>
+                                        Use strict CPU placement for draft model batch (default: --cpu-strict-draft)
+--spec-draft-prio-batch, --prio-batch-draft  N
+                                        set draft process/thread priority for batch : 0-normal, 1-medium, 2-high, 3-realtime
+--spec-draft-poll-batch, --poll-batch-draft  <0|1>
+                                        Use polling to wait for draft model work for batch (default: --poll-draft)
+```
+
+### Draft Model KV Cache and Tensor Override Parameters
+
+```
+--spec-draft-type-k, -ctkd, --cache-type-k-draft  TYPE
+                                        KV cache data type for K for the draft model
+                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+                                        (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K)
+--spec-draft-type-v, -ctvd, --cache-type-v-draft  TYPE
+                                        KV cache data type for V for the draft model
+                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+                                        (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V)
+--spec-draft-override-tensor, -otd, --override-tensor-draft  <tensor name pattern>=<buffer type>,...
+                                        override tensor buffer type for draft model
+--spec-draft-cpu-moe, -cmoed, --cpu-moe-draft
+                                        keep all Mixture of Experts (MoE) weights in the CPU for the draft model
+                                        (env: LLAMA_ARG_SPEC_DRAFT_CPU_MOE)
+--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft  N
+                                        keep the MoE weights of the first N layers in the CPU for the draft model
+                                        (env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE)
 ```
 
 ### n-gram Mod Parameters
@@ -193,11 +357,16 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
 
 ### `--spec-type TYPE`
 
-Specifies a type of speculative decoding without draft model.
+Specifies a comma-separated list of speculative decoding types to use.
 
 | Type | Description |
 |------|-------------|
 | `none` | No speculative decoding (default) |
+| `draft-simple` | Use a simple draft model for speculation |
+| `draft-eagle3` | Use an EAGLE-3 draft model that reads the target's hidden states |
+| `draft-dflash` | Use a DFlash block-diffusion draft model that emits a block per step |
+| `draft-dspark` | Use a DSpark draft model (DFlash backbone + semi-autoregressive Markov head) |
+| `draft-mtp` | Use Multi Token Prediction (MTP) heads from the main model |
 | `ngram-cache` | Use n-gram cache lookup |
 | `ngram-simple` | Use simple n-gram pattern matching |
 | `ngram-map-k` | Use n-gram pattern matching with n-gram-keys |
@@ -207,6 +376,11 @@ Specifies a type of speculative decoding without draft model.
 **Example:** Server-instance used to refactor source code.
 ```bash
 ./llama-server [...] --spec-type ngram-simple
+```
+
+**Example:** Multiple speculative implementations.
+```bash
+./llama-server [...] --spec-type ngram-mod,ngram-map-k4v
 ```
 
 ### `--spec-ngram-*-size-n N`
@@ -268,3 +442,8 @@ statistics ngram_map_k: #calls(b,g,a) = 6 1690 26, #gen drafts = 26, #acc drafts
 - `#gen tokens`: number of tokens generated by this implementation (including rejected tokens)
 - `#acc tokens`: number of tokens accepted by the main model
 - `dur(b,g,a): durations of begin (new prompt), generation and accumulation (process acceptance).
+
+## Benchmarking
+
+To measure the end-to-end effect of speculative decoding (throughput, latency, and draft acceptance) across diverse prompts, see the SPEED-Bench client in [tools/server/bench/speed-bench](../tools/server/bench/speed-bench/README.md).
+It runs against a running `llama-server` and can compare a baseline run against a speculative-decoding run.

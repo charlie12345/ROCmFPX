@@ -1,0 +1,79 @@
+name: ROCmFPX upstream sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 9 * * 1"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: rocmfpx-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Enforce downstream-only repository boundary
+        run: |
+          if [[ "${GITHUB_REPOSITORY,,}" == "ggml-org/llama.cpp" ]]; then
+            echo "Refusing to run publishing automation in official llama.cpp" >&2
+            exit 1
+          fi
+          origin_url="$(git remote get-url origin)"
+          if [[ "${origin_url,,}" == *"github.com/ggml-org/llama.cpp"* ]]; then
+            echo "Refusing to use official llama.cpp as the push remote" >&2
+            exit 1
+          fi
+          repo_path="${GITHUB_REPOSITORY,,}"
+          if [[ "${origin_url,,}" != *"github.com/${repo_path}"* ]]; then
+            echo "Refusing origin that does not match this repository: $origin_url" >&2
+            exit 1
+          fi
+
+      - name: Configure sync identity and official remote
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/ggml-org/llama.cpp.git
+          test "$(git remote get-url upstream)" = "https://github.com/ggml-org/llama.cpp.git"
+
+      - name: Install portable validation dependency
+        run: python3 -m pip install ./gguf-py
+
+      - name: Merge and validate official master
+        id: sync
+        env:
+          SYNC_BRANCH: automation/upstream-sync
+        run: |
+          scripts/rocmfpx/sync-upstream.sh
+          if [[ "$(git branch --show-current)" == "$SYNC_BRANCH" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish sync branch
+        if: steps.sync.outputs.changed == 'true'
+        run: git push --force-with-lease origin HEAD:automation/upstream-sync
+
+      - name: Open or update pull request
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh pr view automation/upstream-sync --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base "${{ github.event.repository.default_branch }}" \
+              --head automation/upstream-sync \
+              --title "sync: merge current llama.cpp master" \
+              --body "Automated upstream merge. Portable ROCmFPX validation passed. gfx1151 Vulkan, HIP, exact ROCmI4, opt-in W4A4, and fixed-model performance gates remain required before merge."
+          fi

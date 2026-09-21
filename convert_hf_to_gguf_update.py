@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("convert_hf_to_gguf_update")
 sess = requests.Session()
 
-convert_py_pth = pathlib.Path("convert_hf_to_gguf.py")
+convert_py_pth = pathlib.Path("conversion/base.py")
 convert_py = convert_py_pth.read_text(encoding="utf-8")
 hf_token_pth = pathlib.Path.home() / ".cache" / "huggingface" / "token"
 hf_token = hf_token_pth.read_text(encoding="utf-8").strip() if hf_token_pth.exists() else None
@@ -100,6 +100,7 @@ models = [
     {"name": "refact",           "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/smallcloudai/Refact-1_6-base", },
     {"name": "command-r",        "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/CohereForAI/c4ai-command-r-v01", },
     {"name": "tiny_aya",         "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/CohereLabs/tiny-aya-base", },
+    {"name": "cohere2moe",       "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/CohereLabs/North-Mini-Code-1.0", },
     {"name": "qwen2",            "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/Qwen/Qwen1.5-7B", },
     {"name": "olmo",             "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/allenai/OLMo-1.7-7B-hf", },
     {"name": "dbrx",             "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/databricks/dbrx-base", },
@@ -139,6 +140,7 @@ models = [
     {"name": "seed-coder",       "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/ByteDance-Seed/Seed-Coder-8B-Base", },
     {"name": "a.x-4.0",          "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/skt/A.X-4.0", },
     {"name": "midm-2.0",         "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/K-intelligence/Midm-2.0-Base-Instruct", },
+    {"name": "lfm2",             "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/LiquidAI/LFM2.5-350M", },
     {"name": "exaone4",          "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/LGAI-EXAONE/EXAONE-4.0-32B", },
     {"name": "mellum",           "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/JetBrains/Mellum-4b-base", },
     {"name": "modern-bert",      "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/answerdotai/ModernBERT-base", },
@@ -155,20 +157,16 @@ models = [
     {"name": "kanana2",          "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/kakaocorp/kanana-2-30b-a3b-instruct-2601", },
     {"name": "f2llmv2",          "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/codefuse-ai/F2LLM-v2-4B", },
     {"name": "sarvam-moe",       "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/sarvamai/sarvam-30b", },
+    {"name": "talkie",           "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/lewtun/talkie-1930-13b-it-hf", },
+    {"name": "minicpm5",         "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/openbmb/MiniCPM5-1B"},
+    {"name": "granite-embed-multi-97m", "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2", },
+    {"name": "granite-embed-multi-311m", "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/ibm-granite/granite-embedding-311m-multilingual-r2", },
+    {"name": "mellum2",          "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/JetBrains/Mellum2-12B-A2.5B-Base"},
     {"name": "laguna",           "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/poolside/Laguna-XS.2", },
 ]
 
 # some models are known to be broken upstream, so we will skip them as exceptions
 pre_computed_hashes = [
-    # lfm2 ships several tokenizer revisions/forks that all map to the same
-    # pre-tokenizer. They must be pre-computed: get_existing_models() keys by
-    # res name, so a single models-list entry can only ever round-trip one of
-    # them and regeneration would silently drop the rest.
-    {"name": "lfm2", "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/LiquidAI/LFM2-Tokenizer", "chkhsh": "169bf0296a13c4d9b7672313f749eb36501d931022de052aad6e36f2bf34dd51"},
-    {"name": "lfm2", "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct", "chkhsh": "1695bc99c38f06ed8a7ab6d3e066ff571f9c5f8759e6eeba60afd0f221e2e858"},
-    {"name": "lfm2", "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B", "chkhsh": "9e454714343b69b99b71795c1d27a68c2a1d15dab111f4d353109f966af29da7"},
-    {"name": "lfm2", "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B", "chkhsh": "5d5192db33764da7bf8147f23ca2c0f4e74fb549a2ecb9dc39eff533a5a267cc"},
-    {"name": "lfm2", "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/reaperdoesntknow/LFM2.5-8B-A1B-Opus-Distil", "chkhsh": "87ab4b1536216e11d7a9b700bf6f8266d2742f26f436e8b557385f39cc891750"},
     # chatglm-bpe has 2 hashes, why?
     {"name": "chatglm-bpe", "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/THUDM/glm-4-9b-chat", "chkhsh": "b6e8e1518dc4305be2fe39c313ed643381c4da5db34a98f6a04c093f8afbe99b"},
     {"name": "chatglm-bpe", "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/THUDM/glm-4-9b-chat", "chkhsh": "81d72c7348a9f0ebe86f23298d37debe0a5e71149e29bd283904c02262b27516"},
@@ -190,6 +188,8 @@ pre_computed_hashes = [
     # jina-v2-de variants
     {"name": "jina-v2-de", "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/aari1995/German_Semantic_V3", "chkhsh": "b3d1dd861f1d4c5c0d2569ce36baf3f90fe8a102db3de50dd71ff860d91be3df"},
     {"name": "gpt-2", "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/evilfreelancer/ruGPT3XL", "chkhsh": "0fe1cf6eda062318a1af7270f3331a85c539a01778ff948e24388e949c5282f4"},
+    # lfm2 variants
+    {"name": "lfm2", "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B", "chkhsh": "9e454714343b69b99b71795c1d27a68c2a1d15dab111f4d353109f966af29da7"},
 ]
 
 
@@ -383,7 +383,7 @@ convert_py = re.sub(
 
 convert_py_pth.write_text(convert_py, encoding="utf-8")
 
-logger.info("+++ convert_hf_to_gguf.py was updated")
+logger.info(f"+++ {convert_py_pth} was updated")
 
 # generate tests for each tokenizer model
 

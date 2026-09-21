@@ -56,8 +56,9 @@ void llama_model_laguna::load_arch_hparams(llama_model_loader & ml) {
         hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID;
     }
 
-    switch (hparams.n_layer) {
+    switch (hparams.n_layer()) {
         case 40: type = LLM_TYPE_30B_A3B;   break;  // Laguna-XS.2
+        case 48: type = LLM_TYPE_118B_A8B;  break;  // Laguna-S.2
         case 70: type = LLM_TYPE_230B_A10B; break;  // Laguna-M.1
         default: type = LLM_TYPE_UNKNOWN;
     }
@@ -171,11 +172,6 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
 
     for (int il = 0; il < n_layer; ++il) {
-        // publish the layer input so DFlash/EAGLE3-style extraction can read it
-        // (mirrors qwen35moe.cpp / llama.cpp / gemma4.cpp; required by
-        //  llm_graph_result::set_outputs -> GGML_ASSERT(t_layer_inp[il] != nullptr))
-        res->t_layer_inp[il] = inpL;
-
         const bool    is_swa_il   = hparams.is_swa(il);
         const int64_t n_head_il   = hparams.n_head(il);
         const int64_t n_head_kv_il = hparams.n_head_kv(il);
@@ -329,7 +325,7 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

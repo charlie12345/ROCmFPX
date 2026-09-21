@@ -1,0 +1,51 @@
+name: ROCmFPX gfx1151 qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      validate_w4a4:
+        description: Also build the opt-in ROCmI4 W4A4 profile
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rocmfpx-gfx1151
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    runs-on: [self-hosted, linux, x64, rocmfpx, gfx1151]
+    timeout-minutes: 180
+    env:
+      HSA_OVERRIDE_GFX_VERSION: 11.5.1
+      ROCM_PATH: /opt/rocm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Enforce private downstream and manual execution
+        shell: bash
+        run: |
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "${GITHUB_REPOSITORY,,}" = rocmfpx/rocmfpx
+          test "${{ github.event.repository.private }}" = true
+
+      - name: CPU, Vulkan, and HIP qualification
+        shell: bash
+        env:
+          BUILD_DIR: ${{ runner.temp }}/rocmfpx-validation
+          ROCMFPX_VALIDATE_VULKAN: 1
+          ROCMFPX_VALIDATE_HIP: 1
+          ROCMFPX_VALIDATE_W4A4: ${{ inputs.validate_w4a4 && '1' || '0' }}
+        run: scripts/rocmfpx/validate-sync.sh
+
+      - name: ROCmFP4 backend operation smoke
+        shell: bash
+        env:
+          BUILD_DIR: ${{ runner.temp }}/rocmfpx-validation
+        run: |
+          "$BUILD_DIR/vulkan/bin/test-backend-ops" test -b Vulkan0 -o MUL_MAT -p 'type_a=q4_0_rocmfp4,'
+          ./build-strix-rocmfpx/bin/test-backend-ops test -b ROCm0 -o MUL_MAT -p 'type_a=q4_0_rocmfp4,'

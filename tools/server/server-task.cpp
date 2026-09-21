@@ -10,23 +10,26 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <algorithm>
 #include <cerrno>
-#include <cinttypes>
 #include <chrono>
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <sstream>
 #include <system_error>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <share.h>
+#else
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
 #endif
-
-using json = nlohmann::ordered_json;
 
 //
 // task_params
@@ -79,6 +82,8 @@ json task_params::to_json(bool only_metrics) const {
             {"mirostat",                  sampling.mirostat},
             {"mirostat_tau",              sampling.mirostat_tau},
             {"mirostat_eta",              sampling.mirostat_eta},
+            {"adaptive_target",           sampling.adaptive_target},
+            {"adaptive_decay",            sampling.adaptive_decay},
             {"max_tokens",                n_predict},
             {"n_predict",                 n_predict}, // TODO: deduplicate?
             {"n_keep",                    n_keep},
@@ -130,6 +135,8 @@ json task_params::to_json(bool only_metrics) const {
         {"mirostat",                  sampling.mirostat},
         {"mirostat_tau",              sampling.mirostat_tau},
         {"mirostat_eta",              sampling.mirostat_eta},
+        {"adaptive_target",           sampling.adaptive_target},
+        {"adaptive_decay",            sampling.adaptive_decay},
         {"stop",                      antiprompt},
         {"max_tokens",                n_predict},
         {"n_predict",                 n_predict}, // TODO: deduplicate?
@@ -160,6 +167,17 @@ json task_params::to_json(bool only_metrics) const {
 //
 // task_result_state
 //
+task_result_state::task_result_state(const common_chat_parser_params & chat_parser_params)
+    : chat_parser_params(chat_parser_params)
+    , oai_resp_id("resp_" + random_string())
+    , oai_resp_reasoning_id("rs_" + random_string())
+    , oai_resp_message_id("msg_" + random_string()) {
+    if (chat_parser_params.is_continuation && !chat_parser_params.echo) {
+        // initialize chat_msg to avoid emitting a delta containing the assistant prefill
+        chat_msg = common_chat_parse("", true, chat_parser_params);
+    }
+}
+
 common_chat_msg task_result_state::update_chat_msg(
         const std::string & text_added,
         bool is_partial,
@@ -238,420 +256,6 @@ common_chat_msg task_result_state::update_chat_msg(
 }
 
 //
-// server_task
-//
-
-task_params server_task::params_from_json_cmpl(
-        const llama_vocab * vocab,
-        const common_params & params_base,
-        const int n_ctx_slot,
-        const std::vector<llama_logit_bias> & logit_bias_eog,
-        const json & data) {
-    task_params params;
-
-    // Sampling parameter defaults are loaded from the global server context (but individual requests can still them)
-    task_params defaults;
-    defaults.sampling      = params_base.sampling;
-    defaults.speculative   = params_base.speculative;
-    defaults.n_keep        = params_base.n_keep;
-    defaults.n_predict     = params_base.n_predict;
-    defaults.n_cache_reuse = params_base.n_cache_reuse;
-    defaults.cache_prompt  = params_base.cache_prompt;
-    defaults.antiprompt    = params_base.antiprompt;
-
-    // enabling this will output extra debug information in the HTTP responses from the server
-    params.verbose           = params_base.verbosity > 9;
-    params.timings_per_token = json_value(data, "timings_per_token", false);
-
-    params.stream           = json_value(data,       "stream",             false);
-    auto stream_opt         = json_value(data,       "stream_options",     json::object());
-    params.include_usage    = json_value(stream_opt, "include_usage",      false);
-    params.cache_prompt     = json_value(data,       "cache_prompt",       defaults.cache_prompt);
-    params.return_tokens    = json_value(data,       "return_tokens",      false);
-    params.return_progress  = json_value(data,       "return_progress",    false);
-    auto max_tokens         = json_value(data,       "max_tokens",         defaults.n_predict);
-    params.n_predict        = json_value(data,       "n_predict",          json_value(data, "max_completion_tokens", max_tokens));
-    params.n_indent         = json_value(data,       "n_indent",           defaults.n_indent);
-    params.n_keep           = json_value(data,       "n_keep",             defaults.n_keep);
-    params.n_discard        = json_value(data,       "n_discard",          defaults.n_discard);
-    params.n_discard        = std::max(0, params.n_discard);
-    params.n_cmpl           = json_value(data,       "n_cmpl",             json_value(data, "n", 1));
-    params.n_cache_reuse    = json_value(data,       "n_cache_reuse",      defaults.n_cache_reuse);
-    //params.t_max_prompt_ms  = json_value(data,       "t_max_prompt_ms",    defaults.t_max_prompt_ms); // TODO: implement
-    params.t_max_predict_ms = json_value(data,       "t_max_predict_ms",   defaults.t_max_predict_ms);
-    params.response_fields  = json_value(data,       "response_fields",    std::vector<std::string>());
-
-    params.sampling.top_k              = json_value(data, "top_k",               defaults.sampling.top_k);
-    params.sampling.top_p              = json_value(data, "top_p",               defaults.sampling.top_p);
-    params.sampling.min_p              = json_value(data, "min_p",               defaults.sampling.min_p);
-    params.sampling.top_n_sigma        = json_value(data, "top_n_sigma",         defaults.sampling.top_n_sigma);
-    params.sampling.xtc_probability    = json_value(data, "xtc_probability",     defaults.sampling.xtc_probability);
-    params.sampling.xtc_threshold      = json_value(data, "xtc_threshold",       defaults.sampling.xtc_threshold);
-    params.sampling.typ_p              = json_value(data, "typical_p",           defaults.sampling.typ_p);
-    params.sampling.temp               = json_value(data, "temperature",         defaults.sampling.temp);
-    params.sampling.dynatemp_range     = json_value(data, "dynatemp_range",      defaults.sampling.dynatemp_range);
-    params.sampling.dynatemp_exponent  = json_value(data, "dynatemp_exponent",   defaults.sampling.dynatemp_exponent);
-    params.sampling.penalty_last_n     = json_value(data, "repeat_last_n",       defaults.sampling.penalty_last_n);
-    params.sampling.penalty_repeat     = json_value(data, "repeat_penalty",      defaults.sampling.penalty_repeat);
-    params.sampling.penalty_freq       = json_value(data, "frequency_penalty",   defaults.sampling.penalty_freq);
-    params.sampling.penalty_present    = json_value(data, "presence_penalty",    defaults.sampling.penalty_present);
-    params.sampling.dry_multiplier     = json_value(data, "dry_multiplier",      defaults.sampling.dry_multiplier);
-    params.sampling.dry_base           = json_value(data, "dry_base",            defaults.sampling.dry_base);
-    params.sampling.dry_allowed_length = json_value(data, "dry_allowed_length",  defaults.sampling.dry_allowed_length);
-    params.sampling.dry_penalty_last_n = json_value(data, "dry_penalty_last_n",  defaults.sampling.dry_penalty_last_n);
-    params.sampling.mirostat           = json_value(data, "mirostat",            defaults.sampling.mirostat);
-    params.sampling.mirostat_tau       = json_value(data, "mirostat_tau",        defaults.sampling.mirostat_tau);
-    params.sampling.mirostat_eta       = json_value(data, "mirostat_eta",        defaults.sampling.mirostat_eta);
-    params.sampling.adaptive_target    = json_value(data, "adaptive_target",     defaults.sampling.adaptive_target);
-    params.sampling.adaptive_decay     = json_value(data, "adaptive_decay",      defaults.sampling.adaptive_decay);
-    params.sampling.seed               = json_value(data, "seed",                defaults.sampling.seed);
-    params.sampling.n_probs            = json_value(data, "n_probs",             defaults.sampling.n_probs);
-    params.sampling.min_keep           = json_value(data, "min_keep",            defaults.sampling.min_keep);
-    params.sampling.backend_sampling   = json_value(data, "backend_sampling",    defaults.sampling.backend_sampling);
-    params.post_sampling_probs         = json_value(data, "post_sampling_probs", defaults.post_sampling_probs);
-
-    params.speculative = defaults.speculative;
-
-    // per-request overrides for the draft-model based speculative parameters
-    params.speculative.draft.n_min = json_value(data, "speculative.n_min", defaults.speculative.draft.n_min);
-    params.speculative.draft.n_max = json_value(data, "speculative.n_max", defaults.speculative.draft.n_max);
-    params.speculative.draft.p_min = json_value(data, "speculative.p_min", defaults.speculative.draft.p_min);
-
-    params.speculative.draft.n_min = std::min(params.speculative.draft.n_max, params.speculative.draft.n_min);
-    params.speculative.draft.n_min = std::max(params.speculative.draft.n_min, 0);
-    params.speculative.draft.n_max = std::max(params.speculative.draft.n_max, 0);
-
-    // TODO: to keep things simple, we disable further speculative parameter adjustments for now
-#if 0
-    // for debugging and research purposes
-    params.speculative.type = common_speculative_type_from_name(json_value(data, "speculative.type", common_speculative_type_to_str(defaults.speculative.type)));
-
-    params.speculative.ngram_size_n     = json_value(data, "speculative.ngram_size_n", defaults.speculative.ngram_size_n);
-    params.speculative.ngram_size_m     = json_value(data, "speculative.ngram_size_m", defaults.speculative.ngram_size_m);
-    params.speculative.ngram_min_hits   = json_value(data, "speculative.ngram_m_hits", defaults.speculative.ngram_min_hits);
-
-    params.speculative.ngram_size_n     = std::max(std::min(1, (int) params.speculative.ngram_size_n),     1024);
-    params.speculative.ngram_size_m     = std::max(std::min(1, (int) params.speculative.ngram_size_m),     1024);
-    params.speculative.ngram_min_hits   = std::max(std::min(1, (int) params.speculative.ngram_min_hits),   1024);
-#endif
-
-    // Use OpenAI API logprobs only if n_probs wasn't provided
-    if (data.contains("logprobs") && params.sampling.n_probs == defaults.sampling.n_probs){
-        params.sampling.n_probs = json_value(data, "logprobs", defaults.sampling.n_probs);
-    }
-
-    if (data.contains("lora")) {
-        if (data.at("lora").is_array()) {
-            params.lora = parse_lora_request(data.at("lora"));
-        } else {
-            throw std::runtime_error("Error: 'lora' must be an array of objects with 'id' and 'scale' fields");
-        }
-    } else {
-        params.lora = {};
-    }
-
-    // TODO: add more sanity checks for the input parameters
-
-    if (params.sampling.penalty_last_n < -1) {
-        throw std::runtime_error("Error: repeat_last_n must be >= -1");
-    }
-
-    if (params.sampling.dry_penalty_last_n < -1) {
-        throw std::runtime_error("Error: dry_penalty_last_n must be >= -1");
-    }
-
-    if (params.sampling.penalty_last_n == -1) {
-        // note: should be the slot's context and not the full context, but it's ok
-        params.sampling.penalty_last_n = n_ctx_slot;
-    }
-
-    if (params.sampling.dry_penalty_last_n == -1) {
-        params.sampling.dry_penalty_last_n = n_ctx_slot;
-    }
-
-    if (params.sampling.dry_base < 1.0f) {
-        params.sampling.dry_base = defaults.sampling.dry_base;
-    }
-
-    // sequence breakers for DRY
-    {
-        // Currently, this is not compatible with TextGen WebUI, Koboldcpp and SillyTavern format
-        // Ref: https://github.com/oobabooga/text-generation-webui/blob/d1af7a41ade7bd3c3a463bfa640725edb818ebaf/extensions/openai/typing.py#L39
-
-        if (data.contains("dry_sequence_breakers")) {
-            params.sampling.dry_sequence_breakers = json_value(data, "dry_sequence_breakers", std::vector<std::string>());
-            if (params.sampling.dry_sequence_breakers.empty()) {
-                throw std::runtime_error("Error: dry_sequence_breakers must be a non-empty array of strings");
-            }
-        }
-    }
-
-    // process "json_schema" and "grammar"
-    if (data.contains("json_schema") && !data.contains("grammar")) {
-        try {
-            auto schema                  = json_value(data, "json_schema", json::object());
-            SRV_DBG("JSON schema: %s\n", schema.dump(2).c_str());
-            std::string grammar_str      = json_schema_to_grammar(schema);
-            SRV_DBG("Converted grammar: %s\n", grammar_str.c_str());
-            params.sampling.grammar      = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, std::move(grammar_str)};
-        } catch (const std::exception & e) {
-            throw std::runtime_error(std::string("\"json_schema\": ") + e.what());
-        }
-    } else {
-        params.sampling.grammar = defaults.sampling.grammar;
-
-        std::string grammar_str = json_value(data, "grammar", std::string());
-        if (!grammar_str.empty()) {
-            // grammar_type key is set by the server when converting chat template grammars
-            std::string grammar_type = json_value(data, "grammar_type", std::string());
-            if (grammar_type == "tool_calls") {
-                params.sampling.grammar = {COMMON_GRAMMAR_TYPE_TOOL_CALLS, std::move(grammar_str)};
-            } else {
-                // explicit grammar from the user (API field "grammar")
-                params.sampling.grammar = {COMMON_GRAMMAR_TYPE_USER, std::move(grammar_str)};
-            }
-            SRV_DBG("Grammar (%s): %s\n", grammar_type.c_str(), common_grammar_value(params.sampling.grammar).c_str());
-        }
-        params.sampling.grammar_lazy = json_value(data, "grammar_lazy", defaults.sampling.grammar_lazy);
-        SRV_DBG("Grammar lazy: %s\n", params.sampling.grammar_lazy ? "true" : "false");
-    }
-
-    {
-        auto it = data.find("chat_format");
-        if (it != data.end()) {
-            params.chat_parser_params.format = static_cast<common_chat_format>(it->get<int>());
-            SRV_INF("Chat format: %s\n", common_chat_format_name(params.chat_parser_params.format));
-        } else {
-            params.chat_parser_params.format = defaults.chat_parser_params.format;
-        }
-        common_reasoning_format reasoning_format = params_base.reasoning_format;
-        if (data.contains("reasoning_format")) {
-            reasoning_format = common_reasoning_format_from_name(data.at("reasoning_format").get<std::string>());
-        }
-        params.chat_parser_params.reasoning_format = reasoning_format;
-        params.chat_parser_params.reasoning_in_content = params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
-        params.chat_parser_params.generation_prompt = json_value(data, "generation_prompt", std::string());
-        params.sampling.generation_prompt = params.chat_parser_params.generation_prompt;
-        SRV_DBG("Generation prompt: '%s'\n", params.chat_parser_params.generation_prompt.c_str());
-        params.chat_parser_params.parse_tool_calls = json_value(data, "parse_tool_calls", false);
-        if (data.contains("chat_parser")) {
-            params.chat_parser_params.parser.load(data.at("chat_parser").get<std::string>());
-        }
-    }
-
-    {
-        const auto preserved_tokens = data.find("preserved_tokens");
-        if (preserved_tokens != data.end()) {
-            for (const auto & t : *preserved_tokens) {
-                auto ids = common_tokenize(vocab, t.get<std::string>(), /* add_special= */ false, /* parse_special= */ true);
-                if (ids.size() == 1) {
-                    SRV_DBG("Preserved token: %d\n", ids[0]);
-                    params.sampling.preserved_tokens.insert(ids[0]);
-                } else {
-                    // This may happen when using a tool call style meant for a model with special tokens to preserve on a model without said tokens.
-                    SRV_DBG("Not preserved because more than 1 token: %s\n", t.get<std::string>().c_str());
-                }
-            }
-        }
-        const auto grammar_triggers = data.find("grammar_triggers");
-        if (grammar_triggers != data.end()) {
-            for (const auto & t : *grammar_triggers) {
-                server_grammar_trigger ct(t);
-                if (ct.value.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
-                    const auto & word = ct.value.value;
-                    auto ids = common_tokenize(vocab, word, /* add_special= */ false, /* parse_special= */ true);
-                    if (ids.size() == 1) {
-                        auto token = ids[0];
-                        if (std::find(params.sampling.preserved_tokens.begin(), params.sampling.preserved_tokens.end(), (llama_token) token) == params.sampling.preserved_tokens.end()) {
-                            throw std::runtime_error("Grammar trigger word should be marked as preserved token: " + word);
-                        }
-                        SRV_DBG("Grammar trigger token: %d (`%s`)\n", token, word.c_str());
-                        common_grammar_trigger trigger;
-                        trigger.type = COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN;
-                        trigger.value = word;
-                        trigger.token = token;
-                        params.sampling.grammar_triggers.push_back(std::move(trigger));
-                    } else {
-                        SRV_DBG("Grammar trigger word: `%s`\n", word.c_str());
-                        params.sampling.grammar_triggers.push_back({COMMON_GRAMMAR_TRIGGER_TYPE_WORD, word});
-                    }
-                } else {
-                    if (ct.value.type == COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN) {
-                        SRV_DBG("Grammar trigger pattern: `%s`\n", ct.value.value.c_str());
-                    } else if (ct.value.type == COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL) {
-                        SRV_DBG("Grammar trigger pattern full: `%s`\n", ct.value.value.c_str());
-                    } else {
-                        throw std::runtime_error("Unknown grammar trigger type");
-                    }
-                    params.sampling.grammar_triggers.emplace_back(std::move(ct.value));
-                }
-            }
-        }
-        if (params.sampling.grammar_lazy && params.sampling.grammar_triggers.empty()) {
-            throw std::runtime_error("Error: no triggers set for lazy grammar!");
-        }
-    }
-
-    // Parse reasoning budget sampler parameters
-    {
-        const int32_t budget = json_value(data, "reasoning_budget_tokens", (int32_t) -1);
-        const auto start_tag = json_value(data, "reasoning_budget_start_tag", std::string());
-        const auto end_tag   = json_value(data, "reasoning_budget_end_tag", std::string());
-        const auto message   = json_value(data, "reasoning_budget_message", std::string());
-        params.sampling.reasoning_budget_tokens = budget;
-
-        if (!start_tag.empty()) {
-            params.sampling.reasoning_budget_start = common_tokenize(vocab, start_tag, false, true);
-        }
-        if (!end_tag.empty()) {
-            params.sampling.reasoning_budget_end = common_tokenize(vocab, end_tag, false, true);
-            // il template re-renderizza un turno assistant passato come
-            // '<think>\n' + reasoning_content + '\n</think>\n\n': il '\n' prima dell'end tag
-            // deve far parte della sequenza forzata, altrimenti un turno tagliato dal budget
-            // non round-trippa nel resend del client e la prompt cache diverge alla chiusura
-            params.sampling.reasoning_budget_forced = common_tokenize(vocab, "\n" + message + end_tag, false, true);
-
-            SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu toks, forced=%zu toks\n",
-                budget, params.sampling.generation_prompt.c_str(),
-                params.sampling.reasoning_budget_start.size(),
-                params.sampling.reasoning_budget_end.size(),
-                params.sampling.reasoning_budget_forced.size());
-        }
-    }
-
-    {
-        params.sampling.logit_bias.clear();
-
-        const auto & logit_bias = data.find("logit_bias");
-        if (logit_bias != data.end() && logit_bias->is_array()) {
-            const int n_vocab = llama_vocab_n_tokens(vocab);
-            for (const auto & el : *logit_bias) {
-                // TODO: we may want to throw errors here, in case "el" is incorrect
-                if (el.is_array() && el.size() == 2) {
-                    float bias;
-                    if (el[1].is_number()) {
-                        bias = el[1].get<float>();
-                    } else if (el[1].is_boolean() && !el[1].get<bool>()) {
-                        bias = -INFINITY;
-                    } else {
-                        continue;
-                    }
-
-                    if (el[0].is_number_integer()) {
-                        llama_token tok = el[0].get<llama_token>();
-                        if (tok >= 0 && tok < n_vocab) {
-                            params.sampling.logit_bias.push_back({tok, bias});
-                        }
-                    } else if (el[0].is_string()) {
-                        auto toks = common_tokenize(vocab, el[0].get<std::string>(), false);
-                        for (auto tok : toks) {
-                            params.sampling.logit_bias.push_back({tok, bias});
-                        }
-                    }
-                }
-            }
-        } else if (logit_bias != data.end() && logit_bias->is_object()) {
-            const int n_vocab = llama_vocab_n_tokens(vocab);
-            for (const auto & el : logit_bias->items()) {
-                float bias;
-                const auto & key = el.key();
-                const auto & value = el.value();
-                if (value.is_number()) {
-                    bias = value.get<float>();
-                } else if (value.is_boolean() && !value.get<bool>()) {
-                    bias = -INFINITY;
-                } else {
-                    continue;
-                }
-
-                char *end;
-                llama_token tok = strtol(key.c_str(), &end, 10);
-                if (*end == 0) {
-                    if (tok >= 0 && tok < n_vocab) {
-                        params.sampling.logit_bias.push_back({tok, bias});
-                    }
-                } else {
-                    auto toks = common_tokenize(vocab, key, false);
-                    for (auto tok : toks) {
-                        params.sampling.logit_bias.push_back({tok, bias});
-                    }
-                }
-            }
-        }
-
-        params.sampling.ignore_eos = json_value(data, "ignore_eos", params_base.sampling.ignore_eos);
-        if (params.sampling.ignore_eos) {
-            params.sampling.logit_bias.insert(
-                    params.sampling.logit_bias.end(),
-                    logit_bias_eog.begin(), logit_bias_eog.end());
-        }
-    }
-
-    {
-        params.antiprompt.clear();
-
-        const auto & stop = data.find("stop");
-        if (stop != data.end() && stop->is_array()) {
-            for (const auto & word : *stop) {
-                if (!word.empty()) {
-                    params.antiprompt.push_back(word);
-                }
-            }
-        }
-        // set reverse prompt from cli args if not set in the request
-        if (params.antiprompt.empty()) {
-            params.antiprompt = defaults.antiprompt;
-        }
-    }
-
-    {
-        const auto samplers = data.find("samplers");
-        if (samplers != data.end()) {
-            if (samplers->is_array()) {
-                params.sampling.samplers = common_sampler_types_from_names(*samplers);
-            } else if (samplers->is_string()){
-                params.sampling.samplers = common_sampler_types_from_chars(samplers->get<std::string>());
-            }
-        } else {
-            params.sampling.samplers = defaults.sampling.samplers;
-        }
-    }
-
-    if (params.n_cmpl > params_base.n_parallel) {
-        throw std::runtime_error("n_cmpl cannot be greater than the number of slots, please increase -np");
-    }
-
-    return params;
-}
-
-//
-// result_timings
-//
-
-json result_timings::to_json() const {
-    json base = {
-        {"cache_n",                cache_n},
-
-        {"prompt_n",               prompt_n},
-        {"prompt_ms",              prompt_ms},
-        {"prompt_per_token_ms",    prompt_per_token_ms},
-        {"prompt_per_second",      prompt_per_second},
-
-        {"predicted_n",            predicted_n},
-        {"predicted_ms",           predicted_ms},
-        {"predicted_per_token_ms", predicted_per_token_ms},
-        {"predicted_per_second",   predicted_per_second},
-    };
-
-    if (draft_n > 0) {
-        base["draft_n"] = draft_n;
-        base["draft_n_accepted"] = draft_n_accepted;
-    }
-
-    return base;
-}
-
-//
 // result_prompt_progress
 //
 json result_prompt_progress::to_json() const {
@@ -717,7 +321,7 @@ json completion_token_output::probs_vector_to_json(const std::vector<completion_
 }
 
 float completion_token_output::logarithm(float x) {
-    // nlohmann::json converts -inf to null, so we need to prevent that
+    // the JSON library converts -inf to null, so we need to prevent that
     return x == 0.0f ? std::numeric_limits<float>::lowest() : std::log(x);
 }
 
@@ -769,7 +373,7 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"stop_type",           stop_type_to_str(stop)},
         {"stopping_word",       stopping_word},
         {"tokens_cached",       n_tokens_cached},
-        {"timings",             timings.to_json()},
+        {"timings",             stats.to_json()},
     };
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
@@ -819,8 +423,8 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
     }
-    if (timings.prompt_n >= 0) {
-        res.push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        res["timings"] = stats.to_json();
     }
 
     return res;
@@ -867,8 +471,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
     }
-    if (timings.prompt_n >= 0) {
-        res.push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        res["timings"] = stats.to_json();
     }
 
     return res;
@@ -928,8 +532,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
         });
     }
 
-    if (timings.prompt_n >= 0) {
-        deltas.back().push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        deltas.back()["timings"] = stats.to_json();
     }
 
     // extra fields for debugging purposes
@@ -982,10 +586,11 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
         output.push_back(json {
+            {"id",        "fc_" + tool_call.id},
             {"type",      "function_call"},
             {"status",    "completed"},
             {"arguments", tool_call.arguments},
-            {"call_id",   "fc_" + tool_call.id},
+            {"call_id",   "call_" + tool_call.id},
             {"name",      tool_call.name},
         });
     }
@@ -1081,10 +686,11 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
         const json output_item = {
+            {"id",        "fc_" + tool_call.id},
             {"type",      "function_call"},
             {"status",    "completed"},
             {"arguments", tool_call.arguments},
-            {"call_id",   "fc_" + tool_call.id},
+            {"call_id",   "call_" + tool_call.id},
             {"name",      tool_call.name}
         };
         server_sent_events.push_back(json {
@@ -1118,6 +724,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
             }},
         }}
     });
+
+    if (stats.is_set()) {
+        server_sent_events.back().at("data")["timings"] = stats.to_json();
+    }
 
     return server_sent_events;
 }
@@ -1396,12 +1006,16 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
 //
 void server_task_result_cmpl_partial::update(task_result_state & state) {
     is_updated = true;
+    if (is_begin) {
+        return; // begin marker only flushes headers, skip parsing
+    }
     state.update_chat_msg(content, true, oaicompat_msg_diffs);
 
     // Copy current state for use in to_json_*() (reflects state BEFORE this chunk)
     thinking_block_started = state.thinking_block_started;
     text_block_started     = state.text_block_started;
 
+    oai_resp_created       = state.oai_resp_created;
     oai_resp_id            = state.oai_resp_id;
     oai_resp_reasoning_id  = state.oai_resp_reasoning_id;
     oai_resp_message_id    = state.oai_resp_message_id;
@@ -1409,6 +1023,10 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
 
     // track if the accumulated message has any reasoning content
     anthropic_has_reasoning = !state.chat_msg.reasoning_content.empty();
+
+    if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && !state.oai_resp_created && (is_progress || n_decoded == 1)) {
+        state.oai_resp_created = true;
+    }
 
     // Pre-compute state updates based on diffs (for next chunk)
     for (const common_chat_msg_diff & diff : oaicompat_msg_diffs) {
@@ -1426,6 +1044,9 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
 
 json server_task_result_cmpl_partial::to_json() {
     GGML_ASSERT(is_updated && "update() must be called before to_json()");
+    if (is_begin) {
+        return nullptr; // simply signal to HTTP handler to send the headers and status code
+    }
     switch (res_type) {
         case TASK_RESPONSE_TYPE_NONE:
             return to_json_non_oaicompat();
@@ -1456,11 +1077,11 @@ json server_task_result_cmpl_partial::to_json_non_oaicompat() {
         {"tokens_evaluated", n_prompt_tokens},
     };
     // populate the timings object when needed (usually for the last response or with timings_per_token enabled)
-    if (timings.prompt_n > 0) {
-        res.push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        res["timings"] = stats.to_json();
     }
     if (is_progress) {
-        res.push_back({"prompt_progress", progress.to_json()});
+        res["prompt_progress"] = progress.to_json();
     }
     if (!prob_output.probs.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json({prob_output}, post_sampling_probs);
@@ -1496,11 +1117,11 @@ json server_task_result_cmpl_partial::to_json_oaicompat() {
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
     }
-    if (timings.prompt_n >= 0) {
-        res.push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        res["timings"] = stats.to_json();
     }
     if (is_progress) {
-        res.push_back({"prompt_progress", progress.to_json()});
+        res["prompt_progress"] = progress.to_json();
     }
 
     return res;
@@ -1550,11 +1171,11 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
             };
         }
 
-        if (timings.prompt_n >= 0) {
-            last_json.push_back({"timings", timings.to_json()});
+        if (stats.is_set()) {
+            last_json["timings"] = stats.to_json();
         }
         if (is_progress) {
-            last_json.push_back({"prompt_progress", progress.to_json()});
+            last_json["prompt_progress"] = progress.to_json();
         }
     }
 
@@ -1564,7 +1185,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
 json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
     std::vector<json> events;
 
-    if (n_decoded == 1) {
+    if (!oai_resp_created) {
         events.push_back(json {
             {"event", "response.created"},
             {"data", json {
@@ -1576,6 +1197,18 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                 }},
             }},
         });
+        events.push_back(json {
+            {"event", "response.in_progress"},
+            {"data", json {
+                {"type", "response.in_progress"},
+                {"response", json {
+                    {"id",     oai_resp_id},
+                    {"object", "response"},
+                    {"status", "in_progress"},
+                }},
+            }},
+        });
+    } else if (is_progress) {
         events.push_back(json {
             {"event", "response.in_progress"},
             {"data", json {
@@ -1662,8 +1295,9 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                 {"data", json {
                     {"type",  "response.output_item.added"},
                     {"item", json {
+                        {"id",        "fc_" + diff.tool_call_delta.id},
                         {"arguments", ""},
-                        {"call_id",   "fc_" + diff.tool_call_delta.id},
+                        {"call_id",   "call_" + diff.tool_call_delta.id},
                         {"name",      diff.tool_call_delta.name},
                         {"type",      "function_call"},
                         {"status",    "in_progress"},
@@ -1684,6 +1318,17 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
             });
         }
     }
+
+    if (!events.empty()) {
+        json & data = events.back().at("data");
+        if (stats.is_set()) {
+            data["timings"] = stats.to_json();
+        }
+        if (is_progress) {
+            data["prompt_progress"] = progress.to_json();
+        }
+    }
+
     return events;
 }
 
@@ -1884,30 +1529,110 @@ json server_task_result_error::to_json() {
 //
 // server_task_result_metrics
 //
+json server_task_result_slots::to_json() {
+    return slots_data;
+}
+
 json server_task_result_metrics::to_json() {
-    return json {
-        { "idle",                            n_idle_slots },
-        { "processing",                      n_processing_slots },
-        { "deferred",                        n_tasks_deferred },
-        { "t_start",                         t_start },
+    // not used, /metrics renders prometheus text via to_metrics()
+    return json{};
+}
 
-        { "n_prompt_tokens_processed_total", n_prompt_tokens_processed_total },
-        { "t_tokens_generation_total",       t_tokens_generation_total },
-        { "n_tokens_predicted_total",        n_tokens_predicted_total },
-        { "t_prompt_processing_total",       t_prompt_processing_total },
-
-        { "n_tokens_max",                    n_tokens_max },
-
-        { "n_prompt_tokens_processed",       n_prompt_tokens_processed },
-        { "t_prompt_processing",             t_prompt_processing },
-        { "n_tokens_predicted",              n_tokens_predicted },
-        { "t_tokens_generation",             t_tokens_generation },
-
-        { "n_decode_total",                  n_decode_total },
-        { "n_busy_slots_total",              n_busy_slots_total },
-
-        { "slots",                           slots_data },
+// metrics definition: https://prometheus.io/docs/practices/naming/#metric-names
+std::string server_task_result_metrics::to_metrics() {
+    const std::vector<metric_item> counters = {
+        {
+            "prompt_tokens_total",
+            "Number of prompt tokens processed, excluding cached tokens",
+            (double) metrics.prompt.count
+        }, {
+            "prompt_tokens_cached_total",
+            "Number of prompt tokens reused from the cache",
+            (double) metrics.n_prompt_cached
+        }, {
+            "prompt_seconds_total",
+            "Total time spent processing prompts",
+            metrics.prompt.time / 1.e6
+        }, {
+            "tokens_predicted_total",
+            "Number of generation tokens processed",
+            (double) metrics.predict.count
+        }, {
+            "tokens_predicted_seconds_total",
+            "Total time spent generating tokens",
+            metrics.predict.time / 1.e6
+        }, {
+            "n_decode_total",
+            "Total number of llama_decode() calls, excluding speculative decoding and multimodal decoding",
+            (double) metrics.n_decode
+        }, {
+            "n_tokens_max",
+            "Largest observed sequence length (prompt + generation)",
+            (double) metrics.n_tokens_max
+        }, {
+            "spec_decode_num_draft_tokens_total",
+            "Speculative: Total draft tokens generated",
+            (double) metrics.n_draft_tokens
+        }, {
+            "spec_decode_num_accepted_tokens_total",
+            "Speculative: Total draft tokens accepted by the target model",
+            (double) metrics.n_draft_accepted
+        }, {
+            "spec_decode_num_drafts_total",
+            "Speculative: Total speculative decoding verification steps",
+            (double) metrics.n_draft_verif_steps
+        },
     };
+
+    const std::vector<metric_item> gauges = {
+        {
+            "prompt_tokens_seconds",
+            "Average prompt throughput in tokens/s",
+            metrics.prompt_bucket.n_per_second()
+        }, {
+            "predicted_tokens_seconds",
+            "Average generation throughput in tokens/s",
+            metrics.predict_bucket.n_per_second()
+        }, {
+            "requests_processing",
+            "Number of requests processing",
+            (double) n_processing_slots
+        }, {
+            "requests_deferred",
+            "Number of requests deferred",
+            (double) n_tasks_deferred
+        }, {
+            "n_busy_slots_per_decode",
+            "Average number of busy slots per llama_decode() call",
+            (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        },
+    };
+
+    std::stringstream prometheus;
+
+    auto add_items = [&prometheus](const char * type, const std::vector<metric_item> & items) {
+        for (const auto & item : items) {
+            prometheus << "# HELP llamacpp:" << item.name << " " << item.description << "\n"
+                       << "# TYPE llamacpp:" << item.name << " " << type             << "\n"
+                       << "llamacpp:"        << item.name << " " << item.value       << "\n";
+        }
+    };
+
+    add_items("counter", counters);
+    add_items("gauge",   gauges);
+
+    // labeled counter: one time series per draft position
+    if (!metrics.n_accepted_per_pos.empty()) {
+        prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
+                      " Accepted tokens per draft position\n"
+                   << "# TYPE llamacpp:spec_decode_num_accepted_tokens_per_pos_total counter\n";
+        for (size_t i = 0; i < metrics.n_accepted_per_pos.size(); i++) {
+            prometheus << "llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position=\""
+                       << i << "\"} " << metrics.n_accepted_per_pos[i] << "\n";
+        }
+    }
+
+    return prometheus.str();
 }
 
 //
@@ -1982,12 +1707,17 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+
 namespace {
 
 namespace fs = std::filesystem;
 
 constexpr const char * SERVER_PROMPT_CACHE_DISK_NAMESPACE = ".llama-prompt-cache-v1";
-constexpr const char * SERVER_PROMPT_CACHE_OWNER_MAGIC = "llama.cpp automatic prompt cache v1";
+constexpr const char * SERVER_PROMPT_CACHE_OWNER_MAGIC    = "llama.cpp automatic prompt cache v1";
+
+// checkpoint sidecar: magic, version, n_tokens, pos_min, pos_max, size_tgt, size_dft, size_spec, payloads
+constexpr uint32_t SERVER_PROMPT_CACHE_CKPT_MAGIC   = 0x50434b43u; // 'CKCP'
+constexpr uint32_t SERVER_PROMPT_CACHE_CKPT_VERSION = 1;
 
 static std::string server_prompt_cache_disk_path_utf8(const fs::path & path) {
 #if defined(__cpp_lib_char8_t)
@@ -2112,15 +1842,166 @@ static bool server_prompt_cache_tokens_equal(const server_tokens & expected, con
     return expected.get_tokens() == actual;
 }
 
+// Number of tokens of `tokens_new` that a cached state with `cached` tokens and common
+// prefix `lcp` actually saves once restored into a slot:
+//  - the whole prefix when the entry ends exactly there, or the target can drop the tail
+//    in place (dense KV);
+//  - otherwise the newest checkpoint at or before the divergence (`ckpt_n`, 0 = none):
+//    recurrent/hybrid state cannot be truncated, so the slot rolls back to that
+//    checkpoint and re-prefills from it;
+//  - 0 when neither applies (the slot would have to start cold).
+static size_t server_prompt_cache_eff_tokens(size_t cached, size_t lcp, bool partial_rm, int64_t ckpt_n) {
+    if (lcp == cached || partial_rm) {
+        return lcp;
+    }
+    if (ckpt_n > 0 && (size_t) ckpt_n <= lcp) {
+        return (size_t) ckpt_n;
+    }
+    return 0;
+}
+
+// <stem>-ckpt<k>.bin, k = 0 is the oldest persisted checkpoint of the entry
+constexpr int SERVER_PROMPT_CACHE_CKPT_MAX_FILES = 64;
+
+static std::string server_prompt_cache_ckpt_suffix(int k) {
+    return "-ckpt" + std::to_string(k) + ".bin";
+}
+
+// header: u32 magic, u32 version, u64 n_tokens, i32 pos_min, i32 pos_max, u64 size_tgt, u64 size_dft, u64 size_spec
+static bool server_prompt_cache_ckpt_write(
+        const fs::path & path_tmp, const fs::path & path, const common_prompt_checkpoint & ck, size_t & n_bytes) {
+    const std::string path_tmp_utf8 = server_prompt_cache_disk_path_utf8(path_tmp);
+
+    bool ok = false;
+    n_bytes = 0;
+    {
+        const uint32_t magic   = SERVER_PROMPT_CACHE_CKPT_MAGIC;
+        const uint32_t version = SERVER_PROMPT_CACHE_CKPT_VERSION;
+        const uint64_t h_n_tokens = (uint64_t) ck.n_tokens;
+        const int32_t  h_pos_min  = ck.pos_min;
+        const int32_t  h_pos_max  = ck.pos_max;
+        const uint64_t s_tgt = ck.data_tgt.size();
+        const uint64_t s_dft = ck.data_dft.size();
+        const uint64_t s_spc = ck.data_spec.size();
+        FILE * f = fopen(path_tmp_utf8.c_str(), "wb");
+        if (f) {
+            ok = fwrite(&magic, sizeof(magic), 1, f) == 1 &&
+                 fwrite(&version, sizeof(version), 1, f) == 1 &&
+                 fwrite(&h_n_tokens, sizeof(h_n_tokens), 1, f) == 1 &&
+                 fwrite(&h_pos_min, sizeof(h_pos_min), 1, f) == 1 &&
+                 fwrite(&h_pos_max, sizeof(h_pos_max), 1, f) == 1 &&
+                 fwrite(&s_tgt, sizeof(s_tgt), 1, f) == 1 &&
+                 fwrite(&s_dft, sizeof(s_dft), 1, f) == 1 &&
+                 fwrite(&s_spc, sizeof(s_spc), 1, f) == 1 &&
+                 (s_tgt == 0 || fwrite(ck.data_tgt.data(), 1, s_tgt, f) == s_tgt) &&
+                 (s_dft == 0 || fwrite(ck.data_dft.data(), 1, s_dft, f) == s_dft) &&
+                 (s_spc == 0 || fwrite(ck.data_spec.data(), 1, s_spc, f) == s_spc);
+            n_bytes = sizeof(magic) + sizeof(version) + sizeof(h_n_tokens) + sizeof(h_pos_min) + sizeof(h_pos_max) +
+                      sizeof(s_tgt) + sizeof(s_dft) + sizeof(s_spc) + (size_t) (s_tgt + s_dft + s_spc);
+            ok = (fclose(f) == 0) && ok;
+        }
+    }
+    if (ok) {
+        std::error_code ec;
+        fs::rename(path_tmp, path, ec);
+        ok = !ec;
+    }
+    if (!ok) {
+        server_prompt_cache_disk_remove_file(path_tmp_utf8);
+        n_bytes = 0;
+    }
+    return ok;
+}
+
+// reads only the header; false when the file is not a checkpoint of this format
+static bool server_prompt_cache_ckpt_read_meta(const std::string & path, server_prompt_checkpoint_meta & meta) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    uint32_t magic = 0, version = 0; uint64_t n_tokens = 0; int32_t pos_min = 0, pos_max = 0;
+    const bool ok = fread(&magic, sizeof(magic), 1, f) == 1 && fread(&version, sizeof(version), 1, f) == 1 &&
+                    fread(&n_tokens, sizeof(n_tokens), 1, f) == 1 &&
+                    fread(&pos_min, sizeof(pos_min), 1, f) == 1 && fread(&pos_max, sizeof(pos_max), 1, f) == 1 &&
+                    magic == SERVER_PROMPT_CACHE_CKPT_MAGIC && version == SERVER_PROMPT_CACHE_CKPT_VERSION && n_tokens > 0;
+    fclose(f);
+    if (ok) {
+        meta = {(int64_t) n_tokens, pos_min, pos_max};
+    }
+    return ok;
+}
+
+static bool server_prompt_cache_ckpt_read(
+        const std::string & path, int64_t n_tokens_expected, common_prompt_checkpoint & ck, size_t & n_bytes) {
+    n_bytes = 0;
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    uint32_t magic = 0, version = 0; uint64_t h_n_tokens = 0, s_tgt = 0, s_dft = 0, s_spc = 0; int32_t h_pos_min = 0, h_pos_max = 0;
+    bool ok = fread(&magic, sizeof(magic), 1, f) == 1 && magic == SERVER_PROMPT_CACHE_CKPT_MAGIC &&
+              fread(&version, sizeof(version), 1, f) == 1 && version == SERVER_PROMPT_CACHE_CKPT_VERSION &&
+              fread(&h_n_tokens, sizeof(h_n_tokens), 1, f) == 1 &&
+              fread(&h_pos_min, sizeof(h_pos_min), 1, f) == 1 &&
+              fread(&h_pos_max, sizeof(h_pos_max), 1, f) == 1 &&
+              fread(&s_tgt, sizeof(s_tgt), 1, f) == 1 &&
+              fread(&s_dft, sizeof(s_dft), 1, f) == 1 &&
+              fread(&s_spc, sizeof(s_spc), 1, f) == 1 &&
+              h_n_tokens == (uint64_t) n_tokens_expected;
+    if (ok) {
+        ck.n_tokens = (int64_t) h_n_tokens; ck.pos_min = h_pos_min; ck.pos_max = h_pos_max;
+        ck.id_task = -1;
+        ck.data_tgt.resize((size_t) s_tgt); ck.data_dft.resize((size_t) s_dft); ck.data_spec.resize((size_t) s_spc);
+        ok = (s_tgt == 0 || fread(ck.data_tgt.data(), 1, (size_t) s_tgt, f) == s_tgt) &&
+             (s_dft == 0 || fread(ck.data_dft.data(), 1, (size_t) s_dft, f) == s_dft) &&
+             (s_spc == 0 || fread(ck.data_spec.data(), 1, (size_t) s_spc, f) == s_spc);
+        n_bytes = (size_t) ftell(f);
+    }
+    fclose(f);
+    return ok;
+}
+
+// newest checkpoint boundary at or before `lcp` (0 = none)
+static int64_t server_prompt_cache_ckpt_at_or_below(const std::list<common_prompt_checkpoint> & checkpoints, size_t lcp) {
+    int64_t res = 0;
+    for (const auto & ck : checkpoints) {
+        if (ck.n_tokens > res && (size_t) ck.n_tokens <= lcp) {
+            res = ck.n_tokens;
+        }
+    }
+    return res;
+}
+
+// Mark an entry's files as just used. External retention policies prune the cache directory
+// by file age; without this a shared system-prompt entry that is restored every hour would
+// still be deleted N hours after it was WRITTEN. With it, age means "time since last use".
+static void server_prompt_cache_disk_touch_files(const server_prompt_disk_state & st) {
+    const auto now = fs::file_time_type::clock::now();
+    const auto touch = [&](const std::string & path) {
+        if (!path.empty()) {
+            std::error_code ec;
+            fs::last_write_time(fs::u8path(path), now, ec);
+        }
+    };
+    touch(st.path_main);
+    touch(st.path_drft);
+    touch(st.path_spec);
+    for (const auto & ck : st.ckpts) {
+        touch(ck.path);
+    }
+}
+
 } // namespace
 
 server_prompt_cache::server_prompt_cache(
         int32_t limit_size_mib,
          size_t limit_tokens,
     const std::string & disk_base_path,
-        int32_t disk_limit_size_mib) {
-    ram_enabled       = limit_size_mib != 0;
-    limit_size        = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+        int32_t disk_limit_size_mib,
+    const std::string & disk_identity_) {
+    disk_identity      = disk_identity_;
+    ram_enabled        = limit_size_mib != 0;
+    limit_size         = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
     this->limit_tokens = limit_tokens;
 
     if (disk_base_path.empty() || disk_limit_size_mib <= 0) {
@@ -2150,47 +2031,9 @@ server_prompt_cache::server_prompt_cache(
         throw std::runtime_error("unable to secure prompt cache namespace '" + server_prompt_cache_disk_path_utf8(cache_root) + "': " + ec.message());
     }
 
-    // An OOM/SIGKILL cannot run the destructor. Each run therefore holds an
-    // advisory lock in a magic-marked directory. A later server removes only
-    // marked run-* directories whose lock is no longer held.
-    for (const auto & entry : fs::directory_iterator(cache_root, ec)) {
-        if (ec) {
-            break;
-        }
-        const auto name = server_prompt_cache_disk_path_utf8(entry.path().filename());
-        const bool is_run_dir      = name.rfind("run-", 0) == 0;
-        const bool is_deleting_dir = name.rfind(".deleting-run-", 0) == 0;
-        if (!entry.is_directory() || (!is_run_dir && !is_deleting_dir) || !server_prompt_cache_disk_owned(entry.path())) {
-            continue;
-        }
-
-#if !defined(_WIN32)
-        const fs::path lock_path = entry.path() / ".lock";
-        const int fd = open(lock_path.c_str(), O_RDWR | O_CLOEXEC);
-        if (fd < 0) {
-            continue;
-        }
-        const bool stale = flock(fd, LOCK_EX | LOCK_NB) == 0;
-        if (stale) {
-            flock(fd, LOCK_UN);
-        }
-        close(fd);
-        if (!stale) {
-            continue;
-        }
-#else
-        // Without an advisory-lock primitive, preserve old directories rather
-        // than risk deleting a live cache owned by another process.
-        continue;
-#endif
-
-        const auto stale_path = server_prompt_cache_disk_path_utf8(entry.path());
-        std::error_code rm_ec;
-        const auto removed = fs::remove_all(entry.path(), rm_ec);
-        if (!rm_ec) {
-            SRV_INF("prompt cache disk stale cleanup: path=%s files=%zu\n", stale_path.c_str(), (size_t) removed);
-        }
-    }
+    // Stale run directories from earlier runs are handled AFTER this run's own
+    // directory exists (see below): their entries are adopted into it when the
+    // identity matches, otherwise they are removed.
 
     const auto stamp = (uint64_t) std::chrono::high_resolution_clock::now().time_since_epoch().count();
 #if !defined(_WIN32)
@@ -2237,8 +2080,12 @@ server_prompt_cache::server_prompt_cache(
     }
 #else
     {
-        std::ofstream lock(owned / ".lock", std::ios::out | std::ios::trunc);
-        if (!lock.good()) {
+        // Deny all sharing and keep the handle for the life of the run: any other
+        // process trying to open this file fails while we are alive, which is how a
+        // later startup distinguishes a live run directory from an abandoned one.
+        const std::string lock_utf8 = server_prompt_cache_disk_path_utf8(owned / ".lock");
+        disk_lock_file = _fsopen(lock_utf8.c_str(), "wb", _SH_DENYRW);
+        if (disk_lock_file == nullptr) {
             fs::remove_all(owned);
             throw std::runtime_error("unable to create prompt cache lock file in '" + server_prompt_cache_disk_path_utf8(owned) + "'");
         }
@@ -2275,8 +2122,235 @@ server_prompt_cache::server_prompt_cache(
     this->disk_base_path  = server_prompt_cache_disk_path_utf8(base);
     this->disk_owned_path = server_prompt_cache_disk_path_utf8(owned);
 
+    {
+        std::ofstream ident(owned / "identity.txt", std::ios::out | std::ios::trunc);
+        ident << disk_identity << '\n';
+    }
+
     SRV_INF("prompt cache disk enabled: path=%s owned_path=%s limit_mib=%d\n",
             this->disk_base_path.c_str(), this->disk_owned_path.c_str(), disk_limit_size_mib);
+
+    // ---- adopt entries from abandoned run directories (survive server restarts) ----
+    // A run directory is abandoned when its lock is no longer held (POSIX: flock
+    // succeeds; Windows: the deny-all .lock can be opened). Entries whose identity
+    // matches ours are MOVED into this run's directory and registered; non-matching
+    // stale directories are removed. Every adopted entry is still fully validated by
+    // load_disk() on first use (sizes, tokens, and llama's own state-file checks), so
+    // a damaged file can at worst cost one rejected restore.
+    struct adopted_t {
+        server_prompt_disk_state st;
+        fs::file_time_type       mtime;
+    };
+    std::vector<adopted_t> adopted;
+    size_t n_stale_removed = 0;
+    size_t n_adopt_bytes = 0;
+
+    std::error_code sc;
+    for (const auto & entry : fs::directory_iterator(cache_root, sc)) {
+        if (sc) {
+            break;
+        }
+        if (entry.path() == owned) {
+            continue;
+        }
+        const auto name = server_prompt_cache_disk_path_utf8(entry.path().filename());
+        const bool is_run_dir      = name.rfind("run-", 0) == 0;
+        const bool is_deleting_dir = name.rfind(".deleting-run-", 0) == 0;
+        if (!entry.is_directory() || (!is_run_dir && !is_deleting_dir) || !server_prompt_cache_disk_owned(entry.path())) {
+            continue;
+        }
+
+        bool stale = false;
+#if !defined(_WIN32)
+        {
+            const fs::path lock_path = entry.path() / ".lock";
+            const int fd = open(lock_path.c_str(), O_RDWR | O_CLOEXEC);
+            if (fd < 0) {
+                stale = true; // no lock file at all: nothing can be holding it
+            } else {
+                stale = flock(fd, LOCK_EX | LOCK_NB) == 0;
+                if (stale) {
+                    flock(fd, LOCK_UN);
+                }
+                close(fd);
+            }
+        }
+#else
+        {
+            const std::string lock_utf8 = server_prompt_cache_disk_path_utf8(entry.path() / ".lock");
+            FILE * probe = _fsopen(lock_utf8.c_str(), "rb", _SH_DENYNO);
+            if (probe != nullptr) {
+                fclose(probe);
+                stale = true;             // opened: no live owner holds it deny-all
+            } else {
+                stale = (errno != EACCES); // EACCES = a live process holds it; anything else (e.g. missing) = stale
+            }
+        }
+#endif
+        if (!stale) {
+            continue;
+        }
+
+        const auto stale_path = server_prompt_cache_disk_path_utf8(entry.path());
+
+        std::string their_identity;
+        {
+            std::ifstream ident(entry.path() / "identity.txt");
+            std::getline(ident, their_identity);
+        }
+        const bool same_identity = !disk_identity.empty() && their_identity == disk_identity;
+
+        if (!same_identity || is_deleting_dir) {
+            std::error_code rm_ec;
+            const auto removed = fs::remove_all(entry.path(), rm_ec);
+            if (!rm_ec) {
+                n_stale_removed++;
+                SRV_INF("prompt cache disk stale cleanup: path=%s files=%zu reason=%s\n",
+                        stale_path.c_str(), (size_t) removed, is_deleting_dir ? "half-deleted" : "identity-mismatch");
+            }
+            continue;
+        }
+
+        // adopt: every state-<id>-target.bin with its siblings
+        size_t n_here = 0;
+        std::error_code dc;
+        for (const auto & f : fs::directory_iterator(entry.path(), dc)) {
+            if (dc) {
+                break;
+            }
+            const std::string fname = server_prompt_cache_disk_path_utf8(f.path().filename());
+            if (fname.rfind("state-", 0) != 0 || fname.size() < 17 || fname.compare(fname.size() - 11, 11, "-target.bin") != 0) {
+                continue;
+            }
+            const std::string old_stem = fname.substr(0, fname.size() - 11); // "state-<id>"
+
+            // header: u32 magic, u32 version, u32 n_tokens, tokens[]
+            llama_tokens toks;
+            {
+                FILE * fh = fopen(server_prompt_cache_disk_path_utf8(f.path()).c_str(), "rb");
+                if (!fh) {
+                    continue;
+                }
+                uint32_t magic = 0, version = 0, n_tok = 0;
+                const bool hdr_ok = fread(&magic, 4, 1, fh) == 1 && fread(&version, 4, 1, fh) == 1 && fread(&n_tok, 4, 1, fh) == 1 &&
+                                    magic == LLAMA_STATE_SEQ_MAGIC && version == LLAMA_STATE_SEQ_VERSION &&
+                                    n_tok > 0 && n_tok <= (uint32_t) limit_tokens;
+                if (hdr_ok) {
+                    toks.resize(n_tok);
+                    if (fread(toks.data(), sizeof(llama_token), n_tok, fh) != n_tok) {
+                        toks.clear();
+                    }
+                }
+                fclose(fh);
+                if (toks.empty()) {
+                    SRV_WRN("prompt cache disk adopt: skipping unreadable entry %s\n", server_prompt_cache_disk_path_utf8(f.path()).c_str());
+                    continue;
+                }
+            }
+
+            const fs::path p_main = f.path();
+            const fs::path p_drft = entry.path() / (old_stem + "-draft.bin");
+            const fs::path p_spec = entry.path() / (old_stem + "-spec.bin");
+            const bool has_drft = fs::exists(p_drft);
+            const bool has_spec = fs::exists(p_spec);
+
+            server_prompt_disk_state st;
+            st.tokens = server_tokens(toks, false);
+            st.id     = disk_next_id++;
+            st.usable = true;
+
+            const std::string new_stem = "state-" + std::to_string(st.id);
+            auto move_in = [&](const fs::path & from, const char * suffix, std::string & path_out, size_t & size_out) -> bool {
+                std::error_code mec;
+                const fs::path to = owned / (new_stem + suffix);
+                fs::rename(from, to, mec);
+                if (mec) {
+                    return false;
+                }
+                path_out = server_prompt_cache_disk_path_utf8(to);
+                std::error_code zec;
+                const auto sz = fs::file_size(to, zec);
+                size_out = zec ? 0 : (size_t) sz;
+                return true;
+            };
+
+            size_t dummy = 0;
+            if (!move_in(p_main, "-target.bin", st.path_main, st.size_main)) {
+                continue;
+            }
+            if (has_drft && !move_in(p_drft, "-draft.bin", st.path_drft, st.size_drft)) {
+                server_prompt_cache_disk_remove_file(st.path_main);
+                continue;
+            }
+            // checkpoints: <stem>-ckpt<k>.bin, plus the single <stem>-ckpt.bin written by older builds
+            {
+                std::vector<fs::path> p_ckpts;
+                p_ckpts.push_back(entry.path() / (old_stem + "-ckpt.bin"));
+                for (int k = 0; k < SERVER_PROMPT_CACHE_CKPT_MAX_FILES; ++k) {
+                    p_ckpts.push_back(entry.path() / (old_stem + server_prompt_cache_ckpt_suffix(k)));
+                }
+                for (const auto & p_ckpt : p_ckpts) {
+                    std::error_code xec;
+                    if (!fs::exists(p_ckpt, xec) || xec) {
+                        continue;
+                    }
+                    server_prompt_disk_ckpt dck;
+                    const std::string suffix = server_prompt_cache_ckpt_suffix((int) st.ckpts.size());
+                    if (!move_in(p_ckpt, suffix.c_str(), dck.path, dck.size)) {
+                        continue;
+                    }
+                    if (dck.size > 0 && server_prompt_cache_ckpt_read_meta(dck.path, dck.meta) &&
+                        (size_t) dck.meta.n_tokens <= toks.size()) {
+                        st.ckpts.push_back(std::move(dck));
+                    } else {
+                        server_prompt_cache_disk_remove_file(dck.path);
+                    }
+                }
+                std::sort(st.ckpts.begin(), st.ckpts.end(), [](const server_prompt_disk_ckpt & a, const server_prompt_disk_ckpt & b) {
+                    return a.meta.n_tokens < b.meta.n_tokens;
+                });
+            }
+            if (has_spec && move_in(p_spec, "-spec.bin", st.path_spec, dummy)) {
+                FILE * fsp = fopen(st.path_spec.c_str(), "rb");
+                if (fsp) {
+                    st.spec.resize(dummy);
+                    if (dummy > 0 && fread(st.spec.data(), 1, dummy, fsp) != dummy) {
+                        st.spec.clear();
+                    }
+                    fclose(fsp);
+                }
+            }
+
+            std::error_code tec;
+            const auto mt = fs::last_write_time(fs::u8path(st.path_main), tec);
+            n_adopt_bytes += st.size();
+            adopted.push_back({std::move(st), tec ? fs::file_time_type::min() : mt});
+            n_here++;
+        }
+
+        // drop the emptied directory (ignore failures: leftovers are harmless)
+        std::error_code rm_ec;
+        fs::remove_all(entry.path(), rm_ec);
+        SRV_INF("prompt cache disk adopt: path=%s entries=%zu\n", stale_path.c_str(), n_here);
+    }
+
+    if (!adopted.empty()) {
+        std::sort(adopted.begin(), adopted.end(), [](const adopted_t & a, const adopted_t & b) { return a.mtime < b.mtime; });
+        for (auto & a : adopted) {
+            disk_size_total += a.st.size();
+            disk_states.push_back(std::move(a.st));
+        }
+        // respect the size limit: evict the oldest adopted entries first
+        while (disk_limit_size > 0 && disk_size_total > disk_limit_size && !disk_states.empty()) {
+            if (!erase_disk_state(disk_states.begin(), true, "adopt-limit")) {
+                break;
+            }
+        }
+        SRV_INF("prompt cache disk adopted %zu entries (%zu bytes) from previous runs; stale dirs removed: %zu\n",
+                adopted.size(), n_adopt_bytes, n_stale_removed);
+    } else if (n_stale_removed) {
+        SRV_INF("prompt cache disk: no adoptable entries; stale dirs removed: %zu\n", n_stale_removed);
+    }
 }
 
 server_prompt_cache::~server_prompt_cache() {
@@ -2284,19 +2358,12 @@ server_prompt_cache::~server_prompt_cache() {
         return;
     }
 
-    SRV_INF("prompt cache disk cleanup: path=%s entries=%zu bytes=%zu saves=%" PRIu64 " loads=%" PRIu64 " evictions=%" PRIu64 "\n",
+    // The entries are deliberately RETAINED: the next run with the same identity
+    // adopts them (see the constructor), so the cache survives restarts. Only the
+    // lock is released. Abandoned directories are cleaned up by the next run
+    // (adopted or removed), or by external retention policy.
+    SRV_INF("prompt cache disk retained for the next run: path=%s entries=%zu bytes=%zu saves=%" PRIu64 " loads=%" PRIu64 " evictions=%" PRIu64 "\n",
             disk_owned_path.c_str(), disk_states.size(), disk_size_total, disk_saves, disk_loads, disk_evictions);
-
-    fs::path cleanup_path = fs::u8path(disk_owned_path);
-    std::error_code ec;
-    const fs::path trash_path = cleanup_path.parent_path() /
-        fs::u8path(".deleting-" + server_prompt_cache_disk_path_utf8(cleanup_path.filename()));
-    fs::rename(cleanup_path, trash_path, ec);
-    if (!ec) {
-        cleanup_path = trash_path;
-    } else {
-        ec.clear();
-    }
 
 #if !defined(_WIN32)
     if (disk_lock_fd >= 0) {
@@ -2304,13 +2371,12 @@ server_prompt_cache::~server_prompt_cache() {
         close(disk_lock_fd);
         disk_lock_fd = -1;
     }
-#endif
-
-    fs::remove_all(cleanup_path, ec);
-    if (ec) {
-        const std::string cleanup_path_utf8 = server_prompt_cache_disk_path_utf8(cleanup_path);
-        SRV_WRN("prompt cache disk cleanup failed: path=%s error=%s\n", cleanup_path_utf8.c_str(), ec.message().c_str());
+#else
+    if (disk_lock_file != nullptr) {
+        fclose(disk_lock_file);
+        disk_lock_file = nullptr;
     }
+#endif
 }
 
 size_t server_prompt_cache::size() const {
@@ -2327,7 +2393,7 @@ size_t server_prompt_cache::n_tokens() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.n_tokens();
+        res += state.prompt.n_tokens();
     }
 
     return res;
@@ -2359,41 +2425,46 @@ void server_prompt_cache::disable_disk_saves(const char * reason, const std::str
 
 bool server_prompt_cache::save(
         const server_prompt & prompt,
-              llama_context * ctx_main,
-              llama_context * ctx_drft,
+              llama_context * ctx_tgt,
+              llama_context * ctx_dft,
                llama_seq_id   id_slot,
         const std::vector<uint8_t> & state_spec) {
+    if (prompt.tokens.size() == 0) {
+        return false;
+    }
+
     bool saved = false;
 
-    if (!disk_owned_path.empty()) {
-        saved = save_disk(prompt, ctx_main, ctx_drft, id_slot, state_spec) || saved;
+    if (disk_enabled()) {
+        saved = save_disk(prompt, ctx_tgt, ctx_dft, id_slot, state_spec) || saved;
     }
 
     if (!ram_enabled) {
         return saved;
     }
 
-    const size_t state_size_main = llama_state_seq_get_size_ext(ctx_main, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
-    const size_t state_size_drft = ctx_drft ? llama_state_seq_get_size_ext(ctx_drft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+    const size_t state_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const size_t state_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
-    auto * cur = alloc(prompt, state_size_main, state_size_drft, state_spec);
+    SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
+            (int) prompt.tokens.size(), (state_size_tgt + state_size_dft) / (1024.0 * 1024.0), state_size_dft / (1024.0 * 1024.0));
+
+    auto * cur = alloc(prompt, state_size_tgt, state_size_dft, state_spec);
     if (cur == nullptr) {
         return saved;
     }
 
-    const size_t n_main = llama_state_seq_get_data_ext(
-        ctx_main, cur->data.main.data(), state_size_main, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
-    if (n_main != state_size_main) {
-        SRV_ERR("failed to save RAM prompt cache target state: expected=%zu saved=%zu\n", state_size_main, n_main);
+    const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), state_size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    if (n_tgt != state_size_tgt) {
+        SRV_ERR("failed to save RAM prompt cache target state: expected=%zu saved=%zu\n", state_size_tgt, n_tgt);
         states.pop_back();
         return saved;
     }
 
-    if (ctx_drft) {
-        const size_t n_drft = llama_state_seq_get_data_ext(
-            ctx_drft, cur->data.drft.data(), state_size_drft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (n_drft != state_size_drft) {
-            SRV_ERR("failed to save RAM prompt cache draft state: expected=%zu saved=%zu\n", state_size_drft, n_drft);
+    if (ctx_dft) {
+        const size_t n_dft = llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), state_size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (n_dft != state_size_dft) {
+            SRV_ERR("failed to save RAM prompt cache draft state: expected=%zu saved=%zu\n", state_size_dft, n_dft);
             states.pop_back();
             return saved;
         }
@@ -2404,24 +2475,29 @@ bool server_prompt_cache::save(
 
 bool server_prompt_cache::save_disk(
         const server_prompt & prompt,
-              llama_context * ctx_main,
-              llama_context * ctx_drft,
+              llama_context * ctx_tgt,
+              llama_context * ctx_dft,
                llama_seq_id   id_slot,
         const std::vector<uint8_t> & state_spec) {
     if (disk_owned_path.empty() || disk_limit_size == 0 || prompt.tokens.empty()) {
         return false;
     }
 
-    if (prompt.tokens.has_mtmd) {
+    if (prompt.tokens.has_media()) {
         SRV_WRN("prompt cache disk skip: reason=multimodal tokens=%zu path=%s\n",
                 prompt.tokens.size(), disk_owned_path.c_str());
         return false;
     }
 
-    // If a usable cached prompt already contains the current stateless prompt,
-    // retain the more useful state without rewriting the SSD. Stateful MTP
-    // blobs are valid only at their exact token boundary, so they may touch an
-    // equal-token entry but never a longer containing entry.
+    if (prompt.tokens.size() < disk_min_tokens) {
+        SRV_INF("prompt cache disk skip: reason=below-min-tokens tokens=%zu min_tokens=%zu\n",
+                prompt.tokens.size(), disk_min_tokens);
+        return false;
+    }
+
+    // If a usable entry already holds this prompt, retain it without rewriting the SSD.
+    // An entry with the same tokens always qualifies; a longer entry only when the
+    // target can truncate its tail in place (dense KV).
     for (auto it = disk_states.begin(); it != disk_states.end();) {
         if (!it->usable) {
             ++it;
@@ -2430,25 +2506,22 @@ bool server_prompt_cache::save_disk(
 
         const int lcp = it->tokens.get_common_prefix(prompt.tokens);
         const bool exact_tokens = lcp == (int) prompt.tokens.size() && it->tokens.size() == prompt.tokens.size();
-        const bool can_touch = state_spec.empty()
-            ? lcp == (int) prompt.tokens.size()
-            : exact_tokens;
+        const bool can_touch = exact_tokens || (partial_seq_rm && lcp == (int) prompt.tokens.size());
         if (!can_touch) {
             ++it;
             continue;
         }
 
         const bool pair_shape_ok = !it->path_main.empty() && it->size_main > 0 &&
-            ((ctx_drft != nullptr) == (!it->path_drft.empty() && it->size_drft > 0));
-        const bool spec_shape_ok = state_spec.empty() || !it->spec.empty();
+            ((ctx_dft != nullptr) == (!it->path_drft.empty() && it->size_drft > 0));
         size_t actual_main = 0;
         size_t actual_drft = 0;
-        const bool files_ok = pair_shape_ok && spec_shape_ok &&
+        const bool files_ok = pair_shape_ok &&
             server_prompt_cache_disk_size_exact(it->path_main, it->size_main, &actual_main) &&
             server_prompt_cache_disk_size_exact(it->path_drft, it->size_drft, &actual_drft);
         if (!files_ok) {
-            SRV_WRN("prompt cache disk touch rejected: entry=%" PRIu64 " reason=unusable-pair target_bytes=%zu target_actual=%zu draft_bytes=%zu draft_actual=%zu spec_bytes=%zu path=%s\n",
-                    it->id, it->size_main, actual_main, it->size_drft, actual_drft, it->spec.size(), disk_owned_path.c_str());
+            SRV_WRN("prompt cache disk touch rejected: entry=%" PRIu64 " reason=unusable-pair target_bytes=%zu target_actual=%zu draft_bytes=%zu draft_actual=%zu path=%s\n",
+                    it->id, it->size_main, actual_main, it->size_drft, actual_drft, disk_owned_path.c_str());
             auto bad = it++;
             bad->usable = false;
             if (!erase_disk_state(bad, false, "touch-unusable")) {
@@ -2459,10 +2532,10 @@ bool server_prompt_cache::save_disk(
 
         {
             const auto id = it->id;
+            server_prompt_cache_disk_touch_files(*it);
             disk_states.splice(disk_states.end(), disk_states, it);
-            SRV_INF("prompt cache disk touch: entry=%" PRIu64 " lcp=%d tokens=%zu exact=%s stateful=%s safe_to_clear=true path=%s\n",
-                    id, lcp, prompt.tokens.size(), exact_tokens ? "true" : "false",
-                    state_spec.empty() ? "false" : "true", disk_owned_path.c_str());
+            SRV_INF("prompt cache disk touch: entry=%" PRIu64 " lcp=%d tokens=%zu exact=%s path=%s\n",
+                    id, lcp, prompt.tokens.size(), exact_tokens ? "true" : "false", disk_owned_path.c_str());
             return true;
         }
     }
@@ -2476,10 +2549,10 @@ bool server_prompt_cache::save_disk(
     const auto & tokens = prompt.tokens.get_tokens();
     const size_t token_bytes = tokens.size()*sizeof(llama_token);
     const size_t file_overhead = 3*sizeof(uint32_t) + token_bytes;
-    const size_t state_size_main = llama_state_seq_get_size_ext(ctx_main, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
-    const size_t state_size_drft = ctx_drft ? llama_state_seq_get_size_ext(ctx_drft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+    const size_t state_size_main = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const size_t state_size_drft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
     const size_t predicted_main = state_size_main + file_overhead;
-    const size_t predicted_drft = ctx_drft ? state_size_drft + file_overhead : 0;
+    const size_t predicted_drft = ctx_dft ? state_size_drft + file_overhead : 0;
     const size_t predicted_total = predicted_main + predicted_drft;
 
     if (predicted_total > disk_limit_size) {
@@ -2517,7 +2590,7 @@ bool server_prompt_cache::save_disk(
     const int64_t t_start = ggml_time_us();
 
     const size_t n_main = llama_state_seq_save_file(
-        ctx_main, path_main_tmp_utf8.c_str(), id_slot, tokens.data(), tokens.size());
+        ctx_tgt, path_main_tmp_utf8.c_str(), id_slot, tokens.data(), tokens.size());
     size_t actual_main = 0;
     if (n_main == 0 ||
         !server_prompt_cache_disk_size_exact(path_main_tmp_utf8, n_main, &actual_main) ||
@@ -2528,9 +2601,9 @@ bool server_prompt_cache::save_disk(
     }
 
     size_t n_drft = 0;
-    if (ctx_drft) {
+    if (ctx_dft) {
         n_drft = llama_state_seq_save_file(
-            ctx_drft, path_drft_tmp_utf8.c_str(), id_slot, tokens.data(), tokens.size());
+            ctx_dft, path_drft_tmp_utf8.c_str(), id_slot, tokens.data(), tokens.size());
         size_t actual_drft = 0;
         if (n_drft == 0 ||
             !server_prompt_cache_disk_size_exact(path_drft_tmp_utf8, n_drft, &actual_drft) ||
@@ -2559,7 +2632,7 @@ bool server_prompt_cache::save_disk(
                 entry_id, path_main_tmp_utf8.c_str(), ec.message().c_str());
         return fail_io("target-permissions", path_main_tmp_utf8);
     }
-    if (ctx_drft) {
+    if (ctx_dft) {
         fs::permissions(path_drft_tmp, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
         if (ec) {
             SRV_ERR("prompt cache disk permissions failed: entry=%" PRIu64 " component=draft path=%s error=%s\n",
@@ -2580,7 +2653,7 @@ bool server_prompt_cache::save_disk(
         return fail_io("target-rename", path_main_utf8);
     }
 
-    if (ctx_drft) {
+    if (ctx_dft) {
         ec.clear();
         fs::rename(path_drft_tmp, path_drft, ec);
         if (ec) {
@@ -2598,7 +2671,7 @@ bool server_prompt_cache::save_disk(
 
     if (!server_prompt_cache_disk_sync_dir(disk_owned_path) ||
         !server_prompt_cache_disk_flush_and_drop(path_main_utf8, false) ||
-        (ctx_drft && !server_prompt_cache_disk_flush_and_drop(path_drft_utf8, false))) {
+        (ctx_dft && !server_prompt_cache_disk_flush_and_drop(path_drft_utf8, false))) {
         const bool main_cleanup_ok = server_prompt_cache_disk_remove_file(path_main_utf8);
         const bool drft_cleanup_ok = server_prompt_cache_disk_remove_file(path_drft_utf8);
         disable_disk_saves("commit-sync", disk_owned_path);
@@ -2611,16 +2684,12 @@ bool server_prompt_cache::save_disk(
     server_prompt_disk_state state;
     state.tokens    = prompt.tokens.clone();
     state.path_main = path_main_utf8;
-    state.path_drft = ctx_drft ? path_drft_utf8 : std::string();
+    state.path_drft = ctx_dft ? path_drft_utf8 : std::string();
     state.size_main = n_main;
     state.size_drft = n_drft;
     state.spec      = state_spec;
     state.id        = entry_id;
     state.usable    = true;
-    state.checkpoints.reserve(prompt.checkpoints.size());
-    for (const auto & ckpt : prompt.checkpoints) {
-        state.checkpoints.push_back({ckpt.n_tokens, ckpt.pos_min, ckpt.pos_max});
-    }
 
     disk_states.push_back(std::move(state));
     disk_size_total    += actual_total;
@@ -2628,11 +2697,105 @@ bool server_prompt_cache::save_disk(
     disk_bytes_written += actual_total;
 
     auto new_entry = std::prev(disk_states.end());
+
+    // Persist the speculative-impl state blob too, so the entry is complete after a restart.
+    if (!state_spec.empty()) {
+        const fs::path p_spec_tmp = owned / (stem + "-spec.bin.tmp");
+        const fs::path p_spec     = owned / (stem + "-spec.bin");
+        const std::string p_spec_tmp_utf8 = server_prompt_cache_disk_path_utf8(p_spec_tmp);
+        FILE * fsp = fopen(p_spec_tmp_utf8.c_str(), "wb");
+        bool ok = false;
+        if (fsp) {
+            ok = fwrite(state_spec.data(), 1, state_spec.size(), fsp) == state_spec.size();
+            ok = (fclose(fsp) == 0) && ok;
+        }
+        if (ok) {
+            std::error_code sec;
+            fs::rename(p_spec_tmp, p_spec, sec);
+            ok = !sec;
+        }
+        if (ok) {
+            new_entry->path_spec = server_prompt_cache_disk_path_utf8(p_spec);
+        } else {
+            server_prompt_cache_disk_remove_file(p_spec_tmp_utf8);
+            SRV_WRN("prompt cache disk save: entry=%" PRIu64 " spec blob NOT persisted\n", entry_id);
+        }
+    }
+
+    // Persist the context checkpoints with the entry, newest first up to disk_max_ckpts
+    // (best effort: a failure here leaves a perfectly valid exact-boundary entry). The
+    // newest one sits where a client that does not echo reasoning_content diverges; the
+    // older ones are what a request that rewrote earlier history can still roll back to.
+    // One checkpoint is ~150-200 MiB and is written without a durable flush.
+    size_t n_ckpt_total = 0;
+    if (disk_max_ckpts != 0 && !prompt.checkpoints.empty()) {
+        std::vector<const common_prompt_checkpoint *> picked;
+        for (auto ck = prompt.checkpoints.rbegin(); ck != prompt.checkpoints.rend(); ++ck) {
+            if (disk_max_ckpts > 0 && (int32_t) picked.size() >= disk_max_ckpts) {
+                break;
+            }
+            const bool ck_ok = ck->n_tokens > 0 && ck->n_tokens < (int64_t) tokens.size() &&
+                               !ck->data_tgt.empty() && (ctx_dft == nullptr || !ck->data_dft.empty());
+            if (!ck_ok) {
+                continue;
+            }
+            // the pinned system-prompt checkpoint is redundant when a shared prefix entry
+            // already ends exactly there: that entry is smaller to read and serves every conversation
+            if (ck->pinned && has_disk_prefix(prompt.tokens, (size_t) ck->n_tokens)) {
+                continue;
+            }
+            // Each request leaves several checkpoints within a few hundred tokens of its prompt end.
+            // A rollback point that close to a newer one saves less prefill than it costs to write and
+            // read (~200 MiB each), so keep only checkpoints at least disk_min_gain tokens apart.
+            if (!ck->pinned && !picked.empty() &&
+                picked.back()->n_tokens - ck->n_tokens < (int64_t) disk_min_gain &&
+                picked.back()->n_tokens >= ck->n_tokens) {
+                // Of the newest cluster keep the newest member: it sits where the next request of this
+                // conversation diverges. Of an older cluster keep the EARLIEST: it still serves a prompt
+                // that diverges anywhere after it, the later members miss whatever diverges just before them.
+                if (picked.size() > 1 && !picked.back()->pinned) {
+                    picked.back() = &*ck;
+                }
+                continue;
+            }
+            picked.push_back(&*ck);
+        }
+        if (picked.size() > (size_t) SERVER_PROMPT_CACHE_CKPT_MAX_FILES) {
+            picked.resize(SERVER_PROMPT_CACHE_CKPT_MAX_FILES);
+        }
+        // oldest first on disk and in the entry
+        std::sort(picked.begin(), picked.end(), [](const common_prompt_checkpoint * a, const common_prompt_checkpoint * b) {
+            return a->n_tokens < b->n_tokens;
+        });
+
+        for (const auto * ck : picked) {
+            const std::string suffix = server_prompt_cache_ckpt_suffix((int) new_entry->ckpts.size());
+            const fs::path path_ckpt_tmp = owned / (stem + suffix + ".tmp");
+            const fs::path path_ckpt     = owned / (stem + suffix);
+            size_t n_ckpt = 0;
+            if (server_prompt_cache_ckpt_write(path_ckpt_tmp, path_ckpt, *ck, n_ckpt)) {
+                server_prompt_disk_ckpt dck;
+                dck.path = server_prompt_cache_disk_path_utf8(path_ckpt);
+                dck.size = n_ckpt;
+                dck.meta = {ck->n_tokens, ck->pos_min, ck->pos_max};
+                new_entry->ckpts.push_back(std::move(dck));
+                disk_size_total    += n_ckpt;
+                disk_bytes_written += n_ckpt;
+                n_ckpt_total       += n_ckpt;
+                SRV_INF("prompt cache disk save: entry=%" PRIu64 " checkpoint persisted n_tokens=%" PRId64 " pos=[%d,%d] bytes=%zu%s\n",
+                        entry_id, ck->n_tokens, ck->pos_min, ck->pos_max, n_ckpt, ck->pinned ? " pinned" : "");
+            } else {
+                SRV_WRN("prompt cache disk save: entry=%" PRIu64 " checkpoint n_tokens=%" PRId64 " NOT persisted (write failed)\n",
+                        entry_id, ck->n_tokens);
+            }
+        }
+    }
     bool reclaim_ok = true;
 
-    // Stateless entries can supersede shorter prefixes. Stateful MTP blobs
-    // remain independently useful exact-boundary states.
-    if (state_spec.empty()) {
+    // With dense KV a longer entry supersedes shorter prefixes (their state is a
+    // truncation of the new one). Recurrent/hybrid entries are exact-boundary states,
+    // so shorter boundaries stay independently useful.
+    if (partial_seq_rm) {
         for (auto it = disk_states.begin(); it != new_entry;) {
             const int lcp = it->tokens.get_common_prefix(prompt.tokens);
             if (lcp == (int) it->tokens.size()) {
@@ -2669,29 +2832,26 @@ bool server_prompt_cache::save_disk(
     }
 
     const double t_ms = (ggml_time_us() - t_start)/1000.0;
-    SRV_INF("prompt cache disk save: entry=%" PRIu64 " tokens=%zu checkpoints=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu save_ms=%.2f path=%s\n",
-            entry_id, tokens.size(), prompt.checkpoints.size(), n_main, n_drft, state_spec.size(), actual_total, t_ms, disk_owned_path.c_str());
+    SRV_INF("prompt cache disk save: entry=%" PRIu64 " tokens=%zu checkpoints=%zu/%zu ckpt_bytes=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu save_ms=%.2f path=%s\n",
+            entry_id, tokens.size(), new_entry->ckpts.size(), prompt.checkpoints.size(), n_ckpt_total, n_main, n_drft, state_spec.size(), actual_total + n_ckpt_total, t_ms, disk_owned_path.c_str());
     log_disk_state();
 
     return true;
 }
 
-server_prompt * server_prompt_cache::alloc(
+server_prompt_cache_state * server_prompt_cache::alloc(
         const server_prompt & prompt,
                     size_t state_size_tgt,
                     size_t state_size_dft,
         const std::vector<uint8_t> & state_spec) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->tokens.get_common_prefix(prompt.tokens);
-        const bool exact_tokens = cur_lcp_len == (int) prompt.tokens.size() &&
-            it->tokens.size() == prompt.tokens.size();
-        const bool cached_boundary = state_spec.empty()
-            ? cur_lcp_len == (int) prompt.tokens.size()
-            : exact_tokens && !it->data.spec.empty();
+        const size_t lcp = it->prompt.tokens.get_common_prefix(prompt.tokens);
+        const bool covered = lcp == prompt.tokens.size() &&
+            (partial_seq_rm || it->prompt.tokens.size() == prompt.tokens.size());
 
-        if (cached_boundary) {
-            SRV_INF("%s", " - prompt is already in the cache, skipping\n");
+        if (covered) {
+            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
     }
@@ -2711,14 +2871,15 @@ server_prompt * server_prompt_cache::alloc(
         return nullptr;
     }
 
-    // Stateful speculative blobs are exact-boundary states. Keep shorter
-    // boundaries instead of treating them as obsolete prefixes.
-    if (state_spec.empty()) {
+    // remove any cached prompts that are fully contained in the current prompt; with
+    // recurrent/hybrid state a shorter boundary is not a truncation of the new one, so
+    // it is kept
+    if (partial_seq_rm) {
         for (auto it = states.begin(); it != states.end();) {
-            const int len = it->tokens.get_common_prefix(prompt.tokens);
+            const size_t len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-            if (len == (int) it->tokens.size()) {
-                SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
+            if (len == it->prompt.tokens.size()) {
+                SRV_TRC(" - removing obsolete cached prompt with length %zu\n", len);
 
                 it = states.erase(it);
             } else {
@@ -2757,16 +2918,47 @@ server_prompt * server_prompt_cache::alloc(
     }
 
     states.push_back({
-        /*.tokens      =*/ prompt.tokens.clone(),
-        /*.data        =*/ {
+        /*.prompt =*/ {
+            /*.tokens      =*/ prompt.tokens.clone(),
+            /*.checkpoints =*/ prompt.checkpoints,
+        },
+        /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
             /*.spec =*/ state_spec,
         },
-        /*.checkpoints =*/ prompt.checkpoints,
     });
 
     return &states.back();
+}
+
+bool server_prompt_cache::has_disk_prefix(const server_tokens & tokens, size_t n_tokens) const {
+    if (n_tokens == 0 || n_tokens > tokens.size()) {
+        return false;
+    }
+    for (const auto & st : disk_states) {
+        if (st.usable && st.tokens.size() == n_tokens && st.tokens.get_common_prefix(tokens) == n_tokens) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool server_prompt_cache::save_prefix(
+        const server_tokens & tokens_prefix,
+              llama_context * ctx_tgt,
+              llama_context * ctx_dft,
+               llama_seq_id   id_slot,
+        const std::vector<uint8_t> & state_spec) {
+    if (!disk_enabled() || tokens_prefix.empty()) {
+        return false;
+    }
+
+    // an exact-boundary entry: no checkpoints, the contexts hold exactly these tokens
+    server_prompt prefix;
+    prefix.tokens = tokens_prefix.clone();
+
+    return save_disk(prefix, ctx_tgt, ctx_dft, id_slot, state_spec);
 }
 
 bool server_prompt_cache::load_disk(
@@ -2776,18 +2968,14 @@ bool server_prompt_cache::load_disk(
         llama_context * ctx_dft,
          llama_seq_id   id_slot,
               size_t   lcp,
-            uint64_t * entry_id_out) {
-    if (entry_id_out != nullptr) {
-        *entry_id_out = 0;
-    }
-
+       std::vector<uint8_t> * state_spec) {
     const uint64_t entry_id = it->id;
     const size_t target_bytes = it->size_main;
     const size_t draft_bytes  = it->size_drft;
     const size_t spec_bytes   = it->spec.size();
     const size_t total_bytes  = it->size();
     const size_t n_tokens_expected = it->tokens.size();
-    const size_t n_checkpoints = it->checkpoints.size();
+    const size_t n_checkpoints = it->ckpts.size();
     const std::string path_main = it->path_main;
     const std::string path_drft = it->path_drft;
 
@@ -2859,22 +3047,55 @@ bool server_prompt_cache::load_disk(
 
     server_prompt restored;
     restored.tokens = it->tokens.clone();
-    restored.data.spec = it->spec;
-    // Intentionally do not recreate common_prompt_checkpoint payloads. The
-    // disk entry retained only their small positions, not cloned host/device
-    // state. Fresh checkpoints are created as processing continues.
+
+    // Restore the persisted checkpoints as real ones (see save_disk), oldest first. Those
+    // past the divergence point would be invalidated by the slot right away, so they are
+    // not even read. An unreadable file only costs that one rollback point.
+    size_t nread_ckpt = 0;
+    size_t n_ckpt_restored = 0;
+    for (const auto & dck : it->ckpts) {
+        if ((size_t) dck.meta.n_tokens > lcp) {
+            continue;
+        }
+        common_prompt_checkpoint ck;
+        size_t n_bytes = 0;
+        if (server_prompt_cache_ckpt_read(dck.path, dck.meta.n_tokens, ck, n_bytes)) {
+            nread_ckpt += n_bytes;
+            n_ckpt_restored++;
+            restored.checkpoints.push_back(std::move(ck));
+            SRV_INF("prompt cache disk load: entry=%" PRIu64 " checkpoint restored n_tokens=%" PRId64 " bytes=%zu\n",
+                    entry_id, dck.meta.n_tokens, n_bytes);
+        } else {
+            SRV_WRN("prompt cache disk load: entry=%" PRIu64 " checkpoint file unreadable (%s) - skipping this rollback point\n",
+                    entry_id, dck.path.c_str());
+        }
+    }
+    // a divergence inside the entry needs a rollback point; without one the slot would
+    // hold a recurrent state it can neither truncate nor use
+    if (!partial_seq_rm && lcp < n_tokens_expected && n_ckpt_restored == 0) {
+        SRV_ERR("prompt cache disk load failed: entry=%" PRIu64 " reason=no-readable-checkpoint lcp=%zu tokens=%zu\n",
+                entry_id, lcp, n_tokens_expected);
+        return reject_entry("unreadable-checkpoints");
+    }
     prompt = std::move(restored);
 
-    disk_bytes_read += nread_main + nread_drft;
+    if (state_spec != nullptr) {
+        *state_spec = it->spec;
+    }
+
+    disk_bytes_read += nread_main + nread_drft + nread_ckpt;
+    disk_loads++;
+
+    // the entry stays on disk and becomes most-recently-used
+    server_prompt_cache_disk_touch_files(*it);
+    disk_states.splice(disk_states.end(), disk_states, it);
 
     const double t_ms = (ggml_time_us() - t_start)/1000.0;
-    SRV_INF("prompt cache disk load: entry=%" PRIu64 " lcp=%zu tokens=%zu checkpoints=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu read_bytes=%zu load_ms=%.2f path=%s\n",
-            entry_id, lcp, n_tokens_expected, n_checkpoints, target_bytes, draft_bytes, spec_bytes, total_bytes,
-            nread_main + nread_drft, t_ms, disk_owned_path.c_str());
+    SRV_INF("prompt cache disk load: entry=%" PRIu64 " lcp=%zu tokens=%zu checkpoints=%zu/%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu read_bytes=%zu load_ms=%.2f path=%s\n",
+            entry_id, lcp, n_tokens_expected, n_ckpt_restored, n_checkpoints, target_bytes, draft_bytes, spec_bytes, total_bytes,
+            nread_main + nread_drft + nread_ckpt, t_ms, disk_owned_path.c_str());
+    log_disk_state();
 
-    if (entry_id_out != nullptr) {
-        *entry_id_out = entry_id;
-    }
     return true;
 }
 
@@ -2885,7 +3106,6 @@ bool server_prompt_cache::erase_disk_state(
     const uint64_t entry_id    = it->id;
     const size_t target_bytes  = it->size_main;
     const size_t draft_bytes   = it->size_drft;
-    const size_t spec_bytes    = it->spec.size();
     const size_t total_bytes   = it->size();
     const size_t tokens        = it->tokens.size();
     const std::string path_main = it->path_main;
@@ -2896,6 +3116,13 @@ bool server_prompt_cache::erase_disk_state(
     it->usable = false;
     const bool main_ok = server_prompt_cache_disk_remove_file(path_main);
     const bool drft_ok = server_prompt_cache_disk_remove_file(path_drft);
+    for (const auto & ck : it->ckpts) {
+        // best effort; the accounting below uses it->size() which includes the checkpoints
+        server_prompt_cache_disk_remove_file(ck.path);
+    }
+    if (!it->path_spec.empty()) {
+        server_prompt_cache_disk_remove_file(it->path_spec);
+    }
     if (!main_ok || !drft_ok) {
         SRV_ERR("prompt cache disk removal failed: entry=%" PRIu64 " reason=%s target_removed=%s draft_removed=%s accounted_bytes=%zu path=%s\n",
                 entry_id, reason, main_ok ? "true" : "false", drft_ok ? "true" : "false",
@@ -2913,55 +3140,15 @@ bool server_prompt_cache::erase_disk_state(
     if (eviction) {
         disk_evictions++;
         disk_bytes_evicted += total_bytes;
-        SRV_INF("prompt cache disk eviction: entry=%" PRIu64 " reason=%s tokens=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu remaining_bytes=%zu path=%s\n",
-                entry_id, reason, tokens, target_bytes, draft_bytes, spec_bytes, total_bytes, disk_size_total, disk_owned_path.c_str());
+        SRV_INF("prompt cache disk eviction: entry=%" PRIu64 " reason=%s tokens=%zu target_bytes=%zu draft_bytes=%zu total_bytes=%zu remaining_bytes=%zu path=%s\n",
+                entry_id, reason, tokens, target_bytes, draft_bytes, total_bytes, disk_size_total, disk_owned_path.c_str());
     } else {
-        SRV_INF("prompt cache disk remove: entry=%" PRIu64 " reason=%s tokens=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu remaining_bytes=%zu path=%s\n",
-                entry_id, reason, tokens, target_bytes, draft_bytes, spec_bytes, total_bytes, disk_size_total, disk_owned_path.c_str());
+        SRV_INF("prompt cache disk remove: entry=%" PRIu64 " reason=%s tokens=%zu target_bytes=%zu draft_bytes=%zu total_bytes=%zu remaining_bytes=%zu path=%s\n",
+                entry_id, reason, tokens, target_bytes, draft_bytes, total_bytes, disk_size_total, disk_owned_path.c_str());
     }
 
     disk_states.erase(it);
     return true;
-}
-
-void server_prompt_cache::accept_disk_load(uint64_t entry_id) {
-    if (entry_id == 0) {
-        return;
-    }
-
-    for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
-        if (it->id != entry_id || !it->usable) {
-            continue;
-        }
-
-        disk_loads++;
-        disk_states.splice(disk_states.end(), disk_states, it);
-        SRV_INF("prompt cache disk load accepted: entry=%" PRIu64 " reusable=true path=%s\n",
-                entry_id, disk_owned_path.c_str());
-        log_disk_state();
-        return;
-    }
-}
-
-void server_prompt_cache::reject_disk_load(uint64_t entry_id, const char * reason) {
-    if (entry_id == 0) {
-        return;
-    }
-
-    for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
-        if (it->id != entry_id) {
-            continue;
-        }
-
-        it->usable = false;
-        SRV_WRN("prompt cache disk load rejected: entry=%" PRIu64 " reason=%s reusable=false path=%s\n",
-                entry_id, reason, disk_owned_path.c_str());
-        if (!erase_disk_state(it, false, reason)) {
-            disable_disk_saves("rejected-load-removal", disk_owned_path);
-        }
-        log_disk_state();
-        return;
-    }
 }
 
 void server_prompt_cache::update_disk() {
@@ -2996,151 +3183,141 @@ bool server_prompt_cache::load(
               llama_context * ctx_tgt,
               llama_context * ctx_dft,
                     int32_t   id_slot,
-                       bool   spec_state_required,
-                       bool   spec_trailing_rm,
-                       bool * cache_hit,
-                   uint64_t * disk_entry_id) {
-    if (cache_hit != nullptr) {
-        *cache_hit = false;
-    }
-    if (disk_entry_id != nullptr) {
-        *disk_entry_id = 0;
+       std::vector<uint8_t> * state_spec,
+                       bool   probe) {
+    if (state_spec != nullptr) {
+        state_spec->clear();
     }
 
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    // Worth of what the slot already holds. Like every candidate below it is measured in
+    // tokens the slot would actually keep: a diverging tail on a recurrent/hybrid target
+    // means rolling back to the newest checkpoint at or before the divergence.
+    const size_t lcp_base  = prompt.tokens.get_common_prefix(tokens_new);
+    const size_t eff_base  = prompt.tokens.empty() ? 0 :
+        server_prompt_cache_eff_tokens(prompt.tokens.size(), lcp_base, partial_seq_rm,
+                                       server_prompt_cache_ckpt_at_or_below(prompt.checkpoints, lcp_base));
 
-    // With speculative decoding, an entry whose token sequence extends past the
-    // common prefix (lcp < cached_tokens, e.g. a client re-sending a normalized
-    // conversation) can still be salvaged when the target and draft memories
-    // support removing the diverging tail: the slot code then performs a bounded
-    // trailing rollback and reprocesses only the new tokens.
-    const auto spec_boundary_valid = [&](size_t cached_tokens, int lcp) {
-        if (!spec_state_required || lcp == (int) cached_tokens) {
-            return true;
-        }
-        if (!spec_trailing_rm || lcp < 0 || cached_tokens <= (size_t) lcp) {
-            return false;
-        }
-        const size_t delta = cached_tokens - (size_t) lcp;
-        // dense KV (n_rs_seq == 0) supports removing any tail; bounded RS state only up to the snapshot bound
-        uint32_t n_rs_min = UINT32_MAX;
-        if (const uint32_t n_rs = llama_n_rs_seq(ctx_tgt); n_rs > 0) {
-            n_rs_min = std::min(n_rs_min, n_rs);
-        }
-        if (ctx_dft) {
-            if (const uint32_t n_rs = llama_n_rs_seq(ctx_dft); n_rs > 0) {
-                n_rs_min = std::min(n_rs_min, n_rs);
-            }
-        }
-        return n_rs_min == UINT32_MAX || delta <= (size_t) n_rs_min;
-    };
+    // Candidates are ranked by eff tokens alone: a slot switch first saves the slot's own
+    // state to the cache, so nothing is lost by taking the entry that keeps the most of
+    // the request. (vanilla's additional f_keep criterion would prefer an older, shorter
+    // version of the same conversation over a newer one with a longer discarded tail.)
+    size_t eff_best = eff_base; // empty slot: any usable cache entry wins
 
-    const bool base_boundary_valid = spec_boundary_valid(prompt.tokens.size(), lcp_best);
-    float f_keep_best = base_boundary_valid && prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float sim_best    = base_boundary_valid ? float(lcp_best) / std::max<size_t>(1, tokens_new.size()) : -1.0f;
-
-    if (spec_state_required && !prompt.tokens.empty() && !base_boundary_valid) {
-        SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=slot lcp=%d cached_tokens=%zu request_tokens=%zu\n",
-                lcp_best, prompt.tokens.size(), tokens_new.size());
-    }
-
-    SRV_INF(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+    SRV_TRC(" - looking for better prompt, base eff = %zu (lcp = %zu, cached = %zu, request = %zu)\n", eff_base, lcp_base, prompt.tokens.size(), tokens_new.size());
 
     auto it_best_ram  = states.end();
     auto it_best_disk = disk_states.end();
     size_t lcp_selected = 0;
-    size_t spec_boundary_best = base_boundary_valid ? prompt.tokens.size() : 0;
-    bool ram_loaded = false;
 
     // Find the most similar RAM prompt first. On an equal match, the hot RAM
     // copy wins and avoids SSD I/O.
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+        const size_t lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        const size_t eff_cur = server_prompt_cache_eff_tokens(it->prompt.tokens.size(), lcp_cur, partial_seq_rm,
+                                                              server_prompt_cache_ckpt_at_or_below(it->prompt.checkpoints, lcp_cur));
 
-        if (!spec_boundary_valid(it->tokens.size(), lcp_cur)) {
-            SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=ram lcp=%d cached_tokens=%zu request_tokens=%zu spec_bytes=%zu\n",
-                    lcp_cur, it->tokens.size(), tokens_new.size(), it->data.spec.size());
-            continue;
-        }
-        if (spec_state_required && it->data.spec.empty()) {
-            SRV_INF("prompt cache skip: reason=spec-state-missing source=ram cached_tokens=%zu request_tokens=%zu\n",
-                    it->tokens.size(), tokens_new.size());
-            continue;
-        }
+        const float f_keep_cur = float(eff_cur) / std::max<size_t>(1, it->prompt.tokens.size());
 
-        const float f_keep_cur = float(lcp_cur) / std::max<size_t>(1, it->tokens.size());
-        const float sim_cur    = float(lcp_cur) / std::max<size_t>(1, tokens_new.size());
+        SRV_TRC("   - prompt with length %7zu, lcp = %7zu, eff = %7zu, f_keep = %.3f\n", it->prompt.tokens.size(), lcp_cur, eff_cur, f_keep_cur);
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
             continue;
         }
 
-        const bool is_better = spec_state_required
-            ? it->tokens.size() > spec_boundary_best
-            : f_keep_best < f_keep_cur && sim_best < sim_cur;
-        if (is_better) {
-            f_keep_best = f_keep_cur;
-            sim_best    = sim_cur;
-            spec_boundary_best = it->tokens.size();
+        if (eff_cur > eff_best) {
+            eff_best = eff_cur;
 
             it_best_ram  = it;
-            it_best_disk = disk_states.end();
             lcp_selected = lcp_cur;
         }
     }
+
+    // Disk candidates. Unlike a RAM entry, a disk entry is not consumed by a restore, so
+    // there is no "don't trash large prompts" veto here: a 60k-token conversation whose
+    // only usable checkpoint is the 14k system-prompt boundary is still worth 14k tokens.
+    // What a disk restore must clear is the cost of the read: it has to keep at least
+    // disk_min_gain tokens more than the slot already does. Among equals the smaller
+    // entry wins (a shared prefix entry instead of a whole conversation).
+    std::vector<std::list<server_prompt_disk_state>::iterator> dead;
 
     for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
         if (!it->usable) {
             continue;
         }
 
-        const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+        const size_t  lcp_cur = it->tokens.get_common_prefix(tokens_new);
+        const int64_t ckpt_n  = it->ckpt_at_or_below(lcp_cur);
+        const size_t  eff_cur = server_prompt_cache_eff_tokens(it->tokens.size(), lcp_cur, partial_seq_rm, ckpt_n);
 
-        if (!spec_boundary_valid(it->tokens.size(), lcp_cur)) {
-            SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=disk entry=%" PRIu64 " lcp=%d cached_tokens=%zu request_tokens=%zu spec_bytes=%zu\n",
-                    it->id, lcp_cur, it->tokens.size(), tokens_new.size(), it->spec.size());
+        if (eff_cur == 0) {
+            if (lcp_cur >= disk_min_gain) {
+                if (probe) {
+                    SRV_DBG("prompt cache skip: reason=boundary-mismatch source=disk entry=%" PRIu64 " lcp=%zu cached_tokens=%zu request_tokens=%zu checkpoints=%zu\n",
+                            it->id, lcp_cur, it->tokens.size(), tokens_new.size(), it->ckpts.size());
+                } else {
+                    SRV_INF("prompt cache skip: reason=boundary-mismatch source=disk entry=%" PRIu64 " lcp=%zu cached_tokens=%zu request_tokens=%zu checkpoints=%zu%s\n",
+                            it->id, lcp_cur, it->tokens.size(), tokens_new.size(), it->ckpts.size(),
+                            it->has_ckpt() ? " (request diverges before the oldest persisted checkpoint)" : "");
+                }
+            }
             continue;
         }
-        if (spec_state_required && it->spec.empty()) {
-            SRV_INF("prompt cache skip: reason=spec-state-missing source=disk entry=%" PRIu64 " cached_tokens=%zu request_tokens=%zu\n",
-                    it->id, it->tokens.size(), tokens_new.size());
+
+        if (eff_cur < eff_base + disk_min_gain) {
             continue;
         }
 
-        const float f_keep_cur = float(lcp_cur) / std::max<size_t>(1, it->tokens.size());
-        const float sim_cur    = float(lcp_cur) / std::max<size_t>(1, tokens_new.size());
-
-        if (f_keep_cur < 0.25f) {
+        const bool better = eff_cur > eff_best ||
+            (eff_cur == eff_best && it_best_disk != disk_states.end() && it->size() < it_best_disk->size());
+        if (!better) {
             continue;
         }
 
-        const bool is_better = spec_state_required
-            ? it->tokens.size() > spec_boundary_best
-            : f_keep_best < f_keep_cur && sim_best < sim_cur;
-        if (is_better) {
-            f_keep_best = f_keep_cur;
-            sim_best    = sim_cur;
-            spec_boundary_best = it->tokens.size();
+        // the files may have been removed under us (external retention policy, manual cleanup):
+        // drop the entry and keep looking instead of failing the restore
+        {
+            size_t actual_main = 0;
+            size_t actual_drft = 0;
+            const bool files_ok =
+                !it->path_main.empty() && it->size_main > 0 &&
+                server_prompt_cache_disk_size_exact(it->path_main, it->size_main, &actual_main) &&
+                (it->path_drft.empty() || server_prompt_cache_disk_size_exact(it->path_drft, it->size_drft, &actual_drft));
+            if (!files_ok) {
+                SRV_WRN("prompt cache skip: reason=files-missing source=disk entry=%" PRIu64 " target_bytes=%zu target_actual=%zu\n",
+                        it->id, it->size_main, actual_main);
+                dead.push_back(it);
+                continue;
+            }
+        }
 
-            it_best_ram  = states.end();
-            it_best_disk = it;
-            lcp_selected = lcp_cur;
+        if (ckpt_n > 0 && lcp_cur != it->tokens.size()) {
+            SRV_INF("prompt cache candidate: source=disk entry=%" PRIu64 " via checkpoint n_tokens=%" PRId64 " lcp=%zu cached_tokens=%zu request_tokens=%zu\n",
+                    it->id, ckpt_n, lcp_cur, it->tokens.size(), tokens_new.size());
+        }
+
+        eff_best = eff_cur;
+
+        it_best_ram  = states.end();
+        it_best_disk = it;
+        lcp_selected = lcp_cur;
+    }
+
+    for (auto & it : dead) {
+        it->usable = false;
+        if (!erase_disk_state(it, false, "files-missing")) {
+            disable_disk_saves("missing-entry-removal", disk_owned_path);
         }
     }
 
     if (it_best_disk != disk_states.end()) {
-        SRV_INF(" - found better disk prompt with f_keep = %.3f, sim = %.3f, lcp = %zu\n",
-                f_keep_best, sim_best, lcp_selected);
-        const bool loaded = load_disk(it_best_disk, prompt, ctx_tgt, ctx_dft, id_slot, lcp_selected, disk_entry_id);
-        if (loaded && cache_hit != nullptr) {
-            *cache_hit = true;
-        }
-        return loaded;
+        SRV_INF(" - found better disk prompt: entry=%" PRIu64 " eff=%zu lcp=%zu cached_tokens=%zu request_tokens=%zu\n",
+                it_best_disk->id, eff_best, lcp_selected, it_best_disk->tokens.size(), tokens_new.size());
+        return load_disk(it_best_disk, prompt, ctx_tgt, ctx_dft, id_slot, lcp_selected, state_spec);
     }
 
     if (it_best_ram != states.end()) {
-        SRV_INF(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+        SRV_TRC(" - found better RAM prompt with eff = %zu, lcp = %zu\n", eff_best, lcp_selected);
 
         {
             auto & data = it_best_ram->data.main;
@@ -3176,17 +3353,16 @@ bool server_prompt_cache::load(
             }
         }
 
-        prompt = std::move(*it_best_ram);
+        if (state_spec != nullptr) {
+            *state_spec = std::move(it_best_ram->data.spec);
+        }
+
+        prompt = std::move(it_best_ram->prompt);
 
         states.erase(it_best_ram);
-
-        if (cache_hit != nullptr) {
-            *cache_hit = true;
-        }
-        ram_loaded = true;
     }
 
-    return base_boundary_valid || ram_loaded;
+    return true;
 }
 
 void server_prompt_cache::update() {
@@ -3213,13 +3389,15 @@ void server_prompt_cache::update() {
         }
     }
 
-    SRV_INF(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
+    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
-        SRV_INF("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
+                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
 
-    update_disk();
+    if (disk_enabled()) {
+        update_disk();
+    }
 }

@@ -10,12 +10,12 @@
 # ggml-org/ggml-rpc         : rgerganov
 # ggml-org/ggml-sycl        : arthw
 # ggml-org/ggml-vulkan      : 0cc4m, jeffbolznv
-# ggml-org/ggml-webgpu      : reeselevine
+# ggml-org/ggml-webgpu      : reeselevine, yomaytk
 # ggml-org/ggml-zdnn        : taronaeo
 # ggml-org/llama-common     : ggerganov, aldehir, angt, danbev, ngxson, pwilkin
 # ggml-org/llama-mtmd       : ngxson
 # ggml-org/llama-server     : ggerganov, ngxson, allozaur, angt, ServeurpersoCom
-# ggml-org/llama-webui      : allozaur
+# ggml-org/llama-ui           : allozaur
 
 /.devops/*.Dockerfile                   @ngxson
 /.github/actions/                       @ggml-org/ci
@@ -26,6 +26,7 @@
 /common/fit.*                           @JohannesGaessler
 /common/jinja/                          @CISC
 /common/ngram-map.*                     @srogmann
+/conversion/                            @CISC
 /convert_*.py                           @CISC
 /docs/backend/snapdragon/               @ggml-org/ggml-hexagon
 /examples/batched.swift/                @ggerganov
@@ -48,7 +49,6 @@
 /examples/parallel/                     @ggerganov
 /examples/passkey/                      @ggerganov
 /examples/retrieval/                    @ggerganov
-/examples/save-load-state/              @ggerganov
 /examples/speculative-simple/           @ggerganov
 /examples/speculative/                  @ggerganov
 /ggml/cmake/                            @ggerganov
@@ -57,12 +57,13 @@
 /ggml/src/ggml-cann/                    @ggml-org/ggml-cann
 /ggml/src/ggml-common.h                 @ggerganov
 /ggml/src/ggml-cpu/                     @ggerganov
+/ggml/src/ggml-cpu/iqp.*                @bartowski1182
 /ggml/src/ggml-cpu/spacemit/            @alex-spacemit
 /ggml/src/ggml-cuda/                    @ggml-org/ggml-cuda
 /ggml/src/ggml-cuda/vendors/hip.h       @IMbackK
-/ggml/src/ggml-cuda/fattn-wmma*         @IMbackK
 /ggml/src/ggml-hexagon/                 @ggml-org/ggml-hexagon
 /ggml/src/ggml-hip/                     @IMbackK
+/ggml/src/ggml-et/                      @marty1885
 /ggml/src/ggml-impl.h                   @ggerganov
 /ggml/src/ggml-metal/                   @ggml-org/ggml-metal
 /ggml/src/ggml-opencl/                  @ggml-org/ggml-opencl
@@ -107,7 +108,7 @@
 /tools/rpc/                             @ggml-org/ggml-rpc
 /tools/server/*                         @ggml-org/llama-server # no subdir
 /tools/server/tests/                    @ggml-org/llama-server
-/tools/server/webui/                    @ggml-org/llama-webui
+/tools/ui/                              @ggml-org/llama-ui
 /tools/tokenize/                        @ggerganov
 /tools/tts/                             @ggerganov
 /vendor/                                @ggerganov
@@ -119,3 +120,8 @@
 /SECURITY.md                            @ggerganov
 /build-xcframework.sh                   @danbev
 requirements*.txt                       @CISC
+/skills                                 @ngxson
+
+# ROCmFPX downstream ownership. Keep this final catch-all last so the local
+# maintainers take precedence over inherited upstream ownership mappings.
+*                                       @ROCmFPX @charlie12345

@@ -55,7 +55,6 @@
 /autogen-*.md
 /bench-reports/
 /common/build-info.cpp
-/tools/server/public
 
 # Deprecated
 
@@ -93,11 +92,6 @@
 !/examples/*/*/*.kts
 !/examples/sycl/*.bat
 !/examples/sycl/*.sh
-
-# Server Web UI temporary files
-
-/tools/server/webui/node_modules
-/tools/server/webui/dist
 
 # Python
 
@@ -168,3 +162,6 @@ AGENTS.local.md
 # Internal AI/reviewer handoff + one-off conversion helper — kept local, not published
 /ROCMFPX-SPEEDUP-HANDOFF.md
 /scripts/convert-step37-nvfp4-to-rocmfp4.sh
+
+# local server API keys - never commit
+/api-keys.txt

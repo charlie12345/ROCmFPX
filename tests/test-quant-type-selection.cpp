@@ -81,6 +81,16 @@ static const char * llama_ftype_to_name(llama_ftype ftype) {
 // ggml_type name lookup
 // ---------------------------------------------------------------------------
 
+static ggml_type ggml_type_from_name(const std::string & name) {
+    for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+        const char * tname = ggml_type_name((ggml_type) i);
+        if (tname && name == tname) {
+            return (ggml_type) i;
+        }
+    }
+    return GGML_TYPE_COUNT;
+}
+
 // ---------------------------------------------------------------------------
 // File parser for snapshot files (quant type schemas)
 // ---------------------------------------------------------------------------
@@ -128,7 +138,7 @@ static bool parse_snapshot_file(const std::string & path, std::vector<snapshot_s
                 return false;
             }
 
-            ggml_type dtype = ggml_type_from_name(default_str.c_str());
+            ggml_type dtype = ggml_type_from_name(default_str);
             if (dtype == GGML_TYPE_COUNT) {
                 fprintf(stderr, "parse error: unknown default type '%s'\n", default_str.c_str());
                 return false;
@@ -153,7 +163,7 @@ static bool parse_snapshot_file(const std::string & path, std::vector<snapshot_s
         std::string tname = line.substr(0, sp);
         std::string ttype = line.substr(sp + 1);
 
-        ggml_type gt = ggml_type_from_name(ttype.c_str());
+        ggml_type gt = ggml_type_from_name(ttype);
         if (gt == GGML_TYPE_COUNT) {
             fprintf(stderr, "parse error: unknown type '%s' for tensor '%s'\n", ttype.c_str(), tname.c_str());
             return false;
@@ -206,18 +216,18 @@ static std::string snapshot_file_from_name(const std::string & name) {
 }
 
 static const remote_model_spec model_specs[] = {
-    { "ggml-org/Qwen3-0.6B-GGUF",                   "Q8_0"   },
-    { "ggml-org/GLM-4.6V-GGUF",                     "Q8_0"   },
-    { "ggml-org/Step-3.5-Flash-GGUF",               "Q4_K"   },
-    { "ggml-org/Qwen3-Coder-Next-GGUF",             "Q8_0"   },
-    { "ggml-org/Qwen3-14B-GGUF",                    "Q8_0"   },
-    { "ggml-org/Nemotron-Nano-3-30B-A3B-GGUF",      "Q8_0"   },
-    { "ggml-org/gpt-oss-120b-GGUF",                 "mxfp4"  },
-    { "ggml-org/gemma-3-4b-it-GGUF",                "Q8_0"   },
-    { "bartowski/Meta-Llama-3.1-70B-Instruct-GGUF", "Q4_K_M" },
-    { "bartowski/deepseek-ai_DeepSeek-V3.1-GGUF",   "IQ1_M"  },
-    { "bartowski/Qwen_Qwen3.5-397B-A17B-GGUF",      "IQ1_S"  }, // TODO: swap with ggml-org if/when it's released
-    { "bartowski/Qwen_Qwen3.5-27B-GGUF",            "Q8_0"   }, // TODO: swap with ggml-org if/when it's released
+    { "ggml-org/Qwen3-0.6B-GGUF",                     "Q8_0"   },
+    { "ggml-org/GLM-4.6V-GGUF",                       "Q8_0"   },
+    { "ggml-org/Step-3.5-Flash-GGUF",                 "Q4_K"   },
+    { "ggml-org/Qwen3-Coder-Next-GGUF",               "Q8_0"   },
+    { "ggml-org/Qwen3-14B-GGUF",                      "Q8_0"   },
+    { "ggml-org/NVIDIA-Nemotron-Nano-3-30B-A3B-GGUF", "Q8_0"   },
+    { "ggml-org/gpt-oss-120b-GGUF",                   "mxfp4"  },
+    { "ggml-org/gemma-3-4b-it-GGUF",                  "Q8_0"   },
+    { "bartowski/Meta-Llama-3.1-70B-Instruct-GGUF",   "Q4_K_M" },
+    { "bartowski/deepseek-ai_DeepSeek-V3.1-GGUF",     "IQ1_M"  },
+  //{ "bartowski/Qwen_Qwen3.5-397B-A17B-GGUF",        "IQ1_S"  }, // TODO: swap with ggml-org if/when it's released
+    { "ggml-org/Qwen3.6-27B-GGUF",                    "Q8_0"   },
 };
 
 static const int n_model_specs = (int) (sizeof(model_specs) / sizeof(model_specs[0]));

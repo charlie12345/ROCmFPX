@@ -8,26 +8,19 @@ layout (binding = 0) readonly buffer A {block_rocmfpx_fp6 data_a[];};
 layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
 
 void main() {
-    const uint i = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
+    const uint i = gl_GlobalInvocationID.x;
 
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
 #endif
 
-    const uint tid = gl_LocalInvocationID.x % 64;
-    const uint il  = tid/32;
-    const uint ir  = tid%32;
-    const uint ib = 32*i + ir;
-    if (ib >= p.nel / 32) {
+    if (i >= p.nel) {
         return;
     }
-
-    const uint b_idx = 1024*i + 32*ir + 16*il;
-    const uint q_idx = 16*il;
-    const float d = ue4m3_to_fp32(data_a[ib].e[il]);
-
-    [[unroll]] for (uint l = 0; l < 16; ++l) {
-        const uint idx = q_idx + l;
-        data_b[b_idx + l] = D_TYPE(d * float(int(data_a[ib].qs[idx])));
-    }
+    const uint ib = i / 32u;
+    const uint idx = i & 31u;
+    const i8vec4 unpacked = unpack8(rocmfpx_fp6_pack4_qs(data_a[ib].qs, idx & ~3u));
+    const float q = float(unpacked[idx & 3u]);
+    const float d = ue4m3_to_fp32(data_a[ib].e[idx >= 16u ? 1u : 0u]);
+    data_b[i] = D_TYPE(d * q);
 }

@@ -175,6 +175,11 @@ size_t rocmfpx_row_size_fp3(int64_t k) {
     return (size_t) (k / QK_ROCMFP3) * sizeof(block_rocmfp3);
 }
 
+size_t rocmfpx_row_size_fp5(int64_t k) {
+    assert(k % QK_ROCMFP5 == 0);
+    return (size_t) (k / QK_ROCMFP5) * sizeof(block_rocmfp5);
+}
+
 size_t rocmfpx_row_size_fp2(int64_t k) {
     assert(k % QK_ROCMFP2 == 0);
     return (size_t) (k / QK_ROCMFP2) * sizeof(block_rocmfp2);
@@ -183,6 +188,11 @@ size_t rocmfpx_row_size_fp2(int64_t k) {
 size_t rocmfpx_row_size_fp6(int64_t k) {
     assert(k % QK_ROCMFP6 == 0);
     return (size_t) (k / QK_ROCMFP6) * sizeof(block_rocmfp6);
+}
+
+size_t rocmfpx_row_size_fp7(int64_t k) {
+    assert(k % QK_ROCMFP7 == 0);
+    return (size_t) (k / QK_ROCMFP7) * sizeof(block_rocmfp7);
 }
 
 size_t rocmfpx_row_size_fp8(int64_t k) {
@@ -665,7 +675,7 @@ static uint8_t rocmfpx_choose_scale_fp3_weighted_mse(const float * x, int n, con
     float mse_weights[QK_ROCMFP3];
     float max_abs;
     float max_abs_weight;
-    bool all_finite;
+    bool all_finite = false;
     rocmfpx_prepare_mse_weights(mse_weights, x, n, quant_weights, sigma2, &max_abs, &max_abs_weight, &all_finite);
     if (!(max_abs > 0.0f) || !isfinite(max_abs)) {
         return 0;
@@ -1285,6 +1295,281 @@ size_t rocmfpx_quantize_fp8(const float * GGML_RESTRICT src, void * GGML_RESTRIC
     }
 
     return (size_t) nrows * row_size;
+}
+
+// ---------------------------------------------------------------------------
+// ROCmFP5 / ROCmFP7
+//
+// Both new layouts use the same signed-magnitude convention as ROCmFP6 and
+// retain the family's two independently searched 16-value UE4M3 scales. The
+// payload is a dense little-endian bit stream, so the exact sizes are 22 bytes
+// (5.50 bpw) and 30 bytes (7.50 bpw) with no padding.
+// ---------------------------------------------------------------------------
+
+static inline int rocmfpx_decode_linear_code(uint8_t code, int bits) {
+    const uint8_t sign = (uint8_t) (1u << (bits - 1));
+    const int mag = code & (sign - 1u);
+    return (code & sign) ? -(mag == 0 ? sign : mag) : mag;
+}
+
+static inline uint8_t rocmfpx_quantize_linear_code(float x, float inv_scale, int bits) {
+    if (!isfinite(x) || !isfinite(inv_scale) || inv_scale <= 0.0f) {
+        return 0;
+    }
+
+    const int sign = 1 << (bits - 1);
+    int q = (int) lroundf(x * inv_scale);
+    if (q > sign - 1) {
+        q = sign - 1;
+    } else if (q < -sign) {
+        q = -sign;
+    }
+
+    return q == 0 ? 0 : (uint8_t) (q < 0 ? (sign | ((uint8_t) -q & (sign - 1))) : q);
+}
+
+static inline int rocmfpx_linear_value(float x, float inv_scale, int bits) {
+    const int sign = 1 << (bits - 1);
+    int q = (int) lroundf(x * inv_scale);
+    if (q > sign - 1) {
+        q = sign - 1;
+    } else if (q < -sign) {
+        q = -sign;
+    }
+    return q;
+}
+
+static inline void rocmfpx_pack_linear_code(uint8_t * qs, int index, int bits, uint8_t code) {
+    const int bit = index * bits;
+    const int byte = bit >> 3;
+    const int shift = bit & 7;
+    const uint16_t packed = (uint16_t) code << shift;
+    qs[byte] |= (uint8_t) packed;
+    if (shift + bits > 8) {
+        qs[byte + 1] |= (uint8_t) (packed >> 8);
+    }
+}
+
+static inline uint8_t rocmfpx_unpack_linear_code(const uint8_t * qs, int index, int bits) {
+    const int bit = index * bits;
+    const int byte = bit >> 3;
+    const int shift = bit & 7;
+    uint16_t packed = qs[byte];
+    if (shift + bits > 8) {
+        packed |= (uint16_t) qs[byte + 1] << 8;
+    }
+    return (uint8_t) ((packed >> shift) & ((1u << bits) - 1u));
+}
+
+static float rocmfpx_linear_mse_for_scale(
+        const float * x, const float * weights, int n, uint8_t e, int bits, float best_err) {
+    const float scale = rocmfpx_scale_lookup(e);
+    const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    float err = 0.0f;
+
+    for (int i = 0; i < n; ++i) {
+        if (!isfinite(x[i])) {
+            continue;
+        }
+        const float y = (float) rocmfpx_linear_value(x[i], inv_scale, bits) * scale;
+        const float d = x[i] - y;
+        err += (weights ? weights[i] : 1.0f) * d*d;
+        if (err > best_err) {
+            return err;
+        }
+    }
+    return err;
+}
+
+static uint8_t rocmfpx_choose_scale_linear(
+        const float * x, int n, const float * quant_weights, float sigma2, int bits) {
+    float mse_weights[QK_ROCMFPX];
+    const float * weights = NULL;
+    float max_abs;
+    float max_abs_weight = 1.0f;
+    bool all_finite = false;
+
+    if (quant_weights) {
+        rocmfpx_prepare_mse_weights(
+                mse_weights, x, n, quant_weights, sigma2,
+                &max_abs, &max_abs_weight, &all_finite);
+        weights = mse_weights;
+    } else {
+        max_abs = rocmfpx_max_abs(x, n);
+    }
+    GGML_UNUSED(all_finite);
+
+    if (!(max_abs > 0.0f) || !isfinite(max_abs)) {
+        return 0;
+    }
+
+    const int max_code = (1 << (bits - 1)) - 1;
+    const uint8_t start_e = rocmfpx_nearest_scale_ue4m3(max_abs / (float) max_code);
+    uint8_t best_e = start_e;
+    float best_err = INFINITY;
+    bool lower_done = false;
+
+    for (int delta = 0; delta <= 125; ++delta) {
+        const int e0 = (int) start_e - delta;
+        if (!lower_done && e0 >= 1 && e0 <= 126) {
+            const float scale = rocmfpx_scale_lookup((uint8_t) e0);
+            const float clip_delta = max_abs - (float) max_code * scale;
+            const float clip_err = (weights ? max_abs_weight : 1.0f) * clip_delta * clip_delta;
+            if (clip_delta > 0.0f && clip_err > best_err) {
+                lower_done = true;
+            } else {
+                const float err = rocmfpx_linear_mse_for_scale(x, weights, n, (uint8_t) e0, bits, best_err);
+                if (err < best_err || (err == best_err && e0 < best_e)) {
+                    best_err = err;
+                    best_e = (uint8_t) e0;
+                }
+            }
+        }
+
+        const int e1 = (int) start_e + delta;
+        if (delta != 0 && e1 >= 1 && e1 <= 126) {
+            const float err = rocmfpx_linear_mse_for_scale(x, weights, n, (uint8_t) e1, bits, best_err);
+            if (err < best_err || (err == best_err && e1 < best_e)) {
+                best_err = err;
+                best_e = (uint8_t) e1;
+            }
+        }
+
+        if ((lower_done || e0 <= 1) && e1 >= 126) {
+            break;
+        }
+    }
+    return best_e;
+}
+
+static void rocmfpx_quantize_row_linear(
+        const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k,
+        const float * GGML_RESTRICT quant_weights, int bits) {
+    assert(k % QK_ROCMFPX == 0);
+
+    const int payload_size = QK_ROCMFPX * bits / 8;
+    const int block_size = payload_size + 2;
+    float sigma2 = 0.0f;
+    if (quant_weights) {
+        for (int64_t i = 0; i < k; ++i) {
+            sigma2 += isfinite(x[i]) ? x[i]*x[i] : 0.0f;
+        }
+        sigma2 /= (float) k;
+    }
+
+    for (int64_t ib = 0; ib < k / QK_ROCMFPX; ++ib) {
+        const float * xb = x + ib * QK_ROCMFPX;
+        uint8_t * block = (uint8_t *) y + ib * block_size;
+        uint8_t * scales = block + payload_size;
+        memset(block, 0, (size_t) payload_size);
+
+        for (int half = 0; half < 2; ++half) {
+            const int off = half * (QK_ROCMFPX / 2);
+            const float * weights = quant_weights ? quant_weights + ib*QK_ROCMFPX + off : NULL;
+            scales[half] = rocmfpx_choose_scale_linear(
+                    xb + off, QK_ROCMFPX / 2, weights, sigma2, bits);
+            const float scale = rocmfpx_scale_lookup(scales[half]);
+            const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+
+            for (int i = 0; i < QK_ROCMFPX / 2; ++i) {
+                const int index = off + i;
+                rocmfpx_pack_linear_code(
+                        block, index, bits,
+                        rocmfpx_quantize_linear_code(xb[index], inv_scale, bits));
+            }
+        }
+    }
+}
+
+static void rocmfpx_dequantize_row_linear(
+        const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k, int bits) {
+    assert(k % QK_ROCMFPX == 0);
+
+    const int payload_size = QK_ROCMFPX * bits / 8;
+    const int block_size = payload_size + 2;
+    for (int64_t ib = 0; ib < k / QK_ROCMFPX; ++ib) {
+        const uint8_t * block = (const uint8_t *) x + ib * block_size;
+        const uint8_t * scales = block + payload_size;
+        float * yb = y + ib * QK_ROCMFPX;
+
+        for (int i = 0; i < QK_ROCMFPX; ++i) {
+            const float scale = rocmfpx_scale_lookup(scales[i / (QK_ROCMFPX / 2)]);
+            yb[i] = (float) rocmfpx_decode_linear_code(
+                    rocmfpx_unpack_linear_code(block, i, bits), bits) * scale;
+        }
+    }
+}
+
+void rocmfpx_quantize_row_fp5_ref(const float * GGML_RESTRICT x, block_rocmfp5 * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_linear(x, y, k, NULL, 5);
+}
+
+void rocmfpx_dequantize_row_fp5(const block_rocmfp5 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_linear(x, y, k, 5);
+}
+
+void rocmfpx_quantize_row_fp5(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_fp5_ref(x, (block_rocmfp5 *) y, k);
+}
+
+size_t rocmfpx_quantize_fp5(
+        const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+        int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    const size_t row_size = rocmfpx_row_size_fp5(n_per_row);
+    for (int64_t row = 0; row < nrows; ++row) {
+        rocmfpx_quantize_row_linear(
+                src + row*n_per_row, (uint8_t *) dst + row*row_size,
+                n_per_row, imatrix, 5);
+    }
+    return (size_t) nrows * row_size;
+}
+
+void rocmfpx_quantize_row_fp7_ref(const float * GGML_RESTRICT x, block_rocmfp7 * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_linear(x, y, k, NULL, 7);
+}
+
+void rocmfpx_dequantize_row_fp7(const block_rocmfp7 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_linear(x, y, k, 7);
+}
+
+void rocmfpx_quantize_row_fp7(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_quantize_row_fp7_ref(x, (block_rocmfp7 *) y, k);
+}
+
+size_t rocmfpx_quantize_fp7(
+        const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+        int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    const size_t row_size = rocmfpx_row_size_fp7(n_per_row);
+    for (int64_t row = 0; row < nrows; ++row) {
+        rocmfpx_quantize_row_linear(
+                src + row*n_per_row, (uint8_t *) dst + row*row_size,
+                n_per_row, imatrix, 7);
+    }
+    return (size_t) nrows * row_size;
+}
+
+static bool rocmfpx_validate_row_data_linear(const void * data, size_t nbytes, int bits) {
+    const size_t block_size = (size_t) (QK_ROCMFPX * bits / 8 + 2);
+    if (nbytes % block_size != 0) {
+        return false;
+    }
+    const uint8_t * bytes = (const uint8_t *) data;
+    const size_t scale_offset = block_size - 2;
+    for (size_t i = 0; i < nbytes; i += block_size) {
+        if (!rocmfpx_scale_is_valid(bytes[i + scale_offset]) ||
+            !rocmfpx_scale_is_valid(bytes[i + scale_offset + 1])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool rocmfpx_validate_row_data_fp5(const void * data, size_t nbytes) {
+    return rocmfpx_validate_row_data_linear(data, nbytes, 5);
+}
+
+bool rocmfpx_validate_row_data_fp7(const void * data, size_t nbytes) {
+    return rocmfpx_validate_row_data_linear(data, nbytes, 7);
 }
 
 bool rocmfpx_validate_row_data_fp2(const void * data, size_t nbytes) {

@@ -1,0 +1,34 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_rocmfpx_fp7 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+uint rocmfpx_fp7_get_bits(uint ib, uint bit_pos) {
+    uint code = 0u;
+    [[unroll]] for (uint bit = 0u; bit < 7u; ++bit) {
+        const uint src_bit = bit_pos + bit;
+        code |= ((uint(data_a[ib].qs[src_bit >> 3u]) >> (src_bit & 7u)) & 1u) << bit;
+    }
+    return code;
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+
+#ifdef NEEDS_INIT_IQ_SHMEM
+    init_iq_shmem(gl_WorkGroupSize);
+#endif
+
+    if (i >= p.nel) {
+        return;
+    }
+    const uint ib = i / 32u;
+    const uint idx = i & 31u;
+    const float q = float(rocmfpx_decode_linear_code(rocmfpx_fp7_get_bits(ib, idx * 7u), 7u));
+    const float d = ue4m3_to_fp32(data_a[ib].e[idx >= 16u ? 1u : 0u]);
+    data_b[i] = D_TYPE(d * q);
+}

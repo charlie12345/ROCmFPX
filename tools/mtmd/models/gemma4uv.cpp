@@ -4,12 +4,12 @@
 ggml_cgraph * clip_graph_gemma4uv::build() {
     ggml_tensor * inp_raw = build_inp_raw();
 
-    // Gemma4UnifiedVisionEmbedder uses default PyTorch LayerNorm, not RMSNorm.
-    float eps = 1e-5f;
+    // Gemma4UnifiedVisionEmbedder uses default pytorch LayerNorm, not RMSNorm
+    float eps = 1e-5f; // default eps for pytorch LayerNorm
 
     ggml_tensor * inp = nullptr;
     {
-        // We cannot use ggml_conv_2d here because norm is applied after im2col.
+        // note: we cannot use ggml_conv_2d here because we need to apply norm after im2col
         auto c = inp_raw->ne[2];
         ggml_tensor * kernel = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, patch_size, patch_size, c);
         inp = ggml_im2col(ctx0, kernel, inp_raw, patch_size, patch_size, 0, 0, 1, 1, true, inp_raw->type);
@@ -38,7 +38,7 @@ ggml_cgraph * clip_graph_gemma4uv::build() {
         const int64_t pos_size = model.position_embeddings->ne[1];
         const size_t  nb1      = ggml_row_size(model.position_embeddings->type, n_embd);
 
-        // Positional embeddings are stored as lookup tables, one for x and one for y.
+        // positional embeddings are stored as lookup tables (one for x, one for y)
         ggml_tensor * tbl_x = ggml_view_2d(ctx0, model.position_embeddings,
                                              n_embd, pos_size, nb1, 0);
         ggml_tensor * tbl_y = ggml_view_2d(ctx0, model.position_embeddings,

@@ -14,8 +14,8 @@ void llama_model_kimi_linear::load_arch_hparams(llama_model_loader & ml) {
 
     // Mark KDA layers as recurrent using n_head_kv pattern (like Jamba)
     // Set n_head_kv = 0 for KDA layers (recurrent), n_head_kv = n_head for MLA layers (attention)
-    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
-        hparams.recurrent_layer_arr[i] = hparams.n_head_kv(i) == 0;  // KDA layers are recurrent
+    for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
+        hparams.is_recr_impl[i] = hparams.n_head_kv(i) == 0;  // KDA layers are recurrent
     }
 
     // MoE parameters - Kimi uses moe_intermediate_size = 1024
@@ -25,7 +25,7 @@ void llama_model_kimi_linear::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale, false);
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,                hparams.expert_gating_func);
 
-    switch (hparams.n_layer) {
+    switch (hparams.n_layer()) {
         case 27: type = LLM_TYPE_48B_A3B; break; // Kimi-Linear-48B-A3B
         default: type = LLM_TYPE_UNKNOWN;
     }
@@ -53,7 +53,7 @@ void llama_model_kimi_linear::load_arch_tensors(llama_model_loader &) {
         const int64_t n_embd_head_v_kda = hparams.n_embd_head_kda;
         const int64_t ssm_d_conv = hparams.ssm_d_conv;
 
-        if (hparams.is_recurrent(i)) {
+        if (hparams.is_recr(i)) {
             // Conv1d weights: try 4D first, then 3D (quantization may remove trailing 1)
             // 4D: [d_conv, 1, d_inner, 1], 3D: [d_conv, 1, d_inner]
             layer.ssm_q_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_Q, "weight", i), {ssm_d_conv, 1, n_embd_head_k_kda * n_head, 1}, TENSOR_NOT_REQUIRED);
@@ -84,9 +84,9 @@ void llama_model_kimi_linear::load_arch_tensors(llama_model_loader &) {
              layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head}, 0);
 
              // A_log - Shape in GGUF: [1, num_heads, 1, 1] (4D) or [1, num_heads] (2D after quantization) Note: -exp(A_log) is applied in convert_hf_to_gguf.py
-             layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, i), {1, n_head, 1, 1}, TENSOR_NOT_REQUIRED);
+             layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN, i), {1, n_head, 1, 1}, TENSOR_NOT_REQUIRED);
              if (!layer.ssm_a) {
-                 layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, i), {1, n_head}, 0);
+                 layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN, i), {1, n_head}, 0);
              }
 
              // dt_bias - shape [n_embd_head_k_kda * n_head] = [4096]
@@ -285,7 +285,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
 
         ggml_build_forward_expand(gf, cur);
 
-        if (hparams.is_recurrent(il)) {
+        if (hparams.is_recr(il)) {
             // === KDA Layer (Kimi Delta Attention) with Recurrent State ===
             // Reference: vLLM kda.py
             const auto * mctx_cur = inp_rs->mctx;
@@ -331,10 +331,11 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
             state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head, n_seqs);
 
+
             const float eps_norm = hparams.f_norm_rms_eps;
 
-            Qcur = ggml_l2_norm(ctx0, Qcur, eps_norm);
-            Kcur = ggml_l2_norm(ctx0, Kcur, eps_norm);
+            Qcur = build_gdn_l2_norm(ctx0, Qcur, eps_norm);
+            Kcur = build_gdn_l2_norm(ctx0, Kcur, eps_norm);
 
             // Choose between build_delta_net_chunking and build_delta_net_recurrent based on n_tokens
             auto attn_out = build_delta_net(Qcur, Kcur, Vcur, g1, beta, state, il);

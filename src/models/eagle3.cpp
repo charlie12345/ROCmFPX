@@ -19,7 +19,7 @@ void llama_model_eagle3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_TARGET_HIDDEN_SIZE, n_embd_tgt);
     LLAMA_LOG_INFO("%s: EAGLE3 n_embd_tgt = %u (draft n_embd = %u)\n", __func__, n_embd_tgt, hparams.n_embd);
 
-    hparams.n_embd_inp_impl = (uint32_t) target_layer_ids.size() * n_embd_tgt;
+    hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * n_embd_tgt;
 
     // eagle3 norm_before_residual (optional, default false)
     // compatible with Readhat eagle3 speculator model
@@ -28,13 +28,17 @@ void llama_model_eagle3::load_arch_hparams(llama_model_loader & ml) {
         LLAMA_LOG_INFO("%s: EAGLE3gnorm_before_residual = true\n", __func__);
     }
 
+    // eagle3 norm_before_fc (optional, default false)
+    // compatible with eagle3.1 (e.g. nvidia/gpt-oss-120b-Eagle3-v3)
+    ml.get_key(LLM_KV_NORM_BEFORE_FC, hparams.norm_before_fc, false);
+
     type = LLM_TYPE_UNKNOWN;
 }
 
 void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
-    const int64_t n_embd_inp = hparams.n_embd_inp();
+    const int64_t n_embd_inp = hparams.n_embd_inp_enc();
     const int64_t n_embd_attn_input = 2 * n_embd;
 
     // Get vocab size from the d2t tensor in the GGUF file (optional - only needed if eagle3 has different vocab_size than target)
@@ -52,6 +56,11 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
 
     // Feature fusion layer: projects 3 target layers to draft hidden size
     fc = create_tensor(tn(LLM_TENSOR_FC, "weight"), {n_embd_inp, n_embd}, 0);
+
+    // RMSNorm on the fused target features (input to fc), only when norm_before_fc is set.
+    if (hparams.norm_before_fc) {
+        output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), {n_embd_inp}, 0);
+    }
 
     // Output layer (uses draft vocab size)
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
@@ -109,8 +118,8 @@ ggml_tensor * llama_model_eagle3::graph<true>::build_inp_embd_enc() const {
 
     // Input: Target model features (3 layers concatenated: low, mid, high)
     // Data will be provided via ubatch->embd in encode_eagle3_features()
-    auto inp_target = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp());
-    inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,hparams.n_embd_inp(), n_tokens);
+    auto inp_target = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp_enc());
+    inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc(), n_tokens);
     ggml_set_input(inp_target->embd);
 
     cur = inp_target->embd;
@@ -130,14 +139,20 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
 
     cur = build_inp_embd_enc();
 
+    // RMSNorm on the fused target features before fc
+    if (hparams.norm_before_fc) {
+        cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
+        cb(cur, "enc_input_norm", -1);
+    }
+
     // Feature fusion layer
     cur = build_lora_mm(model.fc, cur);
     cb(cur, "fc_out", -1);
 
-    // Output: g_embeddings e.g. [4096, n_tokens].
-    // Store in the fork's pre-norm extraction slot, shared with MTP.
+    // Output: g_embeddings e.g. [4096, n_tokens]
+    // store in t_h_nextn (same as MTP) so can be read via llama_get_embeddings_nextn(ctx_dft)
     ggml_set_output(cur);
-    res->t_h_pre_norm = cur;
+    res->t_h_nextn = cur;
 
     ggml_build_forward_expand(gf, cur);
 }
@@ -213,9 +228,8 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         // inpL is the concatenated input (normalized inp_embd + normalized inp_g)
         ggml_tensor * inpSA = hparams.norm_before_residual ? g_norm : inpL;
 
-        // Concatenate normalized inp_embd and normalized inp_g along the feature dim.
-        // (Must be dim 0, not il: it only happened to work because eagle3 has n_layer==1.)
-        cur = ggml_concat(ctx0, embd_norm, g_norm, 0);
+        // Concatenate normalized inp_embd and normalized inp_g
+        cur = ggml_concat(ctx0, embd_norm, g_norm, il);
         cb(cur, "concat_embd", il);
 
         // Self-attention with concatenated input
@@ -283,7 +297,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
 
     // Output prenorm state (for next token's g_embeddings in autoregressive generation)
     ggml_set_output(cur);
-    res->t_h_pre_norm = cur;
+    res->t_h_nextn = cur;
 
     cur = build_norm(cur,
             model.output_norm, NULL,

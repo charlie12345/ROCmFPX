@@ -6,43 +6,57 @@ on:
     branches:
       - main
       - experimental-rocmfpx-branch
-    paths:
-      - 'ggml/rocmfpx/**'
-      - 'src/llama-quant.cpp'
-      - 'include/llama.h'
-      - 'scripts/check-rocmfpx-*.sh'
-      - 'scripts/check-rocmfp2-*.sh'
-      - 'scripts/check-release-recipe-map.py'
-      - 'scripts/sweep-rocmfpx-*.sh'
-      - 'scripts/build-rocmfpx-*.sh'
-      - 'docs/recipes/**'
-      - '.github/workflows/check-rocmfpx.yml'
   pull_request:
-    paths:
-      - 'ggml/rocmfpx/**'
-      - 'src/llama-quant.cpp'
-      - 'include/llama.h'
-      - 'scripts/check-rocmfpx-*.sh'
-      - 'scripts/check-rocmfp2-*.sh'
-      - 'scripts/check-release-recipe-map.py'
-      - 'scripts/sweep-rocmfpx-*.sh'
-      - 'scripts/build-rocmfpx-*.sh'
-      - 'docs/recipes/**'
-      - '.github/workflows/check-rocmfpx.yml'
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   rocmfpx-reference:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Select ROCmFPX qualification scope
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          run=true
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            run=false
+            git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$HEAD_SHA"
+            while IFS= read -r path; do
+              case "$path" in
+                ggml/rocmfpx/*|ggml/CMakeLists.txt|ggml/include/ggml.h|ggml/src/ggml.c|ggml/src/gguf.cpp|ggml/src/ggml-cpu/*|ggml/src/ggml-cuda/*|ggml/src/ggml-vulkan/*|extensions/rocmfpx-vulkan/*|gguf-py/gguf/constants.py|gguf-py/gguf/quants.py|include/rocmfpx-plugin.h|src/llama-quant.cpp|src/llama.cpp|src/llama-model.cpp|src/llama-model.h|src/llama-model-loader.cpp|src/models/qwen4exp.cpp|src/rocmfpx-plugin.cpp|include/llama.h|tests/rocmfpx-test-plugin.c|tests/test-backend-ops.cpp|tests/test-gguf.cpp|tests/test-llama-archs.cpp|tests/test-rocmfpx-plugin.cpp|scripts/check-rocmfpx-*.sh|scripts/check-rocmfp2-*.sh|scripts/check-release-recipe-map.py|scripts/sweep-rocmfpx-*.sh|scripts/build-rocmfpx-*.sh|scripts/rocmfpx/*|tools/hyperloom/*|docs/recipes/*|.github/workflows/check-rocmfpx.yml)
+                  run=true
+                  break
+                  ;;
+              esac
+            done < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: No ROCmFPX qualification needed
+        if: steps.scope.outputs.run != 'true'
+        run: echo "No ROCmFPX qualification paths changed."
 
       - name: Python converter smoke
+        if: steps.scope.outputs.run == 'true'
         run: |
-          python3 -m py_compile convert_hf_to_gguf.py convert_modular.py conversion/base.py conversion/__init__.py conversion/diffusion_gemma.py conversion/llama.py
+          python3 -m py_compile convert_hf_to_gguf.py convert_modular.py conversion/base.py conversion/__init__.py conversion/gemma.py conversion/llama.py scripts/rocmfpx/retag-legacy-rocmfp2.py tools/hyperloom/run_benchmark.py
           python3 - <<'PY'
           from pathlib import Path
 
@@ -53,30 +67,77 @@ jobs:
           PY
 
       - name: ROCmFPX script syntax
+        if: steps.scope.outputs.run == 'true'
         run: |
-          for s in scripts/check-rocmfpx-*.sh scripts/sweep-rocmfpx-*.sh scripts/build-rocmfpx-*.sh; do
+          for s in scripts/check-rocmfpx-*.sh scripts/sweep-rocmfpx-*.sh scripts/build-rocmfpx-*.sh scripts/rocmfpx/manage-actions-policy.sh tools/hyperloom/*.sh; do
             bash -n "$s"
           done
 
       - name: Released model recipe map
+        if: steps.scope.outputs.run == 'true'
         run: python3 scripts/check-release-recipe-map.py
 
-      - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake
-
       - name: Build reference + backend ops
+        if: steps.scope.outputs.run == 'true'
         run: |
-          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
-          cmake --build build --target test-backend-ops -j 2
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_UI=OFF
+          cmake --build build --target test-backend-ops test-gguf test-rocmfpx-plugin test-llama-archs -j 2
 
       - name: Reference probe
+        if: steps.scope.outputs.run == 'true'
         run: scripts/check-rocmfpx-reference.sh
 
       - name: ROCmFP2 reference probe
+        if: steps.scope.outputs.run == 'true'
         run: scripts/check-rocmfp2-reference.sh
 
       - name: CPU ROCmFPX backend ops
+        if: steps.scope.outputs.run == 'true'
         run: |
           ./build/bin/test-backend-ops test -o MUL_MAT,GET_ROWS,CPY,SET_ROWS -b CPU
+
+      - name: GGUF fail-closed parser
+        if: steps.scope.outputs.run == 'true'
+        run: ctest --test-dir build --output-on-failure -R '^test-gguf$'
+
+      - name: Plugin ABI and PLE model fixture
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          ctest --test-dir build --output-on-failure -R '^test-rocmfpx-plugin$'
+          ./build/bin/test-llama-archs -a qwen4exp
+
+      - name: Setup Vulkan SDK for CM1 compile coverage
+        if: steps.scope.outputs.run == 'true'
+        uses: ./.github/actions/unarchive-tar
+        with:
+          url: https://sdk.lunarg.com/sdk/download/1.4.357.0/linux/vulkan_sdk.tar.xz
+          path: ./vulkan_sdk
+          strip: 1
+
+      - name: Build Vulkan ROCmFP4 CM1 on then off
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          source ./vulkan_sdk/setup-env.sh
+          glslc --version
+          glslc --target-env=vulkan1.3 -fshader-stage=compute \
+            ggml/src/ggml-vulkan/vulkan-shaders/feature-tests/coopmat.comp \
+            -o "$RUNNER_TEMP/rocmfp4-coopmat.spv"
+          for cm1 in ON OFF; do
+            cmake -B build-vulkan-cm1 -S . -DCMAKE_BUILD_TYPE=Release \
+              -DGGML_NATIVE=OFF -DGGML_VULKAN=ON -DGGML_HIP=OFF \
+              -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
+              -DGGML_VULKAN_ROCMFP4_COOPMAT="$cm1"
+            cmake --build build-vulkan-cm1 --target llama-cli -j 2
+            shader_header=build-vulkan-cm1/ggml/src/ggml-vulkan/ggml-vulkan-shaders.hpp
+            test -s "$shader_header"
+            nm --defined-only build-vulkan-cm1/bin/libggml-vulkan.so > "$RUNNER_TEMP/rocmfp4-symbols.txt"
+            if [[ "$cm1" == ON ]]; then
+              for kernel in matmul_rocmfp4_f32 matmul_rocmfp4_fast_f32 matmul_id_subgroup_rocmfp4_f32 matmul_id_subgroup_rocmfp4_fast_f32; do
+                grep -Fq "${kernel}_cm1_data[]" "$shader_header"
+                grep -Eq " ${kernel}_cm1_data$" "$RUNNER_TEMP/rocmfp4-symbols.txt"
+              done
+            elif grep -Eq 'matmul.*rocmfp4.*_cm1_' "$shader_header" "$RUNNER_TEMP/rocmfp4-symbols.txt"; then
+              echo "Stale ROCmFP4 CM1 shaders after disabling the option."
+              exit 1
+            fi
+          done

@@ -111,6 +111,9 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q1_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
 #define VDR_Q1_0_Q8_1_MMQ  4  // Q1_0 has 128 bits (4 ints) per block
 
+#define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
+#define VDR_Q2_0_Q8_1_MMQ  2  // Q2_0 group 64: 128 bits (4 ints) per block, 2 32-element chunks
+
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
 
@@ -409,7 +412,9 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 
 #define VDR_ROCMFP3_Q8_1_MMVQ GGML_ROCMFP3_Q8_1_MMVQ_VDR
 #define VDR_ROCMFP2_Q8_1_MMVQ GGML_ROCMFP2_Q8_1_MMVQ_VDR
+#define VDR_ROCMFP5_Q8_1_MMVQ 4
 #define VDR_ROCMFP6_Q8_1_MMVQ GGML_ROCMFP6_Q8_1_MMVQ_VDR
+#define VDR_ROCMFP7_Q8_1_MMVQ 4
 #define VDR_ROCMFP8_Q8_1_MMVQ GGML_ROCMFP8_Q8_1_MMVQ_VDR
 
 #define VDR_ROCMFP3_Q8_1_MMQ 4
@@ -435,6 +440,22 @@ static __device__ __forceinline__ int rocmfpx_decode_fp3_code_vec_cuda(const uin
     const uint32_t mag_code = code & 3u;
     const int mag = mag_code == 3u ? 4 : (int) mag_code;
     return (code & 4u) ? -mag : mag;
+}
+
+static __device__ __forceinline__ int rocmfpx_decode_linear_code_vec_cuda(const uint32_t code, const int bits) {
+    const uint32_t sign = 1u << (bits - 1);
+    const int mag = (int) (code & (sign - 1u));
+    return (code & sign) ? -(mag == 0 ? (int) sign : mag) : mag;
+}
+
+template<int bits>
+static __device__ __forceinline__ int rocmfpx_pack4_linear_vec_cuda(const uint8_t * qs, const int base) {
+    const char4 v = make_char4(
+        (int8_t) rocmfpx_decode_linear_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 0)*bits, bits), bits),
+        (int8_t) rocmfpx_decode_linear_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 1)*bits, bits), bits),
+        (int8_t) rocmfpx_decode_linear_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 2)*bits, bits), bits),
+        (int8_t) rocmfpx_decode_linear_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 3)*bits, bits), bits));
+    return *((const int *) &v);
 }
 
 static __device__ __forceinline__ int rocmfpx_pack4_fp2_vec_cuda(const uint8_t packed) {
@@ -692,6 +713,41 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp2_q8_1(
     const float db = __low2float(bq8_1->ds);
     return db * (rocmfpx_ue4m3_to_fp32_finite(bq2->e[0]) * sumi0 + rocmfpx_ue4m3_to_fp32_finite(bq2->e[1]) * sumi1);
 #endif
+}
+
+template<typename block_t, int bits, int vdr>
+static __device__ __forceinline__ float vec_dot_rocmfpx_linear_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_t * bq = (const block_t *) vbq + kbx;
+    int sumi0 = 0;
+    int sumi1 = 0;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        const int base = 4 * (iqs + i);
+        const int values = rocmfpx_pack4_linear_vec_cuda<bits>(bq->qs, base);
+        const int u = get_int_b4(bq8_1->qs, iqs + i);
+        if (base < QK_ROCMFPX/2) {
+            sumi0 = ggml_cuda_dp4a(values, u, sumi0);
+        } else {
+            sumi1 = ggml_cuda_dp4a(values, u, sumi1);
+        }
+    }
+
+    const float db = __low2float(bq8_1->ds);
+    return db * (rocmfpx_ue4m3_to_fp32_finite(bq->e[0]) * sumi0 +
+                 rocmfpx_ue4m3_to_fp32_finite(bq->e[1]) * sumi1);
+}
+
+static __device__ __forceinline__ float vec_dot_rocmfpx_fp5_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_rocmfpx_linear_q8_1<block_rocmfp5, 5, VDR_ROCMFP5_Q8_1_MMVQ>(vbq, bq8_1, kbx, iqs);
+}
+
+static __device__ __forceinline__ float vec_dot_rocmfpx_fp7_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_rocmfpx_linear_q8_1<block_rocmfp7, 7, VDR_ROCMFP7_Q8_1_MMVQ>(vbq, bq8_1, kbx, iqs);
 }
 
 static __device__ __forceinline__ float vec_dot_rocmfpx_fp6_q8_1(
@@ -1129,40 +1185,91 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     // Q8_1: 32 elements per block with individual scales
     // iqs selects which of the 4 chunks of 32 elements to process (0-3)
 
-    const float d1 = bq1_0->d;
+    const float     d1 = bq1_0->d;
+    const int16_t * qs = (const int16_t *) bq1_0->qs + iqs * 2;
 
     // Process only the chunk specified by iqs
     const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
 
-    // Load 32 bits (4 bytes) for this chunk from Q1_0
-    const int offset = iqs * 4;
-    const int v = bq1_0->qs[offset + 0] | (bq1_0->qs[offset + 1] << 8) |
-                  (bq1_0->qs[offset + 2] << 16) | (bq1_0->qs[offset + 3] << 24);
-
-    // Unpack 32 bits into 32 signed values (-1 or +1)
-    int vi_bytes[8];
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int shift = j * 4;
-        const int bits4 = (v >> shift) & 0x0F;
-        const int b0 = (bits4 & 0x01) ? 1 : -1;
-        const int b1 = (bits4 & 0x02) ? 1 : -1;
-        const int b2 = (bits4 & 0x04) ? 1 : -1;
-        const int b3 = (bits4 & 0x08) ? 1 : -1;
-        vi_bytes[j] = (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24);
-    }
-
-    // Compute dot product for this 32-element chunk
     int sumi = 0;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int u = get_int_b4(bq8_1_chunk->qs, j);
-        sumi = ggml_cuda_dp4a(vi_bytes[j], u, sumi);
+    for (int j = 0; j < 2; ++j) {
+        const int q  = qs[j];
+
+        const int u0 = get_int_b4(bq8_1_chunk->qs, j*4+0);
+        const int u1 = get_int_b4(bq8_1_chunk->qs, j*4+1);
+        const int u2 = get_int_b4(bq8_1_chunk->qs, j*4+2);
+        const int u3 = get_int_b4(bq8_1_chunk->qs, j*4+3);
+
+        // unpack crumbs into nibble indices
+        const int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0); // [0, 1, 4, 5] [ 8,  9, 12, 13]
+        const int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2); // [2, 3, 6, 7] [10, 11, 14, 15]
+        // unpack nibbles into byte values
+        const int s0 = __byte_perm(0x01FF, 0x01FF, n0 >>  0);
+        const int s1 = __byte_perm(0x01FF, 0x01FF, n1 >>  0);
+        const int s2 = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
+        const int s3 = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
+        // unshuffle values
+        const int v0 = __byte_perm(s0, s1, 0x5410);
+        const int v1 = __byte_perm(s0, s1, 0x7632);
+        const int v2 = __byte_perm(s2, s3, 0x5410);
+        const int v3 = __byte_perm(s2, s3, 0x7632);
+
+        sumi = ggml_cuda_dp4a(v0, u0, sumi);
+        sumi = ggml_cuda_dp4a(v1, u1, sumi);
+        sumi = ggml_cuda_dp4a(v2, u2, sumi);
+        sumi = ggml_cuda_dp4a(v3, u3, sumi);
     }
 
     // Apply Q1_0's single scale and this chunk's Q8_1 scale
     const float d8 = __low2float(bq8_1_chunk->ds);
     return d1 * d8 * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq + kbx;
+
+    // Q2_0 (group 64): 64 elements with ONE scale, 2 bits per element (4 elements per byte)
+    // Q8_1: 32 elements per block with individual scales
+    // iqs selects which of the 2 chunks of 32 elements to process (0-1)
+
+    const float     d2 = bq2_0->d;
+    const int16_t * qs = (const int16_t *) bq2_0->qs + iqs * 4;
+
+    // Process only the chunk specified by iqs
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int q  = qs[j];
+        const int u  = get_int_b4(bq8_1_chunk->qs, j*2+0);
+        const int v  = get_int_b4(bq8_1_chunk->qs, j*2+1);
+
+#if defined(GGML_USE_HIP)
+        const uint32_t qx_indices = (q & 0x03) | ((q & 0x0C) << 6) | ((q & 0x30) << 12) | ((q & 0xC0) << 18);
+        const uint32_t qy_bits    = q >> 8;
+        const uint32_t qy_indices = (qy_bits & 0x03) | ((qy_bits & 0x0C) << 6) | ((qy_bits & 0x30) << 12) | ((qy_bits & 0xC0) << 18);
+        const int qx = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qx_indices);
+        const int qy = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qy_indices);
+#else
+        // unpack even and odd crumbs into byte values
+        const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+        const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+        // unshuffle values
+        const int qx = __byte_perm(qe, qo, 0x5140);
+        const int qy = __byte_perm(qe, qo, 0x7362);
+#endif // defined(GGML_USE_HIP)
+
+        sumi = ggml_cuda_dp4a(u, qx, sumi);
+        sumi = ggml_cuda_dp4a(v, qy, sumi);
+    }
+
+    // Apply Q2_0's single scale and this chunk's Q8_1 scale
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    return d2 * d8 * sumi;
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(

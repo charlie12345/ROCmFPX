@@ -10,8 +10,8 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include <cstdio>
 
-using json = nlohmann::ordered_json;
 
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
@@ -19,8 +19,10 @@ enum server_task_type {
     SERVER_TASK_TYPE_RERANK,
     SERVER_TASK_TYPE_INFILL,
     SERVER_TASK_TYPE_CANCEL,
+    SERVER_TASK_TYPE_CONTROL,
     SERVER_TASK_TYPE_NEXT_RESPONSE,
     SERVER_TASK_TYPE_METRICS,
+    SERVER_TASK_TYPE_SLOT_GET,
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
@@ -47,11 +49,13 @@ enum stop_type {
 };
 
 struct task_params {
-    bool stream          = true;
+    bool stream          = false;
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
     bool return_progress = false;
+
+    int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
 
     int32_t n_keep    =  0; // number of tokens to keep from initial prompt
     int32_t n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
@@ -81,8 +85,15 @@ struct task_params {
     std::string        oaicompat_model;
     std::string        oaicompat_cmpl_id;
 
+    // realtime control (SERVER_TASK_TYPE_CONTROL)
+    std::string        control_action;
+    std::string        control_cmpl_id;
+
     // per-request parameters for chat parsing
     common_chat_parser_params chat_parser_params;
+
+    // message spans for checkpointing
+    common_chat_msg_spans message_spans;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
@@ -107,16 +118,13 @@ struct task_result_state {
     bool text_block_started = false;
 
     // for OpenAI Responses streaming API
+    bool oai_resp_created = false;
     const std::string oai_resp_id;
     const std::string oai_resp_reasoning_id;
     const std::string oai_resp_message_id;
     std::string oai_resp_fc_id; // function call ID for current args delta
 
-    task_result_state(const common_chat_parser_params & chat_parser_params)
-        : chat_parser_params(chat_parser_params)
-        , oai_resp_id("resp_" + random_string())
-        , oai_resp_reasoning_id("rs_" + random_string())
-        , oai_resp_message_id("msg_" + random_string()) {}
+    task_result_state(const common_chat_parser_params & chat_parser_params);
 
     // parse partial tool calls and update the internal state
     common_chat_msg update_chat_msg(
@@ -206,13 +214,6 @@ struct server_task {
         }
     }
 
-    static task_params params_from_json_cmpl(
-        const llama_vocab * vocab,
-        const common_params & params_base,
-        const int n_ctx_slot,
-        const std::vector<llama_logit_bias> & logit_bias_eog,
-        const json & data);
-
     // utility function
     static std::unordered_set<int> get_list_id(const std::vector<server_task> & tasks) {
         std::unordered_set<int> ids(tasks.size());
@@ -259,26 +260,6 @@ struct server_task {
     }
 };
 
-struct result_timings {
-    int32_t cache_n = -1;
-
-    int32_t prompt_n = -1;
-    double prompt_ms = 0.0;
-    double prompt_per_token_ms = 0.0;
-    double prompt_per_second = 0.0;
-
-    int32_t predicted_n = -1;
-    double predicted_ms = 0.0;
-    double predicted_per_token_ms = 0.0;
-    double predicted_per_second = 0.0;
-
-    // Optional speculative metrics - only included when > 0
-    int32_t draft_n = 0;
-    int32_t draft_n_accepted = 0;
-
-    json to_json() const;
-};
-
 struct result_prompt_progress {
     int32_t total = 0;
     int32_t cache = 0;
@@ -308,6 +289,9 @@ struct server_task_result {
     }
     virtual json to_json() = 0;
     virtual ~server_task_result() = default;
+    virtual server_task_result * clone() const {
+        GGML_ABORT("not implemented for this task type");
+    }
 };
 
 // using shared_ptr for polymorphism of server_task_result
@@ -340,7 +324,7 @@ struct server_task_result_cmpl_final : server_task_result {
 
     bool stream;
     bool include_usage;
-    result_timings timings;
+    server_slot_stats stats;
     std::string prompt;
 
     bool truncated;
@@ -419,8 +403,10 @@ struct server_task_result_cmpl_partial : server_task_result {
 
     bool post_sampling_probs;
     bool is_progress = false;
+    bool is_begin = false; // whether to send 200 status to HTTP client (begin of SSE stream)
+                           // ref: https://github.com/ggml-org/llama.cpp/pull/23884
     completion_token_output prob_output;
-    result_timings timings;
+    server_slot_stats stats;
     result_prompt_progress progress;
 
     // response formatting
@@ -436,6 +422,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     bool text_block_started     = false;
 
     // for OpenAI Responses API
+    bool oai_resp_created = false;
     std::string oai_resp_id;
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
@@ -503,28 +490,27 @@ struct server_task_result_error : server_task_result {
     virtual json to_json() override;
 };
 
+// used by /metrics API
 struct server_task_result_metrics : server_task_result {
-    int n_idle_slots;
-    int n_processing_slots;
-    int n_tasks_deferred;
-    int64_t t_start;
+    // these are immediate stats, not accumulated (server_metrics is cumulative)
+    int n_processing_slots = 0;
+    int n_tasks_deferred = 0;
 
-    // TODO: somehow reuse server_metrics in the future, instead of duplicating the fields
-    uint64_t n_prompt_tokens_processed_total = 0;
-    uint64_t t_prompt_processing_total       = 0;
-    uint64_t n_tokens_predicted_total        = 0;
-    uint64_t t_tokens_generation_total       = 0;
+    server_metrics metrics;
 
-    uint64_t n_tokens_max = 0;
+    virtual json to_json() override;
 
-    uint64_t n_prompt_tokens_processed = 0;
-    uint64_t t_prompt_processing       = 0;
+    struct metric_item {
+        std::string name;
+        std::string description;
+        double value; // prometheus values are always float64
+    };
+    std::string to_metrics();
+};
 
-    uint64_t n_tokens_predicted  = 0;
-    uint64_t t_tokens_generation = 0;
-
-    uint64_t n_decode_total     = 0;
-    uint64_t n_busy_slots_total = 0;
+// used by /slots API
+struct server_task_result_slots : server_task_result {
+    int n_idle_slots = 0;
 
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
@@ -550,6 +536,19 @@ struct server_task_result_slot_erase : server_task_result {
     virtual json to_json() override;
 };
 
+struct server_task_result_control : server_task_result {
+    bool        success = false;
+    std::string message; // optional detail when success is false
+
+    virtual json to_json() override {
+        json out = json { { "success", success } };
+        if (!message.empty()) {
+            out["message"] = message;
+        }
+        return out;
+    }
+};
+
 struct server_task_result_get_lora : server_task_result {
     struct lora {
         common_adapter_lora_info info;
@@ -565,33 +564,14 @@ struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
 };
 
-struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
-    std::vector<uint8_t> spec;
-
-    size_t size() const {
-        return main.size() + drft.size() + spec.size();
-    }
-};
-
 struct server_prompt {
     server_tokens tokens;
 
-    server_prompt_data data;
-
     std::list<common_prompt_checkpoint> checkpoints;
 
-    size_t size() const {
-        size_t res = 0;
-
-        res += data.size();
-
-        for (const auto & ckpt : checkpoints) {
-            res += ckpt.size();
-        }
-
-        return res;
+    void clear() {
+        tokens.clear();
+        checkpoints.clear();
     }
 
     int n_tokens() const {
@@ -601,38 +581,103 @@ struct server_prompt {
     server_prompt clone() const {
         return server_prompt {
             tokens.clone(),
-            data,
             checkpoints,
         };
     }
 };
 
-// The context checkpoint payloads may contain large host vectors and cloned
-// backend buffers. Disk-cache entries keep only the small scheduling metadata;
-// a restored disk state starts with an empty live checkpoint list and creates
-// fresh checkpoints as prompt processing continues.
+struct server_prompt_data {
+    std::vector<uint8_t> main;
+    std::vector<uint8_t> drft;
+
+    // speculative-impl state captured at the exact token boundary (e.g. the MTP
+    // drafter's deferred boundary row); optional, restored on an exact-boundary hit
+    std::vector<uint8_t> spec;
+
+    size_t size() const {
+        return main.size() + drft.size() + spec.size();
+    }
+};
+
+struct server_prompt_cache_state {
+    server_prompt prompt;
+    server_prompt_data data;
+
+    size_t size() const {
+        size_t res = data.size();
+
+        for (const auto & ckpt : prompt.checkpoints) {
+            res += ckpt.size();
+        }
+
+        return res;
+    }
+};
+
+// The context checkpoint payloads may contain large host vectors. Disk-cache entries
+// keep only the small scheduling metadata in RAM; the checkpoints themselves are persisted
+// in full next to the entry (see save_disk) and restored as live checkpoints.
 struct server_prompt_checkpoint_meta {
     int64_t   n_tokens = 0;
     llama_pos pos_min  = 0;
     llama_pos pos_max  = 0;
 };
 
+// one context checkpoint persisted next to a disk entry (<stem>-ckpt<k>.bin)
+struct server_prompt_disk_ckpt {
+    std::string path;
+    size_t      size = 0;
+    server_prompt_checkpoint_meta meta;
+};
+
 struct server_prompt_disk_state {
     server_tokens tokens;
-    std::vector<server_prompt_checkpoint_meta> checkpoints;
     std::vector<uint8_t> spec;
 
     std::string path_main;
     std::string path_drft;
 
+    // The context checkpoints persisted alongside the entry, oldest first. A recurrent/hybrid
+    // state cannot be truncated, so without them the entry is usable only when the request
+    // extends it exactly. With them, a request that diverges anywhere past a checkpoint
+    // (a client that re-sends the last assistant turn without reasoning_content, an agent
+    // that rewrote or compacted older history, ...) still restores the entry: the slot rolls
+    // back to the newest checkpoint at or before the divergence, exactly as it does in-slot,
+    // and re-prefills from there.
+    std::vector<server_prompt_disk_ckpt> ckpts;
+
+    // speculative-impl state blob persisted next to the entry so it survives a restart
+    std::string path_spec;
+
     size_t size_main = 0;
     size_t size_drft = 0;
+
+    bool has_ckpt() const { return !ckpts.empty(); }
+
+    size_t size_ckpt() const {
+        size_t res = 0;
+        for (const auto & ck : ckpts) {
+            res += ck.size;
+        }
+        return res;
+    }
+
+    // newest persisted checkpoint boundary at or before `lcp` (0 = none)
+    int64_t ckpt_at_or_below(size_t lcp) const {
+        int64_t res = 0;
+        for (const auto & ck : ckpts) {
+            if (ck.meta.n_tokens > res && (size_t) ck.meta.n_tokens <= lcp) {
+                res = ck.meta.n_tokens;
+            }
+        }
+        return res;
+    }
 
     uint64_t id = 0;
     bool usable = true;
 
     size_t size() const {
-        return size_main + size_drft;
+        return size_main + size_drft + size_ckpt();
     }
 
     int n_tokens() const {
@@ -645,17 +690,37 @@ struct server_prompt_cache {
             int32_t limit_size_mib,
              size_t limit_tokens,
         const std::string & disk_base_path = {},
-            int32_t disk_limit_size_mib = 0);
+            int32_t disk_limit_size_mib = 0,
+        const std::string & disk_identity = {});
 
     ~server_prompt_cache();
 
-    std::list<server_prompt> states;
+    std::list<server_prompt_cache_state> states;
 
     // Cold automatic cache. Entries own only token/checkpoint metadata in RAM;
     // target and draft context payloads live in owner-only files.
     std::list<server_prompt_disk_state> disk_states;
 
+    // Identity of the model/context this cache was written for (model path + size,
+    // n_ctx, KV types). Written to <run>/identity.txt; a later run adopts a stale run
+    // directory's entries only when its identity matches exactly.
+    std::string disk_identity;
+
+#if defined(_WIN32)
+    // Held open with deny-all sharing for the life of the run: the Windows
+    // counterpart of the POSIX flock() advisory lock, so a later startup can tell a
+    // live run directory from an abandoned one.
+    FILE * disk_lock_file = nullptr;
+#endif
+
     bool ram_enabled = false;
+
+    // true when both contexts support unbounded partial sequence removal (dense KV):
+    // then a cached prompt that is longer than the request can be truncated in place.
+    // Recurrent/hybrid targets cannot (their saved state carries no rollback
+    // snapshots), so such entries are only usable at their exact boundary or through
+    // a checkpoint at or before the divergence point.
+    bool partial_seq_rm = false;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -684,6 +749,20 @@ struct server_prompt_cache {
     // created for this server process.
     bool disk_save_disabled = false;
 
+    // Prompts shorter than this are never written to disk: keep-alive pings, title
+    // generation and similar one-shot requests would otherwise each leave an entry whose
+    // size is dominated by the fixed recurrent state (~160 MiB for a few hundred tokens).
+    size_t disk_min_tokens = 0;
+
+    // max context checkpoints persisted with each entry, newest first (-1 = all, 0 = none)
+    int32_t disk_max_ckpts = -1;
+
+    // a disk entry replaces what the slot already holds only when it keeps at least this
+    // many tokens more - below that the read costs more than the prefill it saves
+    size_t disk_min_gain = 1024;
+
+    bool disk_enabled() const { return !disk_owned_path.empty(); }
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -692,54 +771,69 @@ struct server_prompt_cache {
 
     size_t disk_n_tokens() const;
 
+    // save the slot's state to the disk tier (if enabled) and the RAM tier (if enabled);
+    // returns true when the state is now held by at least one tier
     bool save(
         const server_prompt & prompt,
-              llama_context * ctx_main,
-              llama_context * ctx_drft,
+              llama_context * ctx_tgt,
+              llama_context * ctx_dft,
                llama_seq_id   id_slot,
         const std::vector<uint8_t> & state_spec);
 
-    server_prompt * alloc(
+    server_prompt_cache_state * alloc(
         const server_prompt & prompt,
                     size_t state_size_main,
                     size_t state_size_drft,
         const std::vector<uint8_t> & state_spec);
 
+    // Persist a shared exact-boundary entry for `tokens_prefix`. The contexts must hold
+    // exactly these tokens for id_slot, i.e. this is called mid-prefill, between two batches.
+    // Used for the system prompt + tools block, which many conversations have in common:
+    // a new conversation then starts from the entry instead of prefilling the block again.
+    // An existing entry with the same tokens is only touched (kept most-recently-used).
+    bool save_prefix(
+        const server_tokens & tokens_prefix,
+              llama_context * ctx_tgt,
+              llama_context * ctx_dft,
+               llama_seq_id   id_slot,
+        const std::vector<uint8_t> & state_spec);
+
+    // true when a usable disk entry holds exactly the first n_tokens of `tokens`
+    bool has_disk_prefix(const server_tokens & tokens, size_t n_tokens) const;
+
+    // restore the most useful entry (RAM or disk) for tokens_new into the slot, if any is
+    // better than what the slot already holds. On a hit, `prompt` is replaced and
+    // `state_spec` (optional) receives the entry's exact-boundary speculative state.
+    // `probe` marks a lookup made while the slot keeps serving the same conversation
+    // (near-miss logging is then demoted to debug).
+    // Returns false only when a restore was attempted and failed (the slot must be cleared).
     bool load(
               server_prompt & prompt,
         const server_tokens & tokens_new,
-              llama_context * ctx_main,
-              llama_context * ctx_drft,
+              llama_context * ctx_tgt,
+              llama_context * ctx_dft,
                     int32_t   id_slot,
-                       bool   spec_state_required,
-                       bool   spec_trailing_rm,
-                       bool * cache_hit,
-                   uint64_t * disk_entry_id);
-
-    // Called when a stateful speculative implementation rejects a blob after
-    // the target/draft files themselves restored successfully.
-    void accept_disk_load(uint64_t entry_id);
-
-    void reject_disk_load(uint64_t entry_id, const char * reason);
+       std::vector<uint8_t> * state_spec,
+                       bool   probe = false);
 
     void update();
 
 private:
     bool save_disk(
         const server_prompt & prompt,
-              llama_context * ctx_main,
-              llama_context * ctx_drft,
+              llama_context * ctx_tgt,
+              llama_context * ctx_dft,
                llama_seq_id   id_slot,
         const std::vector<uint8_t> & state_spec);
 
     bool load_disk(
         std::list<server_prompt_disk_state>::iterator it,
         server_prompt & prompt,
-        llama_context * ctx_main,
-        llama_context * ctx_drft,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
          llama_seq_id   id_slot,
               size_t   lcp,
-            uint64_t * entry_id_out);
+       std::vector<uint8_t> * state_spec);
 
     bool erase_disk_state(std::list<server_prompt_disk_state>::iterator it, bool eviction, const char * reason);
 
@@ -748,4 +842,13 @@ private:
     void update_disk();
 
     void log_disk_state() const;
+};
+
+// used exclusively by router mode
+struct server_task_result_router : server_task_result {
+    json data;
+    virtual json to_json() override { return data; }
+    virtual server_task_result * clone() const override {
+        return new server_task_result_router(*this);
+    }
 };

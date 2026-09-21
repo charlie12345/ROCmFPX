@@ -1,4 +1,0 @@
-rank_low_error,name,layer,family,elements,sse,bss,mse,rel_sse,seconds
-1,blk.64.attn_output.weight,64,attn_output,31457280,8.9,11400.8,0,0.00078,0.32
-2,blk.0.attn_qkv.weight,0,attn_qkv,52428800,9.8,11944.7,0,0.00082,0.49
-3,blk.60.attn_qkv.weight,60,attn_qkv,52428800,12.5,14955.8,0,0.00083,0.48

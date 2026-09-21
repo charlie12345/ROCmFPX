@@ -33,16 +33,8 @@
 #endif
 
 static llama_context           ** g_ctx;
-// Assigned but never read: the interrupt handler above only consumes g_ctx and
-// g_smpl. Kept (rather than deleted) to stay in step with upstream, which reads
-// these in its own handler. Marked so the ROCm clang build, which enables
-// -Wunused-but-set-global where gcc does not, still compiles with -Werror.
-static llama_model             ** g_model [[maybe_unused]];
 static common_sampler          ** g_smpl;
 static common_params            * g_params;
-static std::vector<llama_token> * g_input_tokens [[maybe_unused]];
-static std::ostringstream       * g_output_ss [[maybe_unused]];
-static std::vector<llama_token> * g_output_tokens [[maybe_unused]];
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
 
@@ -88,7 +80,10 @@ static void sigint_handler(int signo) {
 }
 #endif
 
-int main(int argc, char ** argv) {
+// satisfies -Wmissing-declarations
+int llama_completion(int argc, char ** argv);
+
+int llama_completion(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;
@@ -137,7 +132,6 @@ int main(int argc, char ** argv) {
     llama_context * ctx = nullptr;
     common_sampler * smpl = nullptr;
 
-    g_model = &model;
     g_ctx = &ctx;
     g_smpl = &smpl;
 
@@ -165,47 +159,6 @@ int main(int argc, char ** argv) {
 
     // start measuring performance timings from here
     llama_perf_context_reset(ctx);
-
-    LOG_INF("%s: llama threadpool init, n_threads = %d\n", __func__, (int) params.cpuparams.n_threads);
-
-    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    if (!cpu_dev) {
-        LOG_ERR("%s: no CPU backend found\n", __func__);
-        return 1;
-    }
-    auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
-    auto * ggml_threadpool_new_fn = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
-    auto * ggml_threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
-
-    struct ggml_threadpool_params tpp_batch =
-            ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);
-    struct ggml_threadpool_params tpp =
-            ggml_threadpool_params_from_cpu_params(params.cpuparams);
-
-    if (!set_process_priority(params.cpuparams.priority)) {
-        LOG_ERR("%s: error: failed to set process priority\n", __func__);
-        return 1;
-    }
-
-    struct ggml_threadpool * threadpool_batch = NULL;
-    if (!ggml_threadpool_params_match(&tpp, &tpp_batch)) {
-        threadpool_batch = ggml_threadpool_new_fn(&tpp_batch);
-        if (!threadpool_batch) {
-            LOG_ERR("%s: batch threadpool create failed : n_threads %d\n", __func__, tpp_batch.n_threads);
-            return 1;
-        }
-
-        // start the non-batch threadpool in the paused state
-        tpp.paused = true;
-    }
-
-    struct ggml_threadpool * threadpool = ggml_threadpool_new_fn(&tpp);
-    if (!threadpool) {
-        LOG_ERR("%s: threadpool create failed : n_threads %d\n", __func__, tpp.n_threads);
-        return 1;
-    }
-
-    llama_attach_threadpool(ctx, threadpool, threadpool_batch);
 
     const int n_ctx_train = llama_model_n_ctx_train(model);
     const int n_ctx = llama_n_ctx(ctx);
@@ -282,78 +235,11 @@ int main(int argc, char ** argv) {
     std::vector<llama_token> embd_inp;
 
     bool waiting_for_first_input = false;
-
-    const bool template_supports_thinking = params.use_jinja && common_chat_templates_support_enable_thinking(chat_templates.get());
-    auto get_enable_thinking = [&params, template_supports_thinking]() {
-        bool enable_thinking = params.enable_reasoning != 0 && template_supports_thinking;
-        const auto it = params.default_template_kwargs.find("enable_thinking");
-        if (it != params.default_template_kwargs.end()) {
-            if (it->second == "true") {
-                enable_thinking = true;
-            } else if (it->second == "false") {
-                enable_thinking = false;
-            }
-        }
-        return enable_thinking;
-    };
-    const bool enable_thinking = get_enable_thinking();
-
-    auto make_chat_inputs = [&params, enable_thinking](const std::vector<common_chat_msg> & messages, bool add_generation_prompt) {
-        common_chat_templates_inputs inputs;
-        inputs.use_jinja             = params.use_jinja;
-        inputs.messages              = messages;
-        inputs.add_generation_prompt = add_generation_prompt;
-        inputs.reasoning_format      = params.reasoning_format;
-        inputs.enable_thinking       = enable_thinking;
-        inputs.chat_template_kwargs  = params.default_template_kwargs;
-        if (enable_thinking) {
-            inputs.chat_template_kwargs.emplace("preserve_thinking", "true");
-            inputs.chat_template_kwargs.emplace("clear_thinking", "false");
-        }
-        inputs.force_pure_content    = params.force_pure_content_parser;
-        return inputs;
-    };
-
-    auto chat_format_single = [&chat_templates, &make_chat_inputs](const std::vector<common_chat_msg> & past_msg,
-                                                                   const common_chat_msg &              new_msg,
-                                                                   bool                                 add_ass) {
-        std::string fmt_past_msg;
-        if (!past_msg.empty()) {
-            fmt_past_msg = common_chat_templates_apply(chat_templates.get(), make_chat_inputs(past_msg, false)).prompt;
-        }
-
-        std::ostringstream ss;
-        if (add_ass && !fmt_past_msg.empty() && fmt_past_msg.back() == '\n') {
-            ss << "\n";
-        }
-
-        std::vector<common_chat_msg> new_msgs = past_msg;
-        new_msgs.push_back(new_msg);
-        auto fmt_new_msg = common_chat_templates_apply(chat_templates.get(), make_chat_inputs(new_msgs, add_ass)).prompt;
-
-        if (fmt_past_msg.empty() || string_starts_with(fmt_new_msg, fmt_past_msg)) {
-            ss << fmt_new_msg.substr(fmt_past_msg.size(), fmt_new_msg.size() - fmt_past_msg.size());
-            return ss.str();
-        }
-
-        size_t common_prefix = 0;
-        const size_t max_prefix = fmt_past_msg.size() < fmt_new_msg.size() ? fmt_past_msg.size() : fmt_new_msg.size();
-        while (common_prefix < max_prefix && fmt_past_msg[common_prefix] == fmt_new_msg[common_prefix]) {
-            ++common_prefix;
-        }
-
-        LOG_WRN("chat template history is not a prefix of the new render; "
-                "falling back to common-prefix diff (past=%zu, new=%zu, common=%zu)\n",
-                fmt_past_msg.size(), fmt_new_msg.size(), common_prefix);
-        ss << fmt_new_msg.substr(common_prefix);
-        return ss.str();
-    };
-
-    auto chat_add_and_format = [&chat_msgs, &chat_format_single](const std::string & role, const std::string & content) {
+    auto chat_add_and_format = [&chat_msgs, &chat_templates](const std::string & role, const std::string & content) {
         common_chat_msg new_msg;
         new_msg.role = role;
         new_msg.content = content;
-        auto formatted = chat_format_single(chat_msgs, new_msg, role == "user");
+        auto formatted = common_chat_format_single(chat_templates.get(), chat_msgs, new_msg, role == "user", g_params->use_jinja);
         chat_msgs.push_back(new_msg);
         LOG_DBG("formatted: '%s'\n", formatted.c_str());
         return formatted;
@@ -375,8 +261,13 @@ int main(int argc, char ** argv) {
             }
 
             if (!params.system_prompt.empty() || !params.prompt.empty()) {
-                prompt = common_chat_templates_apply(chat_templates.get(),
-                                                     make_chat_inputs(chat_msgs, !params.prompt.empty())).prompt;
+                common_chat_templates_inputs inputs;
+                inputs.use_jinja = g_params->use_jinja;
+                inputs.messages = chat_msgs;
+                inputs.add_generation_prompt = !params.prompt.empty();
+                inputs.force_pure_content = params.force_pure_content_parser;
+
+                prompt = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
             }
         } else {
             // otherwise use the prompt as is
@@ -436,16 +327,10 @@ int main(int argc, char ** argv) {
                         __func__, n_match, embd_inp.size());
             }
 
-            if (session_tokens.size() == n_match) {
-                // [TAG_CONTEXT_STATE_LOGITS]
-                // in this case, we are going to reuse the logits from the session
-                // if we ever decide to remove the logits from the session, we need to handle this somehow
-                // ref: https://github.com/ggml-org/llama.cpp/pull/18862#issuecomment-3756330941
-            }
-
             // remove any "future" tokens that we might have inherited from the previous session
             if (session_tokens.size() > n_match) {
-                if (!llama_memory_seq_rm(mem, -1, n_match, -1)) {
+                llama_pos pos = n_match > 0 ? (llama_pos)(n_match - 1) : 0;
+                if (!llama_memory_seq_rm(mem, -1, pos, -1)) {
                     LOG_WRN("%s: unable to reuse common prefix (for example, when the memory is recurrent)\n", __func__);
                     llama_memory_clear(mem, true);
                     session_tokens.clear();
@@ -461,7 +346,7 @@ int main(int argc, char ** argv) {
         // Logits are not stored as part of the session state so we need to
         // "replay" the last token to get logits for sampling.
         if (!session_tokens.empty() && n_match > 0 && n_match == session_tokens.size()) {
-            if (!common_replay_last_token(ctx, session_tokens.back(), n_match)) {
+            if (!common_replay_last_token(ctx, session_tokens.back(), n_match - 1)) {
                 return 1;
             }
 
@@ -618,29 +503,10 @@ int main(int argc, char ** argv) {
     int n_consumed         = 0;
     int n_session_consumed = 0;
 
-    std::vector<int>   input_tokens;  g_input_tokens  = &input_tokens;
-    std::vector<int>   output_tokens; g_output_tokens = &output_tokens;
-    std::ostringstream output_ss;     g_output_ss     = &output_ss;
+    std::vector<int>   input_tokens;
+    std::vector<int>   output_tokens;
+    std::ostringstream output_ss;
     std::ostringstream assistant_ss; // for storing current assistant message, used in conversation mode
-
-    auto chat_add_assistant_response = [&chat_msgs, &chat_templates, &make_chat_inputs, &assistant_ss, &params]() {
-        const std::string response = assistant_ss.str();
-        try {
-            auto chat_params = common_chat_templates_apply(chat_templates.get(), make_chat_inputs(chat_msgs, true));
-            common_chat_parser_params parser_params(chat_params);
-            parser_params.reasoning_format = params.reasoning_format;
-
-            common_chat_msg assistant_msg = common_chat_parse(response, /* is_partial = */ false, parser_params);
-            assistant_msg.role = "assistant";
-            chat_msgs.push_back(assistant_msg);
-        } catch (const std::exception & e) {
-            LOG_WRN("failed to parse assistant response for chat history: %s; storing raw content\n", e.what());
-            common_chat_msg assistant_msg;
-            assistant_msg.role = "assistant";
-            assistant_msg.content = response;
-            chat_msgs.push_back(assistant_msg);
-        }
-    };
 
     // the first thing we will do is to output the prompt, so set color accordingly
     console::set_display(DISPLAY_TYPE_PROMPT);
@@ -777,12 +643,14 @@ int main(int argc, char ** argv) {
             if (!embd.empty()) {
                 const bool is_last_batch = (n_consumed >= (int) embd_inp.size());
                 const bool save_now = session_do_save && is_last_batch;
-                if (!common_prompt_batch_decode(ctx, embd, n_past, params.n_batch, path_session, save_now)) {
+                session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
+                if (!common_prompt_batch_decode(ctx, session_tokens, embd.size(), n_past, params.n_batch, path_session, save_now)) {
                     return 1;
                 }
-                session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
-                n_session_consumed = session_tokens.size();
-                session_do_save = false;
+                n_session_consumed += embd.size();
+                if (save_now) {
+                    session_do_save = false;
+                }
 
                 LOG_DBG("n_past = %d\n", n_past);
 
@@ -919,7 +787,7 @@ int main(int argc, char ** argv) {
                     }
 
                     if (params.enable_chat_template) {
-                        chat_add_assistant_response();
+                        chat_add_and_format("assistant", assistant_ss.str());
                     }
                     is_interacting = true;
                     LOG("\n");
@@ -1073,16 +941,16 @@ int main(int argc, char ** argv) {
 
     if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
         LOG("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
+        session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
         llama_state_save_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
+        LOG_INF("saved final session to %s, n_tokens = %zu\n", path_session.data(), session_tokens.size());
+
     }
 
     LOG("\n\n");
     common_perf_print(ctx, smpl);
 
     llama_backend_free();
-
-    ggml_threadpool_free_fn(threadpool);
-    ggml_threadpool_free_fn(threadpool_batch);
 
     return 0;
 }
