@@ -45,11 +45,13 @@ been measured on an XTX.
 
 ## Quick start
 
-**1. Model.** `Swift-Qwen3.8-27B-ROCMFPX-MQ-Q4S` (~15 GB): ROCmFP4 weights and
-the MTP head, with 61 sensitive tensors promoted to `Q6_0_ROCMFPX`, plus the
-f16 `mmproj` for vision. The
-[recipe and its tensor policy file](docs/rocmfpx/swift-qwen3.8-27b-mq-q4s.md)
-are in this repository; quantizing takes about 7 minutes on the CPU.
+**1. Model.** `ThinkingCap-Qwen3.8-27B-ROCMFPX-MQ-Q4S` (~15 GB): ROCmFP4
+weights and the MTP head, with 61 sensitive tensors promoted to
+`Q6_0_ROCMFPX`, plus the f16 `mmproj` for vision. ThinkingCap is BottleCap's
+Qwen3.8-27B fine-tune; at high reasoning effort it reaches the same answers
+with about a third fewer output tokens than other Qwen3.8-27B builds. The
+[recipe and its tensor policy file](docs/rocmfpx/thinkingcap-qwen3.8-27b-mq-q4s.md)
+are in this repository; quantizing takes about 4 minutes on the CPU.
 
 **2. Build** (ROCm 7.2 clang, Ninja; about 3 minutes):
 
@@ -74,7 +76,7 @@ set "PATH=%HIP_PATH%bin;%PATH%"
 set GGML_CUDA_NO_PINNED=1
 set LLAMA_MAX_QUEUED=3
 
-llama-server -m Swift-Qwen3.8-27B-ROCMFPX-MQ-Q4S.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
+llama-server -m ThinkingCap-Qwen3.8-27B-ROCMFPX-MQ-Q4S.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
   -dev ROCm0 -ngl 999 -fa on --jinja ^
   -c 81920 -np 1 -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -b 2048 -ub 256 ^
   --ctx-checkpoints 8 --checkpoint-min-step 2048 ^
