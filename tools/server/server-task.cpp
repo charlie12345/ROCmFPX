@@ -3052,10 +3052,31 @@ bool server_prompt_cache::load(
     size_t spec_boundary_best = base_boundary_valid ? prompt.tokens.size() : 0;
     bool ram_loaded = false;
 
+    // checkpoint salvage fallback: when every entry fails the spec-boundary
+    // check (the diverging tail exceeds the bounded recurrent-state rewind),
+    // an entry can still be restored from one of its context checkpoints -
+    // the checkpoint state covers [0, ckpt.n_tokens) exactly, so no rewind
+    // is needed and only [ckpt.n_tokens, request) is re-prefilled.
+    // only checkpoints with host-memory shadows qualify: the ON_DEVICE
+    // payloads are views into the live context memory and are clobbered as
+    // soon as the slot is reused by another task.
+    auto it_best_ckpt = states.end();
+    const common_prompt_checkpoint * ckpt_sel = nullptr;
+    size_t lcp_ckpt = 0;
+
     // Find the most similar RAM prompt first. On an equal match, the hot RAM
     // copy wins and avoids SSD I/O.
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+
+        if (spec_state_required) {
+            const auto * ckpt_cand = common_prompt_checkpoint_select_salvage(it->checkpoints, lcp_cur);
+            if (ckpt_cand != nullptr && (ckpt_sel == nullptr || ckpt_cand->n_tokens > ckpt_sel->n_tokens)) {
+                ckpt_sel     = ckpt_cand;
+                it_best_ckpt = it;
+                lcp_ckpt     = lcp_cur;
+            }
+        }
 
         if (!spec_boundary_valid(it->tokens.size(), lcp_cur)) {
             SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=ram lcp=%d cached_tokens=%zu request_tokens=%zu spec_bytes=%zu\n",
@@ -3184,6 +3205,60 @@ bool server_prompt_cache::load(
             *cache_hit = true;
         }
         ram_loaded = true;
+    }
+
+    if (it_best_ram == states.end() && it_best_disk == disk_states.end() && it_best_ckpt != states.end() && ckpt_sel != nullptr) {
+        const int64_t ckpt_n     = ckpt_sel->n_tokens;
+        const int64_t reprefill  = (int64_t) tokens_new.size() - ckpt_n;
+        std::vector<uint8_t> ckpt_spec_copy = ckpt_sel->data_spec;
+
+        SRV_INF(" - salvaging prompt via checkpoint: ckpt_tokens=%lld lcp=%zu request_tokens=%zu reprefill=%lld\n",
+                (long long) ckpt_n, lcp_ckpt, tokens_new.size(), (long long) reprefill);
+
+        if (!ckpt_sel->load_tgt_host(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+            SRV_WRN("failed to restore checkpoint target state (ckpt_tokens=%lld)\n", (long long) ckpt_n);
+            return false;
+        }
+
+        if (ctx_dft) {
+            if (!ckpt_sel->load_dft_host(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                SRV_WRN("failed to restore checkpoint draft state (ckpt_tokens=%lld)\n", (long long) ckpt_n);
+                return false;
+            }
+        }
+
+        // the slot seq may hold cells from the previous prompt beyond the
+        // checkpoint position; drop them so attention cannot reach stale
+        // memory (same pattern as the speculative replay path)
+        common_context_seq_rm(ctx_tgt, id_slot, ckpt_sel->pos_max + 1, -1);
+        if (ctx_dft) {
+            common_context_seq_rm(ctx_dft, id_slot, ckpt_sel->pos_max + 1, -1);
+        }
+
+        prompt = std::move(*it_best_ckpt);
+        states.erase(it_best_ckpt);
+
+        // the restored state covers [0, ckpt_n) only; drop everything that
+        // belongs to the diverging tail (tokens, later checkpoints, and the
+        // end-of-prompt state blobs)
+        prompt.tokens.keep_first(ckpt_n);
+        for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end(); ) {
+            if (it->n_tokens > ckpt_n) {
+                it = prompt.checkpoints.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        prompt.data.main.clear();
+        prompt.data.main.shrink_to_fit();
+        prompt.data.drft.clear();
+        prompt.data.drft.shrink_to_fit();
+        prompt.data.spec = std::move(ckpt_spec_copy);
+
+        if (cache_hit != nullptr) {
+            *cache_hit = true;
+        }
+        return true;
     }
 
     return base_boundary_valid || ram_loaded;

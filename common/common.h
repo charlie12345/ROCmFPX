@@ -14,6 +14,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <list>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -1075,6 +1076,14 @@ struct common_prompt_checkpoint {
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 
+    // host-memory shadows of the target/draft state, captured at checkpoint
+    // creation. unlike the ON_DEVICE payloads above (views into the live
+    // context memory, clobbered as soon as the slot is reused), these stay
+    // valid across slot reuse and are what the prompt-cache salvage restores
+    // from. only the newest few checkpoints keep them to bound memory.
+    std::vector<uint8_t> data_tgt_host;
+    std::vector<uint8_t> data_dft_host;
+
     // speculative-impl state at the checkpoint position (e.g. MTP boundary rows),
     // so a checkpoint restore can also rewind the draft bookkeeping
     std::vector<uint8_t> data_spec;
@@ -1111,6 +1120,14 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
+    // capture host-memory shadows of the target and draft state (see
+    // data_tgt_host / data_dft_host above)
+    void capture_host(
+            llama_context *       ctx_tgt,
+            llama_context *       ctx_dft,
+            llama_seq_id          seq_id,
+            llama_state_seq_flags flags);
+
     bool load_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
@@ -1121,6 +1138,49 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
+    // restore from the host shadows (see data_tgt_host / data_dft_host)
+    bool load_tgt_host(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+
+    bool load_dft_host(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+
     void clear_tgt();
     void clear_dft();
+
+    // drop the host shadows (e.g. to bound memory on older checkpoints)
+    void clear_host();
 };
+
+// Select the best context checkpoint for prompt-cache salvage from `checkpoints`.
+//
+// A checkpoint qualifies when its captured state covers [0, n_tokens) with
+// n_tokens <= lcp (restore needs no rewind; only [n_tokens, request) is
+// re-prefilled) and it carries host-memory shadows (data_tgt_host) plus
+// speculative-impl state (data_spec) — the ON_DEVICE payloads are views into
+// live context memory and are clobbered by slot reuse.
+//
+// The largest qualifying checkpoint wins; on equal n_tokens the first one in
+// the list wins. Returns nullptr when no checkpoint qualifies.
+inline const common_prompt_checkpoint * common_prompt_checkpoint_select_salvage(
+        const std::list<common_prompt_checkpoint> & checkpoints,
+        int64_t                                     lcp) {
+    const common_prompt_checkpoint * best = nullptr;
+    for (const auto & ckpt : checkpoints) {
+        if (best != nullptr && ckpt.n_tokens <= best->n_tokens) {
+            continue;
+        }
+        if (ckpt.n_tokens > lcp) {
+            continue;
+        }
+        if (ckpt.data_tgt_host.empty() || ckpt.data_spec.empty()) {
+            continue;
+        }
+        best = &ckpt;
+    }
+    return best;
+}
