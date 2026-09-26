@@ -1568,6 +1568,7 @@ class TextModel(ModelBase):
             # ref: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
             res = "qwen2"
         if chkhsh == "07e1c926f0e5833bd31ad4ce54099a4d3b2b99754a86eb14a33c60349b0e646e":
+            # ref: unreleased: Qwen4Exp tokenizer (no public HF repo yet)
             res = "qwen2"
         if chkhsh == "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f":
             # ref: https://huggingface.co/openbmb/MiniCPM-V-4_6
@@ -1622,7 +1623,7 @@ class TextModel(ModelBase):
             res = "command-r"
         if chkhsh == "d772b220ace2baec124bed8cfafce0ead7d6c38a4b65ef11261cf9d5d62246d1":
             # ref: https://huggingface.co/CohereLabs/tiny-aya-base
-            res = "tiny_aya"  # also used by cohere2moe / North Mini
+            res = "tiny_aya"
         if chkhsh == "e636dc30a262dcc0d8c323492e32ae2b70728f4df7dfe9737d9f920a282b8aea":
             # ref: https://huggingface.co/Qwen/Qwen1.5-7B
             res = "qwen2"
