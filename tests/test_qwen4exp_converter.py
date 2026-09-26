@@ -773,7 +773,6 @@ def test_qwen4exp_hc_norm_plus_one_and_shared_gate_squeeze(tmp_path: Path):
 
     base = load_file(str(st_path))
     hidden = base["model.embed_tokens.weight"].shape[1]
-    lowrank = base["model.layers.0.hc_attn_down.weight"].shape[0]
 
     renamed: dict[str, torch.Tensor] = {}
     for name, tensor in base.items():
@@ -881,4 +880,3 @@ def test_qwen4exp_hc_norm_plus_one_and_shared_gate_squeeze(tmp_path: Path):
     assert np.allclose(gate.data.astype(np.float32), raw_tensors["gate"].numpy().reshape(-1)), (
         "ffn_gate_inp_shexp values do not match shared_expert_gate row"
     )
-
