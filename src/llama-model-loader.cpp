@@ -407,10 +407,13 @@ static std::string llama_model_loader_compat_key(const std::string & key) {
             case GGUF_TYPE_UINT32:
             case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same<T,     int32_t>::value) ||
                                                 (std::is_same<T,    uint32_t>::value)); break;
+            case GGUF_TYPE_UINT64:
+            case GGUF_TYPE_INT64:   GGML_ASSERT((std::is_same<T,     int64_t>::value) ||
+                                                (std::is_same<T,    uint64_t>::value)); break;
             case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T,       float>::value)); break;
             case GGUF_TYPE_STRING:  GGML_ASSERT((std::is_same<T, std::string>::value)); break;
             default:
-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32 array", found_key.c_str()));
+                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64 array", found_key.c_str()));
         }
 
         if (arr_info.length > N_MAX) {
@@ -449,6 +452,8 @@ static std::string llama_model_loader_compat_key(const std::string & key) {
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<std::array<uint64_t, 8>>(enum llm_kv kid, std::array<uint64_t, 8> & result, bool required);
+    template bool llama_model_loader::get_arr<std::array<uint64_t, 64>>(enum llm_kv kid, std::array<uint64_t, 64> & result, bool required);
 
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
@@ -586,6 +591,9 @@ static std::string llama_model_loader_compat_key(const std::string & key) {
     template bool llama_model_loader::get_key_or_arr<std::array<int, 4>>(enum llm_kv kid, std::array<int, 4> & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum llm_kv kid, std::array<float, 512> & result, uint32_t n, bool required);
+    template bool llama_model_loader::get_key_or_arr<std::array<bool, 512>>(enum llm_kv kid, std::array<bool, 512> & result, uint32_t n, bool required);
+    template bool llama_model_loader::get_key_or_arr<std::array<int32_t, 1>>(enum llm_kv kid, std::array<int32_t, 1> & result, uint32_t n, bool required);
+    template bool llama_model_loader::get_key_or_arr<std::array<int32_t, 16>>(enum llm_kv kid, std::array<int32_t, 16> & result, uint32_t n, bool required);
 
 
 llama_model_loader::llama_model_loader(

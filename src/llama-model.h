@@ -125,6 +125,7 @@ enum llm_type {
     LLM_TYPE_35B_A3B, // Qwen3.5
     LLM_TYPE_48B_A3B, // Kimi Linear
     LLM_TYPE_80B_A3B, // Qwen3 Next
+    LLM_TYPE_A3B,     // Qwen4 Exp
     LLM_TYPE_100B_A6B,
     LLM_TYPE_124B_A5B, // Ling 3.0 flash
     LLM_TYPE_102B_A12B, // Solar-Open
@@ -506,6 +507,10 @@ struct llama_layer {
     struct ggml_tensor * indexer_proj     = nullptr;
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
+    struct ggml_tensor * index_q_proj     = nullptr;
+    struct ggml_tensor * index_k_proj     = nullptr;
+    struct ggml_tensor * index_q_norm     = nullptr;
+    struct ggml_tensor * index_k_norm     = nullptr;
     struct ggml_tensor * indexer_compressor_ape  = nullptr;
     struct ggml_tensor * indexer_compressor_kv   = nullptr;
     struct ggml_tensor * indexer_compressor_gate = nullptr;
@@ -518,6 +523,23 @@ struct llama_layer {
     struct ggml_tensor * hc_ffn_base   = nullptr;
     struct ggml_tensor * hc_ffn_fn     = nullptr;
     struct ggml_tensor * hc_ffn_scale  = nullptr;
+
+    struct ggml_tensor * hc_attn_norm   = nullptr;
+    struct ggml_tensor * hc_attn_down   = nullptr;
+    struct ggml_tensor * hc_attn_up     = nullptr;
+    struct ggml_tensor * hc_attn_inject = nullptr;
+    struct ggml_tensor * hc_ffn_norm    = nullptr;
+    struct ggml_tensor * hc_ffn_down    = nullptr;
+    struct ggml_tensor * hc_ffn_up      = nullptr;
+    struct ggml_tensor * hc_ffn_inject  = nullptr;
+
+    struct ggml_tensor * ple_key        = nullptr;
+    struct ggml_tensor * ple_value      = nullptr;
+    struct ggml_tensor * ple_norm_key   = nullptr;
+    struct ggml_tensor * ple_norm_query = nullptr;
+    struct ggml_tensor * ple_norm_conv  = nullptr;
+    struct ggml_tensor * ple_conv1d     = nullptr;
+    struct ggml_tensor * ple_ngram_embd = nullptr;
 
     // gemma4 layer output scale
     struct ggml_tensor * out_scale = nullptr;
@@ -578,6 +600,12 @@ struct llama_model {
     struct ggml_tensor * output_hc_base  = nullptr;
     struct ggml_tensor * output_hc_fn    = nullptr;
     struct ggml_tensor * output_hc_scale = nullptr;
+    struct ggml_tensor * hc_mix_norm     = nullptr;
+    struct ggml_tensor * hc_mix_down     = nullptr;
+    struct ggml_tensor * hc_mix_up       = nullptr;
+    struct ggml_tensor * hc_head_norm    = nullptr;
+    struct ggml_tensor * hc_head_down    = nullptr;
+    struct ggml_tensor * hc_head_up      = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
     struct ggml_tensor * aux_norm_enc    = nullptr;
     // dflash.decoder_arch == "laguna": enables the laguna-specific draft behaviors

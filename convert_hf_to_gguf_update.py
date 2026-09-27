@@ -185,6 +185,12 @@ pre_computed_hashes = [
     {"name": "falcon-h1", "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/tiiuae/Falcon-H1-34B-Base", "chkhsh": "48f8e02c0359c0bbdd82f26909171fac1c18a457bb47573ed1fe3bbb2c1cfd4b"},
     {"name": "kimi-k2",   "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/moonshotai/Kimi-K2-Base",   "chkhsh": "81212dc7cdb7e0c1074ca62c5aeab0d43c9f52b8a737be7b12a777c953027890"},
     {"name": "qwen2",     "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B", "chkhsh": "d4540891389ea895b53b399da6ac824becc30f2fba0e9ddbb98f92e55ca0e97c"},
+    # qwen4exp (Qwen4ExpForConditionalGeneration). Must be pre-computed for the same
+    # reason as the lfm2 entries above: the mapping was added by hand inside the
+    # generated get_vocab_base_pre(), so regeneration silently dropped it.
+    # The tokenizer ships with the Qwen4Exp checkpoint and has no public HF repo
+    # yet, hence a non-URL ref. Replace with the real repo once the model is published.
+    {"name": "qwen2",     "tokt": TOKENIZER_TYPE.BPE, "repo": "unreleased: Qwen4Exp tokenizer (no public HF repo yet)", "chkhsh": "07e1c926f0e5833bd31ad4ce54099a4d3b2b99754a86eb14a33c60349b0e646e"},
     {"name": "qwen35",    "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/openbmb/MiniCPM-V-4_6", "chkhsh": "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f"},
     {"name": "grok-2",    "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/alvarobartt/grok-2-tokenizer", "chkhsh": "66b8d4e19ab16c3bfd89bce5d785fb7e0155e8648708a1f42077cb9fe002c273"},
     # jina-v2-de variants

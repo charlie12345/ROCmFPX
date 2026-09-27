@@ -117,6 +117,16 @@ class TensorNameMap:
             "model.norm",                              # cogvlm
         ),
 
+        MODEL_TENSOR.HC_HEAD_NORM: (
+            "model.norm.hc_head_norm",
+        ),
+        MODEL_TENSOR.HC_HEAD_DOWN: (
+            "model.norm.hc_head_down",
+        ),
+        MODEL_TENSOR.HC_HEAD_UP: (
+            "model.norm.hc_head_up",
+        ),
+
         # Rope frequencies
         MODEL_TENSOR.ROPE_FREQS: (
             "rope.freqs",  # llama-pth
@@ -820,6 +830,7 @@ class TensorNameMap:
             "model.layers.{bid}.mamba.dt_proj",         # jamba falcon-h1 granite-hybrid
             "model.layers.layers.{bid}.mixer.dt_proj",  # plamo2
             "model.layers.{bid}.linear_attn.dt_proj",   # qwen3next
+            "model.layers.{bid}.linear_attn.dt_bias",   # qwen4exp (flash-next ships raw dt_bias)
             "backbone.layers.{bid}.mixer.dt",           # nemotron-h-moe
             "model.layers.{bid}.self_attn.dt_proj",     # kimi
         ),
@@ -1254,6 +1265,8 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.INDEXER_K_NORM: (
+            "model.layers.{bid}.indexer.k_norm",
+            "model.layers.{bid}.indexer.k_layernorm",
             "model.layers.{bid}.self_attn.indexer.k_norm", # DSA
         ),
 
@@ -1267,6 +1280,75 @@ class TensorNameMap:
 
         MODEL_TENSOR.INDEXER_ATTN_Q_B: (
             "model.layers.{bid}.self_attn.indexer.wq_b", # DSA
+        ),
+
+        MODEL_TENSOR.INDEXER_Q_NORM: (
+            "model.layers.{bid}.indexer.q_norm",
+            "model.layers.{bid}.indexer.q_layernorm",
+        ),
+
+        MODEL_TENSOR.INDEXER_Q_PROJ: (
+            "model.layers.{bid}.indexer.q_proj",
+        ),
+
+        MODEL_TENSOR.INDEXER_K_PROJ: (
+            "model.layers.{bid}.indexer.k_proj",
+        ),
+
+        MODEL_TENSOR.HC_ATTN_NORM: (
+            "model.layers.{bid}.hc_attn_norm",
+        ),
+
+        MODEL_TENSOR.HC_ATTN_DOWN: (
+            "model.layers.{bid}.hc_attn_down",
+        ),
+
+        MODEL_TENSOR.HC_ATTN_UP: (
+            "model.layers.{bid}.hc_attn_up",
+        ),
+
+        MODEL_TENSOR.HC_ATTN_INJECT: (
+            "model.layers.{bid}.hc_attn_inject",
+        ),
+
+        MODEL_TENSOR.HC_FFN_NORM: (
+            "model.layers.{bid}.hc_ffn_norm",
+        ),
+
+        MODEL_TENSOR.HC_FFN_DOWN: (
+            "model.layers.{bid}.hc_ffn_down",
+        ),
+
+        MODEL_TENSOR.HC_FFN_UP: (
+            "model.layers.{bid}.hc_ffn_up",
+        ),
+
+        MODEL_TENSOR.HC_FFN_INJECT: (
+            "model.layers.{bid}.hc_ffn_inject",
+        ),
+
+        MODEL_TENSOR.PLE_KEY: (
+            "model.layers.{bid}.ple.key",
+        ),
+
+        MODEL_TENSOR.PLE_VALUE: (
+            "model.layers.{bid}.ple.value",
+        ),
+
+        MODEL_TENSOR.PLE_NORM_KEY: (
+            "model.layers.{bid}.ple.norm_key",
+        ),
+
+        MODEL_TENSOR.PLE_NORM_QUERY: (
+            "model.layers.{bid}.ple.norm_query",
+        ),
+
+        MODEL_TENSOR.PLE_NORM_CONV: (
+            "model.layers.{bid}.ple.norm_conv",
+        ),
+
+        MODEL_TENSOR.PLE_CONV1D: (
+            "model.layers.{bid}.ple.conv1d",
         ),
 
         ############################################################################
