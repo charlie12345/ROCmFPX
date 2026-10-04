@@ -11,8 +11,10 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false) &&
-        !ml.get_arr("dflash.dflash.target_layer_ids", target_layer_ids, false)) {
-        throw std::runtime_error("DFlash model requires 'target_layers' or 'dflash.target_layer_ids' in GGUF metadata");
+        !ml.get_arr("dflash.dflash.target_layer_ids", target_layer_ids, false) &&
+        !ml.get_arr("dflash.capture_layer_ids", target_layer_ids, false) &&
+        !ml.get_arr("deepseek4-dflash-draft.dflash.capture_layer_ids", target_layer_ids, false)) {
+        throw std::runtime_error("DFlash model requires 'target_layers', 'dflash.target_layer_ids', or 'dflash.capture_layer_ids' in GGUF metadata");
     }
 
     // The encoder fc fuses the extracted target hidden states, so its input width is
@@ -25,6 +27,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     LLAMA_LOG_INFO("%s: DFlash n_embd_tgt = %u (draft n_embd = %u)\n", __func__, n_embd_tgt, hparams.n_embd);
 
     LLAMA_LOG_INFO("%s: DFlash extract_layers = [", __func__);
+    if (hparams.n_ctx_train == 0) hparams.n_ctx_train = 4096;
     for (size_t i = 0; i < target_layer_ids.size(); ++i) {
         LLAMA_LOG_INFO("%d%s", target_layer_ids[i], i + 1 < target_layer_ids.size() ? ", " : "");
     }
@@ -35,13 +38,28 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.n_hc, false);
     if (hparams.n_hc > 1) {
         ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
-        ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
+        if (!ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false)) {
+            hparams.n_swa = 4096;
+        }
         ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
         ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
         ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale);
-        ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm);
-        ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func);
-        ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,     hparams.swiglu_clamp_exp, hparams.n_layer);
+        if (!ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,    hparams.expert_weights_norm, false)) {
+            hparams.expert_weights_norm = 1.0f;
+        }
+        std::string gating_str;
+        if (ml.get_key(LLM_KV_EXPERT_GATING_FUNC, gating_str, false) && gating_str == "softmax") {
+            hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX;
+        } else if (ml.get_key(LLM_KV_EXPERT_GATING_FUNC, gating_str, false) && gating_str == "sigmoid") {
+            hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID;
+        } else if (ml.get_key(LLM_KV_EXPERT_GATING_FUNC, gating_str, false) && gating_str == "sqrtsoftplus") {
+            hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SQRTSOFTPLUS;
+        } else if (!ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func, false)) {
+            hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SQRTSOFTPLUS;
+        }
+        if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP, hparams.swiglu_clamp_exp, hparams.n_layer, false)) {
+            std::fill(hparams.swiglu_clamp_exp.begin(), hparams.swiglu_clamp_exp.end(), 1.0f);
+        }
         if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_clamp_shexp, hparams.n_layer, false)) {
             hparams.swiglu_clamp_shexp = hparams.swiglu_clamp_exp;
         }
@@ -106,6 +124,7 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader & ml) {
 
     // DSpark adds a Markov bias and a per-position confidence head to DFlash.
     const struct ggml_tensor * markov_meta = ml.get_tensor_meta("markov_w1.weight");
+    if (!markov_meta) markov_meta = ml.get_tensor_meta("dflash.dspark.markov.w1");
     if (markov_meta) {
         const int64_t dspark_markov_rank = markov_meta->ne[0];
 
@@ -301,6 +320,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     auto it = model.gguf_kv.find("dflash.block_size");
     if (it == model.gguf_kv.end()) {
         it = model.gguf_kv.find("dflash-draft.dflash.block_size");
+    }
+    if (it == model.gguf_kv.end()) {
+        it = model.gguf_kv.find("deepseek4-dflash-draft.dflash.block_size");
     }
     GGML_ASSERT(it != model.gguf_kv.end() && "DSpark draft requires dflash.block_size metadata");
     const int64_t block_size = std::stoi(it->second);
