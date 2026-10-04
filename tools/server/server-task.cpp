@@ -496,22 +496,40 @@ task_params server_task::params_from_json_cmpl(
     {
         const int32_t budget = json_value(data, "reasoning_budget_tokens", (int32_t) -1);
         const auto start_tag = json_value(data, "reasoning_budget_start_tag", std::string());
-        const auto end_tag   = json_value(data, "reasoning_budget_end_tag", std::string());
         const auto message   = json_value(data, "reasoning_budget_message", std::string());
         params.sampling.reasoning_budget_tokens = budget;
+
+        std::vector<std::string> end_tags;
+        if (data.contains("reasoning_budget_end_tags") && data.at("reasoning_budget_end_tags").is_array()) {
+            for (const auto & t : data.at("reasoning_budget_end_tags")) {
+                if (t.is_string()) {
+                    end_tags.push_back(t.get<std::string>());
+                }
+            }
+        } else {
+            const auto end_tag = json_value(data, "reasoning_budget_end_tag", std::string());
+            if (!end_tag.empty()) {
+                end_tags.push_back(end_tag);
+            }
+        }
 
         if (!start_tag.empty()) {
             params.sampling.reasoning_budget_start = common_tokenize(vocab, start_tag, false, true);
         }
-        if (!end_tag.empty()) {
-            params.sampling.reasoning_budget_end = common_tokenize(vocab, end_tag, false, true);
+        if (!end_tags.empty()) {
+            params.sampling.reasoning_budget_end.clear();
+            for (const auto & tag : end_tags) {
+                if (!tag.empty()) {
+                    params.sampling.reasoning_budget_end.push_back(common_tokenize(vocab, tag, false, true));
+                }
+            }
             // il template re-renderizza un turno assistant passato come
             // '<think>\n' + reasoning_content + '\n</think>\n\n': il '\n' prima dell'end tag
             // deve far parte della sequenza forzata, altrimenti un turno tagliato dal budget
             // non round-trippa nel resend del client e la prompt cache diverge alla chiusura
-            params.sampling.reasoning_budget_forced = common_tokenize(vocab, "\n" + message + end_tag, false, true);
+            params.sampling.reasoning_budget_forced = common_tokenize(vocab, "\n" + message + end_tags.front(), false, true);
 
-            SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu toks, forced=%zu toks\n",
+            SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu seqs, forced=%zu toks\n",
                 budget, params.sampling.generation_prompt.c_str(),
                 params.sampling.reasoning_budget_start.size(),
                 params.sampling.reasoning_budget_end.size(),
