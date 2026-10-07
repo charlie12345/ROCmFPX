@@ -1,3 +1,6 @@
+// TODO: merge with test-recurrent-state-rollback.cpp
+// TODO: merge with test-state-restore-fragmented.cpp
+
 #include "arg.h"
 #include "common.h"
 #include "log.h"
@@ -746,6 +749,112 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
 }
 
 
+// Test 10: state rotation
+// a KV state saved with attention rotation enabled must restore only into a context with the same setting;
+// Models without active rotation are explicitly skipped after comparing both saved states.
+static bool test_state_rotation(struct llama_model * model, const struct common_params & params) {
+    LOGV(LOG_LEVEL_INFO, "\n=== Test 10: state rotation ===\n");
+
+    struct env_restore {
+        std::string value = common_get_env("LLAMA_ATTN_ROT_DISABLE");
+        ~env_restore() { common_set_env("LLAMA_ATTN_ROT_DISABLE", value); }
+    } restore_env;
+    const auto make_context = [&](ggml_type type_k, ggml_type type_v, bool disable_rotation) {
+        common_set_env("LLAMA_ATTN_ROT_DISABLE", disable_rotation ? "1" : "0");
+        auto params_ctx = common_context_params_to_llama(params);
+        params_ctx.n_ctx    = 32;
+        params_ctx.n_batch  = 1;
+        params_ctx.n_ubatch = 1;
+        params_ctx.type_k   = type_k;
+        params_ctx.type_v   = type_v;
+        params_ctx.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        return llama_context_ptr(llama_init_from_model(model, params_ctx));
+    };
+
+    std::vector<std::pair<ggml_type, ggml_type>> type_pairs;
+    for (const auto & types : { std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0} }) {
+        if (make_context(types.first, types.second, false)) {
+            type_pairs.push_back(types);
+        }
+    }
+    if (type_pairs.empty()) {
+        LOG_WRN("%s: no supported quantized KV cache type combination - skipping\n", __func__);
+        return true;
+    }
+
+    bool success = true;
+    for (const auto & types : type_pairs) {
+        auto src = make_context(types.first, types.second, false);
+        if (!src) {
+            LOG_ERR("%s: failed to create source context\n", __func__);
+            success = false;
+            break;
+        }
+
+        llama_token token = 0;
+        if (llama_decode(src.get(), llama_batch_get_one(&token, 1))) {
+            LOG_ERR("%s: failed to decode token\n", __func__);
+            success = false;
+            break;
+        }
+
+        const size_t state_size = llama_state_seq_get_size(src.get(), 0);
+        if (state_size == 0) {
+            continue; // no KV state to test
+        }
+
+        std::vector<uint8_t> state(state_size);
+        if (llama_state_seq_get_data(src.get(), state.data(), state.size(), 0) != state.size()) {
+            LOG_ERR("%s: failed to save sequence state\n", __func__);
+            success = false;
+            break;
+        }
+
+        auto matching = make_context(types.first, types.second, false);
+        if (!matching || llama_state_seq_set_data(matching.get(), state.data(), state.size(), 0) != state.size()) {
+            LOG_ERR("%s: failed to restore matching rotation\n", __func__);
+            success = false;
+            break;
+        }
+
+        auto mismatched = make_context(types.first, types.second, true);
+        if (!mismatched) {
+            LOG_ERR("%s: failed to create mismatched rotation context\n", __func__);
+            success = false;
+            break;
+        }
+        if (llama_decode(mismatched.get(), llama_batch_get_one(&token, 1))) {
+            LOG_ERR("%s: failed to decode without rotation\n", __func__);
+            success = false;
+            break;
+        }
+        std::vector<uint8_t> unrotated(llama_state_seq_get_size(mismatched.get(), 0));
+        if (llama_state_seq_get_data(mismatched.get(), unrotated.data(), unrotated.size(), 0) != unrotated.size()) {
+            LOG_ERR("%s: failed to save rotation-disabled state\n", __func__);
+            success = false;
+            break;
+        }
+        if (unrotated == state) {
+            LOG_WRN("%s: identical enabled/disabled states, no active rotation - skipping mismatch check\n", __func__);
+            continue;
+        }
+        llama_memory_clear(llama_get_memory(mismatched.get()), true);
+        if (llama_state_seq_set_data(mismatched.get(), state.data(), state.size(), 0) != 0) {
+            LOG_ERR("%s: restoring incompatible rotation did not fail\n", __func__);
+            success = false;
+            break;
+        }
+        LOG_TRC("%s: incompatible rotation rejected\n", __func__);
+    }
+
+    if (!success) {
+        return false;
+    }
+
+    LOGV(LOG_LEVEL_INFO, "\nPASS\n");
+    return true;
+}
+
 struct test_suite {
     std::vector<test_status> results;
 
@@ -756,10 +865,10 @@ struct test_suite {
 
 // column headers for the --models table, one per test, in the order they are run
 static const std::vector<const char *> test_names = {
-    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf",
+    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf", "rot",
 };
 
-// Run the full save/load test suite (tests 1-9) for a single model.
+// Run the full save/load test suite (tests 1-10) for a single model.
 // Returns the per-test results.
 static test_suite run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     test_suite suite;
@@ -837,6 +946,9 @@ static test_suite run_save_load_tests_for_model(const std::string & model_path, 
 
     // Test 9: state restore failure
     suite.results.push_back(test_state_restore_failure(model, params, tokens) ? test_status::PASS : test_status::FAIL);
+
+    // Test 10: state rotation
+    suite.results.push_back(test_state_rotation(model, params) ? test_status::PASS : test_status::FAIL);
 
     return suite;
 }

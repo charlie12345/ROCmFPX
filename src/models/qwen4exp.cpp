@@ -221,11 +221,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int64_t hc_dim = hc * n_embd;
     const int64_t hc_lr  = hparams.hc_low_rank;
 
-    const bool mtp_only    = !ml.files.empty() && (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr);
-    if (mtp_only && !ml.load_mtp) {
+    const auto nf = nextn_flags(ml, LLM_TENSOR_HC_ATTN_NORM);
+    if ((nf.trunk & TENSOR_NOT_REQUIRED) && !ml.load_mtp) {
         throw std::runtime_error("qwen4exp MTP-only weights must be loaded as a draft model");
     }
-    const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+    const int trunk_flags = nf.trunk;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
 
@@ -296,7 +296,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
     }
 
-    const int mtp_flags = !ml.load_mtp ? TENSOR_SKIP | TENSOR_SKIP_IF_VIRTUAL : 0;
+    const int mtp_flags = nf.mtp;
 
     for (int il = 0; il < (int) hparams.n_layer_all; ++il) {
         if (il >= n_layer && ml.files.empty() && !ml.load_mtp) {
@@ -575,9 +575,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
-        const bool gather_now = !cparams.embeddings_nextn || cparams.embeddings_nextn_masked;
-
-        if (il == n_layer - 1 && inp_out_ids && gather_now) {
+        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
             // everything below is per token, so drop the rows that produce no output
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
@@ -605,18 +603,15 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         cb(res_hc, "l_last", il);
     }
 
-    // The draft head consumes the final wide residual, before the LM-head mixer collapses it.
-    // An unmasked request needs every position, so defer the output-row crop until after this
-    // hand-over.
-    if (cparams.embeddings_nextn) {
-        res->t_h_nextn = res_hc;
-        cb(res->t_h_nextn, "h_nextn", -1);
+    // the MTP head reads the hc-wide residual, before the final mixer
+    res->t_h_nextn = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+    cb(res->t_h_nextn, "h_nextn", -1);
+    ggml_build_forward_expand(gf, res->t_h_nextn);
 
-        if (!cparams.embeddings_nextn_masked && inp_out_ids) {
-            res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
-            res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
-            res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
-        }
+    if (crop_after_nextn(inp_out_ids)) {
+        res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+        res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
+        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
     }
 
     // the final mixer is the output norm: there is no separate one
@@ -719,7 +714,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             // the MTP graph has no recurrent layers, so the hybrid input's recurrent tensors are never used and the
             // allocator skips them -- set_input would then hit a null buffer. Give them a trivial use.
             auto * rs = inp_hyb->get_recr();
-            for (ggml_tensor * t : { rs->s_copy, rs->s_copy_main, rs->s_copy_extra }) {
+            for (ggml_tensor * t : { rs->s_copy, rs->s_copy_main, rs->s_copy_tail }) {
                 if (t) { ggml_build_forward_expand(gf, ggml_scale(ctx0, ggml_cast(ctx0, t, GGML_TYPE_F32), 0.0f)); }
             }
         }
@@ -1915,7 +1910,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         ? (llama_token) hp.ple_image_token_id
         : (llama_token) hp.ple_eos_token_id;
     auto tok_of = [&](int64_t k) -> llama_token {
-        return ubatch->token ? ubatch->token[k] : img_tok;
+        const bool is_embd = !ubatch->token || (ubatch->is_mixed() && ubatch->type[k]);
+        return is_embd ? img_tok : ubatch->token[k];
     };
 
     const int64_t n_tokens = ubatch->n_tokens;
