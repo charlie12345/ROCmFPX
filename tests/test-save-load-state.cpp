@@ -609,7 +609,9 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
     params_ctx.n_seq_max  = 4;
     params_ctx.kv_unified = true;
 
-    // without flash attention, corrupted data left behind by the restore shows up as NaN logits on the other sequences
+    // NaN corruption needs floating-point KV; non-Flash Attention exposes leaked NaNs on other sequences.
+    params_ctx.type_k = GGML_TYPE_F16;
+    params_ctx.type_v = GGML_TYPE_F16;
     params_ctx.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};

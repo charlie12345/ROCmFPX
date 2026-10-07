@@ -2851,6 +2851,20 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
+static int64_t llama_io_device_n_elements(const ggml_tensor * tensor, size_t offset, size_t size) {
+    const size_t type_size = ggml_type_size(tensor->type);
+    const size_t block_size = ggml_blck_size(tensor->type);
+    const size_t tensor_size = ggml_nbytes(tensor);
+
+    GGML_ASSERT(offset <= tensor_size && size <= tensor_size - offset);
+    GGML_ASSERT(offset % type_size == 0 && size % type_size == 0);
+    const size_t n_blocks = size / type_size;
+    GGML_ASSERT(n_blocks <= (uint64_t) std::numeric_limits<int64_t>::max() / block_size);
+
+    // Quantized type sizes count bytes per block, not per value.
+    return (int64_t) n_blocks * (int64_t) block_size;
+}
+
 class llama_io_write_device : public llama_io_write_i {
 public:
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
@@ -2882,7 +2896,7 @@ public:
         for (const auto & winfo : winfos) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
+            const int64_t n = llama_io_device_n_elements(winfo.tensor, winfo.offset, winfo.size);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -3013,7 +3027,7 @@ public:
         for (const auto & rinfo : rinfos) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
-            const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
+            const int64_t n = llama_io_device_n_elements(rinfo.tensor, rinfo.offset, rinfo.size);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -3069,6 +3083,7 @@ public:
             size_t dst_base = 0;
 
             while (src_pos < total) {
+                GGML_ASSERT(src_j < mbuf_cur.cpy.size() && dst_i < mbuf.org.size());
                 const auto & src_t = mbuf_cur.cpy[src_j];
                 const auto & dst_t = mbuf.org[dst_i];
 
@@ -3078,10 +3093,12 @@ public:
                 const size_t src_off  = src_pos - src_base;
                 const size_t dst_off  = dst_pos - dst_base;
 
+                GGML_ASSERT(src_off <= src_size && dst_off <= dst_size);
                 const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
 
-                const size_t   el   = ggml_element_size(src_t);
-                const int64_t n_el = (int64_t) (n_copy / el);
+                GGML_ASSERT(src_t->type == dst_t->type);
+                const int64_t n_el = llama_io_device_n_elements(src_t, src_off, n_copy);
+                GGML_ASSERT(n_el == llama_io_device_n_elements(dst_t, dst_off, n_copy));
 
                 auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
                 ggml_backend_view_init(src_v);
