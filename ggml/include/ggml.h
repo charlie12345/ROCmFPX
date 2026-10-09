@@ -639,6 +639,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_FLASH_ATTN_EXT_PARTIAL,
+        GGML_OP_ATTN_MERGE,
+
         GGML_OP_COUNT,
     };
 
@@ -2531,6 +2534,16 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // Partial state layout per row: [unnormalized numerator, maximum score, exponential sum].
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_partial(
+            struct ggml_context * ctx, struct ggml_tensor * q, struct ggml_tensor * k,
+            struct ggml_tensor * v, struct ggml_tensor * mask,
+            float scale, float max_bias, float logit_softcap);
+
+    // Merge two partial states. Normalize only on the final merge.
+    GGML_API struct ggml_tensor * ggml_attn_merge(
+            struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b, bool normalize);
 
     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

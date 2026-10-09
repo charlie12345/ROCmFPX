@@ -58,6 +58,25 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
     }
 }
 
+std::vector<float> llama_kv_cache_hadamard(int64_t n) {
+    std::vector<float> result(n*n);
+
+    ggml_init_params params = {
+        /* .mem_size   = */ 1*ggml_tensor_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(params) };
+
+    ggml_tensor * tmp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n, n);
+    tmp->data = result.data();
+
+    ggml_gen_hadamard(tmp);
+
+    return result;
+}
+
 //
 // llama_kv_cache
 //

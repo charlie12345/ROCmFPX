@@ -10,6 +10,8 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-kv-cache-recency.h"
+#include "../src/llama-memory-hybrid-idx.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
@@ -525,7 +527,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, bool mtp = false) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, bool mtp = false, bool kv_recency = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -540,6 +542,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.kv_recency = kv_recency;
     if (mtp) {
         ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
@@ -589,6 +592,366 @@ static std::vector<float> get_logits(
         }
     }
     return ret;
+}
+
+// GLM5-next latents in the elastic recency store against the ordinary q8_0 latent cache, through the sparse indexer mask.
+// Decodes tokens at consecutive positions from begin and returns their logits.
+static std::vector<float> recency_decode_at(llama_context * lctx, const std::vector<llama_token> & tokens, llama_pos begin) {
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(lctx)));
+    common_batch batch(lctx);
+    for (size_t i = 0; i < tokens.size(); i++) {
+        batch.add(tokens[i], begin + llama_pos(i), 0, true);
+    }
+    if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+        throw std::runtime_error("failed to decode recency continuation");
+    }
+    std::vector<float> ret;
+    for (size_t i = 0; i < tokens.size(); i++) {
+        const float * logits = llama_get_logits_ith(lctx, int32_t(i));
+        ret.insert(ret.end(), logits, logits + n_vocab);
+    }
+    return ret;
+}
+
+// Saves src's sequence 0, restores it into dst, and checks that both continue with the same logits.
+// mismatched must refuse the state and keep its own history; foreign is a state of another cache layout.
+static bool recency_state_round_trip(llama_context * src, llama_context * dst, llama_context * mismatched,
+                                     const std::vector<uint8_t> & foreign, const std::vector<llama_token> & more, const char * name) {
+    std::vector<uint8_t> state(llama_state_seq_get_size(src, 0));
+    const bool saved = !state.empty() && llama_state_seq_get_data(src, state.data(), state.size(), 0) == state.size();
+    const bool loaded = saved && llama_state_seq_set_data(dst, state.data(), state.size(), 0) == state.size();
+    const llama_pos end = llama_memory_seq_pos_max(llama_get_memory(src), 0) + 1;
+    float diff = -1.0f;
+    if (loaded && llama_memory_seq_pos_max(llama_get_memory(dst), 0) + 1 == end) {
+        const auto a = recency_decode_at(src, more, end);
+        const auto b = recency_decode_at(dst, more, end);
+        diff = 0.0f;
+        for (size_t i = 0; i < a.size(); ++i) {
+            diff = std::max(diff, std::abs(a[i] - b[i]));
+        }
+    }
+    const llama_pos kept = llama_memory_seq_pos_max(llama_get_memory(mismatched), 0);
+    const bool refused = llama_state_seq_set_data(mismatched, state.data(), state.size(), 0) == 0 &&
+                         llama_memory_seq_pos_max(llama_get_memory(mismatched), 0) == kept &&
+                         llama_state_seq_set_data(dst, foreign.data(), foreign.size(), 0) == 0;
+    std::fprintf(stderr, "%s state: %zu bytes, restored continuation max diff %g, mismatched geometry and foreign state refused %d\n",
+                 name, state.size(), diff, refused);
+    // the same rows in the same ring slots give bit-identical logits
+    return loaded && diff == 0.0f && refused;
+}
+
+static bool test_recency_glm(const size_t seed, const float stdev) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &tensor_params, model_params));
+    const auto make_ctx = [&](bool recency, const char * hot, const char * slab) {
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx = 2048;
+        params.n_batch = 2048;
+        params.n_ubatch = recency || std::string(hot).empty() ? 64 : 32;
+        params.n_seq_max = 1;
+        params.n_threads = 4;
+        params.n_threads_batch = 4;
+        params.type_k = GGML_TYPE_Q8_0;
+        params.type_v = GGML_TYPE_Q8_0;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        params.kv_recency = recency;
+        params.n_rs_seq = 4; // recurrent rollback checkpoints for rejected drafts
+        setenv("LLAMA_KV_RECENCY_HOT", hot, 1);
+        setenv("LLAMA_KV_RECENCY_SLAB", slab, 1);
+        llama_context_ptr lctx(llama_init_from_model(model.get(), params));
+        unsetenv("LLAMA_KV_RECENCY_HOT");
+        unsetenv("LLAMA_KV_RECENCY_SLAB");
+        if (!lctx) {
+            throw std::runtime_error("failed to create GLM recency comparison context");
+        }
+        return lctx;
+    };
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const auto tokens = get_tokens(2000, n_vocab, seed);
+    const auto decode = [&](llama_context * lctx, uint32_t begin) {
+        common_batch batch(lctx);
+        for (uint32_t pos = begin; pos < tokens.size(); pos++) {
+            batch.add(tokens[pos], pos, 0, true);
+        }
+        if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            throw std::runtime_error("failed to decode GLM recency comparison batch");
+        }
+        std::vector<float> ret;
+        for (uint32_t i = 0; i < tokens.size() - begin; i++) {
+            const float * logits = llama_get_logits_ith(lctx, i);
+            ret.insert(ret.end(), logits, logits + n_vocab);
+        }
+        return ret;
+    };
+    const auto compare = [&](const std::vector<float> & a, const std::vector<float> & b, float & max_diff) {
+        uint32_t agree = 0;
+        max_diff = 0.0f;
+        for (size_t t = 0; t < a.size()/n_vocab; ++t) {
+            const float * x = a.data() + t*n_vocab;
+            const float * y = b.data() + t*n_vocab;
+            for (uint32_t j = 0; j < n_vocab; ++j) {
+                max_diff = std::max(max_diff, std::abs(x[j] - y[j]));
+            }
+            agree += std::max_element(x, x + n_vocab) - x == std::max_element(y, y + n_vocab) - y;
+        }
+        return agree;
+    };
+    const auto latent_of = [](llama_context * lctx) {
+        auto * hybrid = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(lctx));
+        return hybrid ? hybrid->get_latent() : nullptr;
+    };
+    auto normal = make_ctx(false, "", "");
+    const auto reference = decode(normal.get(), 0);
+    // the ordinary path against itself at another ubatch size: kernel shapes alone move this fixture this much on GPUs
+    float diff_spread = 0.0f;
+    uint32_t agree_spread = 0;
+    {
+        auto other = make_ctx(false, "ubatch 32", "");
+        agree_spread = compare(reference, decode(other.get(), 0), diff_spread);
+    }
+
+    // nothing ages: the whole history is one q8_0 ring region
+    auto unaged = make_ctx(true, "2048", "256");
+    if (!latent_of(unaged.get())) {
+        std::fprintf(stderr, "FAIL GLM recency latents were not attached\n");
+        return false;
+    }
+    float diff_unaged = 0.0f;
+    const uint32_t agree_unaged = compare(reference, decode(unaged.get(), 0), diff_unaged);
+
+    // hot 256: pages age into many q4_0 slabs while the batch decodes
+    auto aged = make_ctx(true, "256", "256");
+    const auto aged_logits = decode(aged.get(), 0);
+    float diff_aged = 0.0f;
+    const uint32_t agree_aged = compare(reference, aged_logits, diff_aged);
+    const auto aged_stats = latent_of(aged.get())->get_migration_stats();
+
+    // a 1536-token q4_0 slab is only partly published: its other pages still live in the q8_0 ring
+    auto partial_slab = make_ctx(true, "256", "1536");
+    float diff_partial = 0.0f;
+    const uint32_t agree_partial = compare(reference, decode(partial_slab.get(), 0), diff_partial);
+    const auto partial_stats = latent_of(partial_slab.get())->get_migration_stats();
+    std::fprintf(stderr, "recency glm: partly published q4_0 slab max diff %g agree %u/2000, cold pages %u\n",
+                 diff_partial, agree_partial, partial_stats.cold_pages);
+    std::fprintf(stderr, "recency glm: ordinary ubatch spread max diff %g agree %u/2000; unaged max diff %g agree %u/2000; aged max diff %g agree %u/2000, cold pages %u\n",
+                 diff_spread, agree_spread, diff_unaged, agree_unaged, diff_aged, agree_aged, aged_stats.cold_pages);
+
+    // a rejected draft: roll the last three tokens back through the recurrent checkpoints and the q8_0 ring, then redo them
+    auto * memory = llama_get_memory(aged.get());
+    auto * normal_memory = llama_get_memory(normal.get());
+    if (!memory->seq_rm(0, 1997, -1) || memory->seq_pos_max(0) != 1996) {
+        std::fprintf(stderr, "FAIL GLM recency rejected-draft rollback\n");
+        return false;
+    }
+    const auto redo = decode(aged.get(), 1997);
+    float diff_redo = 0.0f;
+    const uint32_t agree_redo = compare(std::vector<float>(aged_logits.end() - redo.size(), aged_logits.end()), redo, diff_redo);
+    // deeper removals are refused like the ordinary cache refuses them (recurrent state), and never split a q4_0 page
+    const bool refused = !memory->seq_rm(0, 1950, -1) && !normal_memory->seq_rm(0, 1950, -1) &&
+                         !memory->seq_rm(0, 300, -1) && memory->seq_pos_max(0) == 1999;
+    const bool no_shift = !memory->get_can_shift();
+    std::fprintf(stderr, "recency glm: redo max diff %g agree %u/3, deep removal refused %d, shift refused %d\n",
+                 diff_redo, agree_redo, refused, no_shift);
+
+    // versioned state: aged q4_0 pages, the q8_0 ring, recurrent state and indexer rows restore into a fresh context
+    const auto more = get_tokens(40, n_vocab, seed + 1);
+    std::vector<uint8_t> foreign(llama_state_seq_get_size(normal.get(), 0));
+    llama_state_seq_get_data(normal.get(), foreign.data(), foreign.size(), 0);
+    auto restored = make_ctx(true, "256", "256");
+    auto mismatched = make_ctx(true, "512", "256"); // valid cell layout, other frozen geometry
+    recency_decode_at(mismatched.get(), std::vector<llama_token>(tokens.begin(), tokens.begin() + 300), 0);
+    const bool state = recency_state_round_trip(aged.get(), restored.get(), mismatched.get(), foreign, more, "recency glm");
+    // unaged must stay within the ordinary path's own shape spread; aging may add a bounded q4_0 error on top.
+    // first measurements: CPU unaged 0 and 2000/2000, aged 6.7e-3 and 1982/2000; ROCm spread 7.8e-2 and 1910/2000
+    const float diff_bound = std::max(1e-3f, diff_spread);
+    return aged_stats.cold_pages > 0 && diff_unaged <= diff_bound && agree_unaged >= std::min(agree_spread, 2000u) &&
+           diff_aged <= std::max(5e-2f, 2*diff_spread) && agree_aged + 30 >= std::min(agree_spread, 2000u) &&
+           partial_stats.cold_pages % 6 != 0 && diff_partial <= std::max(5e-2f, 2*diff_spread) && agree_partial + 30 >= std::min(agree_spread, 2000u) &&
+           diff_redo <= 1e-3f && agree_redo == 3 && refused && no_shift && state;
+}
+
+// Live elastic recency cache against the ordinary q8_0 cache on one model.
+static bool test_recency_live(const size_t seed, const float stdev) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &tensor_params, model_params));
+    const auto make_ctx = [&](bool recency, const char * hot, const char * slab) {
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx = 2048;
+        params.n_batch = 2048;
+        params.n_ubatch = 64;
+        params.n_seq_max = 1;
+        params.n_threads = 4;
+        params.n_threads_batch = 4;
+        params.type_k = GGML_TYPE_Q8_0;
+        params.type_v = GGML_TYPE_Q8_0;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        params.kv_recency = recency;
+        setenv("LLAMA_KV_RECENCY_HOT", hot, 1);
+        setenv("LLAMA_KV_RECENCY_SLAB", slab, 1);
+        llama_context_ptr lctx(llama_init_from_model(model.get(), params));
+        unsetenv("LLAMA_KV_RECENCY_HOT");
+        unsetenv("LLAMA_KV_RECENCY_SLAB");
+        if (!lctx) {
+            throw std::runtime_error("failed to create recency comparison context");
+        }
+        return lctx;
+    };
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const auto tokens = get_tokens(2000, n_vocab, seed);
+    const auto decode = [&](llama_context * lctx, uint32_t begin) {
+        common_batch batch(lctx);
+        for (uint32_t pos = begin; pos < tokens.size(); pos++) {
+            batch.add(tokens[pos], pos, 0, true);
+        }
+        if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            throw std::runtime_error("failed to decode recency comparison batch");
+        }
+        std::vector<float> ret;
+        for (uint32_t i = 0; i < tokens.size() - begin; i++) {
+            const float * logits = llama_get_logits_ith(lctx, i);
+            ret.insert(ret.end(), logits, logits + n_vocab);
+        }
+        return ret;
+    };
+    // largest logit difference and top-1 agreement, per token
+    const auto compare = [&](const std::vector<float> & a, const std::vector<float> & b, float & max_diff) {
+        uint32_t agree = 0;
+        max_diff = 0.0f;
+        for (size_t t = 0; t < a.size()/n_vocab; ++t) {
+            const float * x = a.data() + t*n_vocab;
+            const float * y = b.data() + t*n_vocab;
+            for (uint32_t j = 0; j < n_vocab; ++j) {
+                max_diff = std::max(max_diff, std::abs(x[j] - y[j]));
+            }
+            agree += std::max_element(x, x + n_vocab) - x == std::max_element(y, y + n_vocab) - y;
+        }
+        return agree;
+    };
+    auto normal = make_ctx(false, "", "");
+    const auto reference = decode(normal.get(), 0);
+    size_t normal_bytes = 0;
+    for (const auto & entry : llama_get_memory(normal.get())->memory_breakdown()) { normal_bytes += entry.second; }
+
+    // nothing ages: eight q8_0 slabs exercise the partial attention and merge path without q4_0 error
+    auto unaged = make_ctx(true, "2048", "256");
+    auto * unaged_memory = dynamic_cast<llama_kv_cache_recency_live *>(llama_get_memory(unaged.get()));
+    if (!unaged_memory) {
+        std::fprintf(stderr, "FAIL live recency cache was not installed\n");
+        return false;
+    }
+    float diff_unaged = 0.0f;
+    const uint32_t agree_unaged = compare(reference, decode(unaged.get(), 0), diff_unaged);
+    const auto unaged_stats = unaged_memory->get_store().get_migration_stats();
+
+    // hot 256: pages age to q4_0 while the batch decodes
+    auto aged = make_ctx(true, "256", "256");
+    auto * aged_memory = dynamic_cast<llama_kv_cache_recency_live *>(llama_get_memory(aged.get()));
+    const auto aged_logits = decode(aged.get(), 0);
+    float diff_aged = 0.0f;
+    const uint32_t agree_aged = compare(reference, aged_logits, diff_aged);
+    const auto aged_stats = aged_memory->get_store().get_migration_stats();
+    size_t aged_bytes = 0;
+    for (const auto & entry : aged_memory->memory_breakdown()) { aged_bytes += entry.second; }
+    std::fprintf(stderr, "recency live: unaged max diff %g agree %u/2000 (q8 slabs %u); aged max diff %g agree %u/2000, cold pages %u, bytes %zu vs %zu\n",
+                 diff_unaged, agree_unaged, unaged_stats.hot_pages, diff_aged, agree_aged, aged_stats.cold_pages, aged_bytes, normal_bytes);
+
+    // versioned state round trip of the aged history, before the tail removals below
+    const auto more = get_tokens(40, n_vocab, seed + 1);
+    std::vector<uint8_t> foreign(llama_state_seq_get_size(normal.get(), 0));
+    llama_state_seq_get_data(normal.get(), foreign.data(), foreign.size(), 0);
+    bool state = false;
+    {
+        auto restored = make_ctx(true, "256", "256");
+        auto mismatched = make_ctx(true, "512", "256"); // valid cell layout, other frozen geometry
+        recency_decode_at(mismatched.get(), std::vector<llama_token>(tokens.begin(), tokens.begin() + 300), 0);
+        state = recency_state_round_trip(aged.get(), restored.get(), mismatched.get(), foreign, more, "recency live");
+        // the continuation is not part of the redo check below
+        llama_memory_seq_rm(llama_get_memory(aged.get()), 0, 2000, -1);
+    }
+
+    // tail removal inside the q8 ring, then the same tokens again
+    auto * memory = llama_get_memory(aged.get());
+    if (!memory->seq_rm(0, 1950, -1) || memory->seq_pos_max(0) != 1949) {
+        std::fprintf(stderr, "FAIL live recency tail removal\n");
+        return false;
+    }
+    const auto redo = decode(aged.get(), 1950);
+    float diff_redo = 0.0f;
+    const uint32_t agree_redo = compare(std::vector<float>(aged_logits.end() - redo.size(), aged_logits.end()), redo, diff_redo);
+    const bool refused = !memory->seq_rm(0, 300, -1) && memory->seq_pos_max(0) == 1999;
+    const bool boundary = memory->seq_rm(0, 256, -1) && memory->seq_pos_max(0) == 255 && memory->seq_pos_min(0) == 0;
+    const bool no_shift = !memory->get_can_shift();
+    std::fprintf(stderr, "recency live: redo max diff %g agree %u/50, q4 split refused %d, cold boundary %d, shift refused %d\n",
+                 diff_redo, agree_redo, refused, boundary, no_shift);
+    // measured: unaged 1.2e-7 (CPU) and 1.3e-4 (ROCm, different FA kernels) with 2000/2000, aged 1.0e-3 and 1997/2000, redo 0
+    return unaged_stats.cold_pages == 0 && diff_unaged <= 1e-3f && agree_unaged == 2000 &&
+           aged_stats.cold_pages > 0 && diff_aged <= 1e-2f && agree_aged >= 1990 &&
+           diff_redo <= 1e-5f && agree_redo == 50 && refused && boundary && no_shift && state;
+}
+
+static bool test_recency_delegate(const size_t seed, const float stdev) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    auto normal = get_model_and_ctx(gguf.get(), nullptr, seed, stdev, {});
+    auto wrapped = get_model_and_ctx(gguf.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, false, nullptr, false, true);
+    auto * recency = dynamic_cast<llama_kv_cache_recency *>(llama_get_memory(wrapped.second.get()));
+    if (!recency) {
+        std::fprintf(stderr, "FAIL recency gate did not install its memory wrapper\n");
+        return false;
+    }
+    if (recency->get_plan().logical_ctx != llama_n_ctx(wrapped.second.get()) ||
+            llama_kv_cache_recency::unwrap(llama_get_memory(normal.second.get())) != llama_get_memory(normal.second.get()) ||
+            llama_kv_cache_recency::unwrap(llama_get_memory(wrapped.second.get())) == llama_get_memory(wrapped.second.get()) ||
+            llama_kv_cache_recency::unwrap(nullptr) != nullptr) {
+        std::fprintf(stderr, "FAIL recency plan or delegate unwrapping\n");
+        return false;
+    }
+    const auto tokens = get_tokens(32, 128, seed);
+    if (get_logits(normal.first.get(), normal.second.get(), tokens) !=
+            get_logits(wrapped.first.get(), wrapped.second.get(), tokens)) {
+        std::fprintf(stderr, "FAIL recency delegate changed logits\n");
+        return false;
+    }
+    const size_t size = llama_state_seq_get_size(normal.second.get(), 0);
+    std::vector<uint8_t> plain(size), delegated(size);
+    if (llama_state_seq_get_data(normal.second.get(), plain.data(), size, 0) != size ||
+            llama_state_seq_get_data(wrapped.second.get(), delegated.data(), size, 0) != size || plain != delegated) {
+        std::fprintf(stderr, "FAIL recency delegate changed saved state\n");
+        return false;
+    }
+    auto * plain_memory = llama_get_memory(normal.second.get());
+    auto * wrapped_memory = llama_get_memory(wrapped.second.get());
+    if (plain_memory->memory_breakdown() != wrapped_memory->memory_breakdown() ||
+            plain_memory->get_can_shift() != wrapped_memory->get_can_shift()) {
+        std::fprintf(stderr, "FAIL recency delegate changed memory or shift capability\n");
+        return false;
+    }
+    for (auto * memory : {plain_memory, wrapped_memory}) {
+        memory->seq_keep(0);
+        memory->seq_add(0, -1, -1, 2);
+        memory->seq_div(0, -1, -1, 2);
+    }
+    if (plain_memory->seq_rm(0, 0, 4) != wrapped_memory->seq_rm(0, 0, 4) ||
+            plain_memory->seq_pos_min(0) != wrapped_memory->seq_pos_min(0) ||
+            plain_memory->seq_pos_max(0) != wrapped_memory->seq_pos_max(0)) {
+        std::fprintf(stderr, "FAIL recency delegate changed sequence operations\n");
+        return false;
+    }
+    for (auto * memory : {plain_memory, wrapped_memory}) {
+        memory->clear(true);
+    }
+    if (get_logits(normal.first.get(), normal.second.get(), tokens) !=
+            get_logits(wrapped.first.get(), wrapped.second.get(), tokens)) {
+        std::fprintf(stderr, "FAIL recency delegate changed logits after clear\n");
+        return false;
+    }
+    std::printf("PASS recency delegate logits, state, memory and sequence operations match normal cache\n");
+    return true;
 }
 
 static bool test_rejection_sampling(const size_t seed, const float stdev) {
@@ -768,7 +1131,7 @@ static int test_glm5_next_mtp(const size_t seed, const float stdev, const char *
         }
         auto normal = get_model_and_ctx(trunk.get(), nullptr, seed, stdev, {dev});
         const auto reference = get_logits(normal.first.get(), normal.second.get(), tokens);
-        auto target = get_model_and_ctx(with_mtp.get(), nullptr, seed, stdev, {dev});
+        auto target = get_model_and_ctx(with_mtp.get(), nullptr, seed, stdev, {dev}, LLAMA_SPLIT_MODE_LAYER, false, nullptr, false, true);
         llama_set_embeddings_nextn(target.second.get(), true, false);
         const auto target_logits = get_logits(target.first.get(), target.second.get(), tokens);
         if (!(nmse(reference, target_logits) <= 1e-6)) {
@@ -1438,6 +1801,15 @@ int main(int argc, char ** argv) {
     try {
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
+        }
+        if (arch_matches(arch_filter, LLM_ARCH_LLAMA) && !test_recency_delegate(seed, stdev)) {
+            return 1;
+        }
+        if (arch_matches(arch_filter, LLM_ARCH_LLAMA) && !test_recency_live(seed, stdev)) {
+            return 1;
+        }
+        if (arch_matches(arch_filter, LLM_ARCH_GLM5_NEXT) && !test_recency_glm(seed, stdev)) {
+            return 1;
         }
         if (arch_matches(arch_filter, LLM_ARCH_LLAMA) && !test_rejection_sampling(seed, stdev)) {
             return 1;

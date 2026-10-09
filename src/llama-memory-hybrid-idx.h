@@ -6,7 +6,11 @@
 #include <array>
 #include <limits>
 #include <memory>
+#include <unordered_map>
 #include <vector>
+
+class llama_kv_recency_store;
+struct llama_kv_recency_plan_params;
 
 //
 // llama_memory_hybrid_idx
@@ -66,6 +70,8 @@ public:
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
+    bool get_can_shift() const override;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     // state write/load
@@ -78,6 +84,14 @@ public:
     //
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
+
+    // Elastic recency storage for the K-only attention latents of one sequence (glm5-next --kv-recency).
+    // The attention cache then keeps cells, masks and slots without K layers, and attention cell i holds latent cell i.
+    // State save/load, shifts and multi-sequence edits are refused while it is attached.
+    void latent_attach(const llama_kv_recency_plan_params & params, const std::vector<uint32_t> & layer_ids, std::vector<ggml_backend_t> readers);
+    llama_kv_recency_store * get_latent() const { return latent.get(); }
+    uint32_t get_latent_layer(int32_t il) const { return latent_layers.at(il); }
+    const std::vector<ggml_backend_t> & get_latent_readers() const { return latent_readers; }
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
@@ -156,6 +170,12 @@ private:
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
 
+    std::unique_ptr<llama_kv_recency_store> latent;
+    std::unordered_map<int32_t, uint32_t> latent_layers;
+    std::vector<ggml_backend_t> latent_readers;
+
+    void latent_sync() const;
+
     // unique_ptr because kpool_layout is incomplete here
     std::unique_ptr<kpool_layout> kpool_lay;
 
@@ -222,6 +242,14 @@ public:
 
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
+
+    // attached elastic latents, nullptr when the attention cache holds them
+    const llama_kv_recency_store * get_latent() const;
+    uint32_t get_latent_layer(int32_t il) const { return mem->get_latent_layer(il); }
+    // first latent cell of the current ubatch, valid after apply()
+    uint32_t get_latent_first() const { return latent_first; }
+    // graph reservation: latents attend the whole ring
+    bool get_latent_full() const { return latent_full; }
     bool qsa_prefix_matches(const llama_ubatch & u) const { return mem && mem->qsa_prefix_matches(u); }
     bool qsa_fast(int il, const llama_ubatch & u) const { return mem && mem->qsa_fast(il, u); }
     // cells the block metadata must cover: the KV view is sized by occupied cells, but a cache whose positions
@@ -288,6 +316,10 @@ private:
 
     // Whether this context tracks k-pool states.
     bool kpool_track() const;
+
+    uint32_t latent_first = 0;
+    bool latent_full = false;
+    bool latent_apply();
 
     // Positions each sequence must re-pool from, cleared only after the first ubatch succeeds
     llama_memory_hybrid_idx::stale_pos_t mem_idx_stale_batch = llama_memory_hybrid_idx::stale_pos_clean();

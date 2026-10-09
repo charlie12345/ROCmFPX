@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-kv-cache-recency.h"
 
 #include "rocmfpx-plugin.h"
 
@@ -2624,13 +2625,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     filter_recr = [&](uint32_t)    { return false; };
                 }
 
+                // cells, masks and slots only; whole pages keep the latent page gathers inside the mask
+                const bool latent = params.recency_latent && params.ctx_type != LLAMA_CONTEXT_TYPE_MTP;
+                if (latent) {
+                    filter_attn = [](uint32_t) { return false; };
+                }
+
                 res = new llama_memory_hybrid_idx(
                     /* model             */ *this,
                     /* attn_type_k       */ params.type_k,
                     /* attn_type_v       */ params.type_v,
                     /* attn_v_trans      */ !cparams.flash_attn,
                     /* attn_kv_size      */ cparams.n_ctx_seq,
-                    /* attn_n_pad        */ 1,
+                    /* attn_n_pad        */ latent ? 256u : 1u,
                     /* attn_n_swa        */ hparams.n_swa,
                     /* attn_swa_type     */ hparams.swa_type,
                     /* recurrent_type_r  */ GGML_TYPE_F32,
@@ -3004,7 +3011,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         GGML_ASSERT(hparams.is_swa_any());
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
-                            llama_memory_t mem_other = llama_get_memory(cparams.ctx_other);
+                            llama_memory_t mem_other = llama_kv_cache_recency::unwrap(llama_get_memory(cparams.ctx_other));
 
                             share = [&](int32_t il) {
                                 const llama_model * model_other = llama_get_model(cparams.ctx_other);

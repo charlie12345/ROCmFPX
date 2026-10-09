@@ -1,5 +1,8 @@
+#include "../rocmfpx-draft-vocab.h"
 #include "models.h"
 #include "llama-memory-hybrid-idx.h"
+#include "llama-kv-cache-recency.h"
+#include "llama-impl.h"
 
 // GLM5-Next (GLM-5.3-Flash): hybrid KDA (linear) + nope MLA with a k-pool DSA indexer,
 // mHC residual streams, DeepSeek-style MoE.
@@ -230,9 +233,9 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
     }
 
     ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
-    ggml_tensor * Xcur = ggml_ssm_conv(ctx0, conv_x, conv_weight);
+    // SiLU directly on the conv output, so the backend can fuse the two
+    ggml_tensor * Xcur = ggml_silu(ctx0, ggml_ssm_conv(ctx0, conv_x, conv_weight));
     Xcur = ggml_reshape_2d(ctx0, Xcur, d_inner, n_tokens);
-    Xcur = ggml_silu(ctx0, Xcur);
 
     return ggml_reshape_4d(ctx0, Xcur, head_dim, n_head, n_seq_tokens, n_seqs);
 }
@@ -663,7 +666,16 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "GLM5-Next MTP: missing both nextn.shared_head_head and output");
-    cur = build_lora_mm(head_w, cur, head_s);
+    // ROCMFPX_DRAFT_VOCAB=n: a draft step projects onto n candidate rows of the head (picked from the target's last
+    // logits) instead of all 154880; verification still uses the full head
+    auto draft_vocabulary = rocmfpx::draft_vocabulary_for(&model);
+    if (draft_vocabulary && ggml_nrows(cur) == 1 && !head_s && ggml_is_contiguous(cur)) {
+        auto projection = rocmfpx::build_draft_projection(ctx0, std::move(draft_vocabulary), head_w, cur);
+        cur = projection.logits;
+        res->add_input(std::move(projection.input));
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
@@ -685,6 +697,9 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     auto * inp_rs    = inp_hyb->get_recr();
     auto * inp_attn  = inp_hyb->get_attn();
     auto * inp_kpool = build_inp_kpool(mctx_hyb);
+    if (mctx_hyb->get_latent()) {
+        inp_latent = build_inp_latent(mctx_hyb);
+    }
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -863,7 +878,10 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     Kcur = build_gdn_l2_norm(ctx0, Kcur, l2_eps);
 
     ggml_tensor * output = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g1, beta, state, il);
-    output = ggml_cont(ctx0, output);
+    // the attention part of the delta-net output is usually contiguous already; copy only when it is not
+    if (!ggml_is_contiguous(output)) {
+        output = ggml_cont(ctx0, output);
+    }
     cb(output, "kda_scan_out", il);
 
     // output gate, then RMSNorm(o) * Sigmoid(g2)
@@ -877,7 +895,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     cb(normed, "kda_normed", il);
     ggml_tensor * gated = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, g2));
 
-    gated = ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
+    gated = ggml_is_contiguous(gated) ? ggml_reshape_2d(ctx0, gated, d_inner, n_tokens) : ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
     cur   = ggml_mul_mat(ctx0, layer.wo, gated);
     cb(cur, "kda_out", il);
 
@@ -1026,6 +1044,138 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
 
 // Nope MLA layer with sparse attention over the indexer selection
 
+// Elastic latent inputs: the ring row of each ubatch token, the mask page of each ring slot, and a -inf bias for free slots.
+// q4_0 slabs hold their cells at logical offsets, so they attend through views of K and the mask without inputs.
+class llama_model_glm5_next::llm_graph_input_latent : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_latent(const llama_memory_hybrid_idx_context * mctx) : mctx(mctx) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        const auto * store = mctx->get_latent();
+        const uint32_t page = store->get_plan().page_tokens;
+        if (rows->buffer) {
+            llama_host_write(rows);
+            for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+                const auto row = store->get_q8_row(mctx->get_latent_first() + i);
+                GGML_ASSERT(row.first == 0);
+                ((int64_t *) rows->data)[i] = row.second;
+            }
+        }
+        if (ring_pages->buffer && ring_bias->buffer) {
+            llama_host_write(ring_pages);
+            llama_host_write(ring_bias);
+            const int64_t n = ring_pages->ne[0];
+            auto * data = (int32_t *) ring_pages->data;
+            auto * bias = (float *) ring_bias->data;
+            for (int64_t j = 0; j < n; ++j) {
+                const int32_t cell = store->get_row_cell(GGML_TYPE_Q8_0, 0, uint32_t(j)*page);
+                const bool used = cell >= 0 && uint32_t(cell)/page < n_kv_pages;
+                data[j] = used ? int32_t(uint32_t(cell)/page) : 0;
+                std::fill_n(bias + j*page, page, used ? 0.0f : -INFINITY);
+            }
+            for (int64_t t = 1; t < ring_pages->ne[1]; ++t) {
+                std::copy_n(data, n, data + t*n);
+            }
+        }
+    }
+
+    ggml_tensor * rows       = nullptr; // I64 [n_tokens]
+    ggml_tensor * ring_pages = nullptr; // I32 [ring pages, n_tokens]
+    ggml_tensor * ring_bias  = nullptr; // F32 [ring rows, 1]
+    std::vector<uint32_t> q4_rows; // published rows of each allocated q4_0 slab
+    uint32_t n_kv_pages = 0;
+
+    const llama_memory_hybrid_idx_context * mctx;
+};
+
+llama_model_glm5_next::llm_graph_input_latent * llama_model_glm5_next::graph::build_inp_latent(const llama_memory_hybrid_idx_context * mctx_hyb) {
+    const auto * store = mctx_hyb->get_latent();
+    const uint32_t page = store->get_plan().page_tokens;
+    const uint32_t n_kv = mctx_hyb->get_attn()->get_n_kv();
+    GGML_ASSERT(n_kv % page == 0 && "KV recency latents need a page-padded attention mask");
+
+    auto inp = std::make_unique<llm_graph_input_latent>(mctx_hyb);
+    inp->n_kv_pages = n_kv/page;
+    inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
+    ggml_set_input(inp->rows);
+    // the ring fills from its lowest free slot: attend up to the last occupied page, the whole ring when reserving
+    int64_t ring_rows = store->get_tensor(0, true, GGML_TYPE_Q8_0, 0)->ne[1];
+    if (!mctx_hyb->get_latent_full()) {
+        while (ring_rows > page && store->get_row_cell(GGML_TYPE_Q8_0, 0, uint32_t(ring_rows - page)) < 0) {
+            ring_rows -= page;
+        }
+    }
+    inp->ring_pages = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, ring_rows/page, n_tokens);
+    ggml_set_input(inp->ring_pages);
+    inp->ring_bias = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, ring_rows, 1);
+    ggml_set_input(inp->ring_bias);
+    const uint32_t cold = store->get_migration_stats().cold_pages*page;
+    const uint32_t slab_tokens = store->get_plan().slab_tokens;
+    for (uint32_t slab = 0; slab < store->get_slab_count(GGML_TYPE_Q4_0); ++slab) {
+        if (store->get_tensor(0, true, GGML_TYPE_Q4_0, slab) && cold > slab*slab_tokens) {
+            inp->q4_rows.push_back(std::min(cold - slab*slab_tokens, slab_tokens));
+        }
+    }
+    return (llm_graph_input_latent *) res->add_input(std::move(inp));
+}
+
+ggml_tensor * llama_model_glm5_next::graph::build_latent_attn(ggml_tensor * q_absorbed, ggml_tensor * kv_cmpr, ggml_tensor * mask,
+        const llama_layer & layer, const llama_memory_hybrid_idx_context * mctx_hyb, float kq_scale, int il) {
+    const auto * store = mctx_hyb->get_latent();
+    const uint32_t ll   = mctx_hyb->get_latent_layer(il);
+    const int64_t  page = store->get_plan().page_tokens;
+    const int64_t  slab_tokens = store->get_plan().slab_tokens;
+
+    ggml_tensor * ring = store->get_tensor(ll, true, GGML_TYPE_Q8_0, 0);
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, ring, ggml_reshape_2d(ctx0, kv_cmpr, kv_cmpr->ne[0], n_tokens), inp_latent->rows));
+
+    // one K head per row; V is the same latent
+    const auto latent_view = [&](ggml_tensor * t, int64_t rows) {
+        return ggml_permute(ctx0, ggml_view_4d(ctx0, t, t->ne[0], 1, rows, 1, t->nb[1], t->nb[1], t->nb[2], 0), 0, 2, 1, 3);
+    };
+    struct region { ggml_tensor * k; ggml_tensor * m; };
+    std::vector<region> regions;
+    for (size_t i = 0; i < inp_latent->q4_rows.size(); ++i) {
+        // published cells of a q4_0 slab are contiguous mask rows: K is a view, the mask a short-lived f16 copy
+        const int64_t rows = inp_latent->q4_rows[i];
+        ggml_tensor * m = ggml_cont(ctx0, ggml_view_2d(ctx0, mask, rows, n_tokens, mask->nb[1], i*slab_tokens*ggml_element_size(mask)));
+        regions.push_back({ latent_view(store->get_tensor(ll, true, GGML_TYPE_Q4_0, i), rows), m });
+    }
+    {
+        // ring slots hold whole pages in any order: gather mask pages, then mask free slots
+        const int64_t rows = inp_latent->ring_bias->ne[0];
+        ggml_tensor * pages = ggml_reshape_3d(ctx0, mask, page, inp_latent->n_kv_pages, n_tokens);
+        ggml_tensor * m = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, pages, inp_latent->ring_pages), rows, n_tokens);
+        m = ggml_cast(ctx0, ggml_add(ctx0, m, inp_latent->ring_bias), GGML_TYPE_F16);
+        regions.push_back({ latent_view(ring, rows), m });
+    }
+
+    ggml_tensor * q = ggml_permute(ctx0, q_absorbed, 0, 2, 1, 3);
+    const float softcap = hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f;
+
+    ggml_tensor * cur = nullptr;
+    for (size_t r = 0; r < regions.size(); ++r) {
+        if (regions.size() == 1) {
+            cur = ggml_flash_attn_ext(ctx0, q, regions[r].k, regions[r].k, regions[r].m, kq_scale, hparams.f_max_alibi_bias, softcap);
+            ggml_prec_set_acc(cur, GGML_PREC_F32);
+            break;
+        }
+        ggml_tensor * part = ggml_flash_attn_ext_partial(ctx0, q, regions[r].k, regions[r].k, regions[r].m, kq_scale, hparams.f_max_alibi_bias, softcap);
+        ggml_prec_set_acc(part, GGML_PREC_F32);
+        cur = cur ? ggml_attn_merge(ctx0, cur, part, r + 1 == regions.size()) : part;
+    }
+
+    // decompress the latent output as build_attn_mha does
+    cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+    cur = ggml_mul_mat(ctx0, layer.wv_b, cur);
+    cb(cur, "fattn_mla", il);
+    cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+    cur = ggml_cont(ctx0, cur);
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+    return cur;
+}
+
 ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
         ggml_tensor * cur, const llama_layer & layer,
         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_attn_k * inp_attn,
@@ -1071,16 +1221,22 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
 
     ggml_build_forward_expand(gf, q_absorbed);
     ggml_build_forward_expand(gf, kv_cmpr);
-    ggml_build_forward_expand(gf, mctx_mla->cpy_k(ctx0, kv_cmpr, inp_attn->get_k_idxs(), il));
 
     // The scatter selection already includes the causal mask.
     ggml_tensor * mask = ggml_reshape_4d(ctx0, sel, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
     cb(mask, "kq_mask_dsa", il);
 
-    ggml_tensor * k = mctx_mla->get_k(ctx0, il);
-    ggml_tensor * v = ggml_view_4d(ctx0, k, kv_lora_rank, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+    ggml_tensor * out;
+    if (inp_latent) {
+        out = build_latent_attn(q_absorbed, kv_cmpr, mask, layer, mctx_hyb, kq_scale, il);
+    } else {
+        ggml_build_forward_expand(gf, mctx_mla->cpy_k(ctx0, kv_cmpr, inp_attn->get_k_idxs(), il));
 
-    ggml_tensor * out = build_attn_mha(q_absorbed, k, v, nullptr, mask, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
+        ggml_tensor * k = mctx_mla->get_k(ctx0, il);
+        ggml_tensor * v = ggml_view_4d(ctx0, k, kv_lora_rank, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+
+        out = build_attn_mha(q_absorbed, k, v, nullptr, mask, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
+    }
     cb(out, "kqv_out", il);
 
     out = ggml_mul_mat(ctx0, layer.wo, out);

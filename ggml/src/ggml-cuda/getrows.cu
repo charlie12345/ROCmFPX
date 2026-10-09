@@ -286,8 +286,10 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
-    if constexpr (std::is_same<dst_t, float>::value &&
-                  (std::is_same<src0_t, float>::value || std::is_same<src0_t, half>::value)) {
+    // i32 rows too: the GLM-5.3-Flash indexer gathers the 4 cells of each selected pool (2M rows at ubatch 4096)
+    if constexpr ((std::is_same<dst_t, float>::value &&
+                   (std::is_same<src0_t, float>::value || std::is_same<src0_t, half>::value)) ||
+                  (std::is_same<dst_t, int32_t>::value && std::is_same<src0_t, int32_t>::value)) {
         if (ne00 > 0 && ne00 <= 128 && ne10 >= 128 &&
                 GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
             auto launch = [&](auto width, auto elements) {

@@ -1,4 +1,5 @@
 #include "llama-memory-hybrid-idx.h"
+#include "llama-kv-cache-recency.h"
 
 #include <cstdlib>
 #include "ggml-cpu.h"
@@ -189,7 +190,33 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
     return result;
 }
 
+void llama_memory_hybrid_idx::latent_attach(const llama_kv_recency_plan_params & params, const std::vector<uint32_t> & layer_ids, std::vector<ggml_backend_t> readers) {
+    if (layer_ids.size() != params.layers.size() || get_mem_attn()->get_cells(0).get_used() != 0) {
+        throw std::invalid_argument("KV recency latents need one plan layer per attention layer and an empty cache");
+    }
+    latent = std::make_unique<llama_kv_recency_store>(params, llama_kv_recency_store::mode::committed_aging);
+    latent_layers.clear();
+    for (size_t i = 0; i < layer_ids.size(); ++i) {
+        latent_layers[layer_ids[i]] = uint32_t(i);
+    }
+    latent_readers = std::move(readers);
+}
+
+void llama_memory_hybrid_idx::latent_sync() const {
+    for (auto * backend : latent_readers) {
+        ggml_backend_synchronize(backend);
+    }
+}
+
+bool llama_memory_hybrid_idx::get_can_shift() const {
+    return !latent && llama_memory_hybrid::get_can_shift();
+}
+
 void llama_memory_hybrid_idx::clear(bool data) {
+    if (latent) {
+        latent_sync();
+        latent->truncate(0);
+    }
     qsa_prefix.reset(); qsa_recover_pending = false; std::fill(qsa_ready.begin(), qsa_ready.end(), 0);
     if (data) { for (const auto & entry : qsa_buffers) { ggml_backend_buffer_clear(entry.second.get(), 0); } }
     llama_memory_hybrid::clear(data);
@@ -228,6 +255,20 @@ llama_pos llama_memory_hybrid_idx::mem_idx_stale_pos(llama_seq_id seq_id, llama_
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // the latents allow only a tail removal that does not split a q4_0 page; check before any cache changes
+    int64_t latent_cut = -1;
+    if (latent && latent->get_n_cells() && (seq_id < 0 || latent->get_cells().seq_has(0, seq_id))) {
+        const llama_pos first = latent->get_cells().pos_get(0);
+        const llama_pos last  = first + llama_pos(latent->get_n_cells()) - 1;
+        const llama_pos from  = p0 < 0 ? first : std::max(p0, first);
+        if (from <= last && (p1 < 0 || p1 > from)) {
+            if ((p1 >= 0 && p1 <= last) || !latent->can_truncate(uint32_t(from - first))) {
+                return false;
+            }
+            latent_cut = from - first;
+        }
+    }
+
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
     if (!hybrid_idx_no_recr(get_mem_recr()) && !get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
@@ -246,12 +287,19 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         mem_idx_stale_set(seq_id, stale);
     }
 
-    return get_mem_attn()->seq_rm(seq_id, p0, p1);
+    const bool res = get_mem_attn()->seq_rm(seq_id, p0, p1);
+    if (latent_cut >= 0) {
+        latent_sync();
+        GGML_ASSERT(latent->truncate(uint32_t(latent_cut)));
+    }
+
+    return res;
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     // only whole sequences are copied: the recurrent state ignores the range, and a shared cell holds a single pool grouping
     GGML_ASSERT(p0 <= 0 && p1 < 0 && "partial seq_cp is not supported");
+    GGML_ASSERT((!latent || seq_id_src == seq_id_dst || !latent->get_n_cells()) && "KV recency latents hold one sequence");
 
     qsa_invalidate();
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
@@ -265,6 +313,10 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
+    if (latent && latent->get_n_cells() && !latent->get_cells().seq_has(0, seq_id)) {
+        latent_sync();
+        latent->truncate(0);
+    }
     if (!qsa_prefix.valid || (qsa_prefix.sequence >= 0 && seq_id != qsa_prefix.sequence)) { qsa_invalidate(); }
     llama_memory_hybrid::seq_keep(seq_id);
 
@@ -276,6 +328,7 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    GGML_ASSERT((!latent || shift == 0 || !latent->get_n_cells()) && "KV recency latents do not support position shifts");
     qsa_invalidate();
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
 
@@ -288,6 +341,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    GGML_ASSERT((!latent || d == 1 || !latent->get_n_cells()) && "KV recency latents do not support position division");
     qsa_invalidate();
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
 
@@ -309,10 +363,20 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
     for (const auto & entry : qsa_buffers) {
         mb[ggml_backend_buffer_get_type(entry.second.get())] += ggml_backend_buffer_get_size(entry.second.get());
     }
+    if (latent) {
+        for (const auto & entry : latent->memory_breakdown()) {
+            mb[entry.first] += entry.second;
+        }
+    }
     return mb;
 }
 
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    // [TAG_HYBRID_IDX_STATE] latents go first, so a reader checks their versioned geometry before any cache changes
+    if (latent && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        latent_sync();
+        latent->state_write(io, seq_id);
+    }
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         get_mem_attn()->state_write(io, seq_id, flags);
     }
@@ -329,6 +393,13 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    llama_kv_recency_store::state_header latent_header;
+    const bool with_latent = latent && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
+    if (with_latent) {
+        latent_header = latent->state_read_header(io);
+        // one sequence: the restore replaces it, and attention cell i must again hold latent cell i
+        clear(true);
+    }
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) { qsa_invalidate(); }
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
@@ -339,6 +410,9 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     llama_kv_cache::slot_info_vec_t sinfos_attn;
 
     try {
+        if (with_latent) {
+            latent->state_read_rows(io, latent_header, seq_id);
+        }
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
             get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
         }
@@ -354,6 +428,16 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
             }
         }
 
+        if (with_latent) {
+            const auto & cells = get_mem_attn()->get_cells(0);
+            bool same = cells.get_used() == latent->get_n_cells();
+            for (uint32_t i = 0; same && i < latent->get_n_cells(); ++i) {
+                same = !cells.is_empty(i) && cells.pos_get(i) == latent->get_cells().pos_get(i);
+            }
+            if (!same) {
+                throw std::runtime_error("KV recency latent state does not match the attention cells");
+            }
+        }
     } catch (...) {
         // a half-restored context is the one state the indexer cannot fix by itself: attention holds new cells, the indexer old ones
         // drop what was being restored from all of them, which is a state they do agree on.
@@ -366,7 +450,8 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     qsa_invalidate();
     // dropped directly, not via seq_rm: the recurrent cache may refuse it and then only the other two get cleared
-    if (seq_id < 0) {
+    // latents hold one sequence, so dropping it clears everything
+    if (seq_id < 0 || latent) {
         clear(true);
 
         return;
@@ -952,6 +1037,11 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         kpool_st = std::make_unique<kpool_state>(std::move(st));
         i_kpool  = 0;
     }
+    if (mem->get_latent()) {
+        // graph reservation writes into the ring slab
+        mem->get_latent()->allocate_slab(GGML_TYPE_Q8_0, 0);
+        latent_full = true;
+    }
 }
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
@@ -998,8 +1088,46 @@ bool llama_memory_hybrid_idx_context::next() {
     return llama_memory_hybrid_context::next();
 }
 
+bool llama_memory_hybrid_idx_context::latent_apply() {
+    auto * store = mem->get_latent();
+    const auto & ubatch = get_ubatch();
+    // latent cell i must be attention cell i: one stream, contiguous cells from the store's end, consecutive positions
+    const auto & slots = qsa_slots.at(i_cur);
+    bool ok = slots.n_stream() == 1 && slots.is_contiguous() && slots.idxs[0][0] == store->get_n_cells() && ubatch.n_pos == 1;
+    for (uint32_t i = 0; ok && i < ubatch.n_tokens; ++i) {
+        ok = ubatch.n_seq_id[i] == 1 && ubatch.seq_id[i][0] == ubatch.seq_id[0][0] && ubatch.pos[i] == ubatch.pos[0] + llama_pos(i);
+    }
+    if (!ok) {
+        LLAMA_LOG_ERROR("%s: KV recency latents need one sequence appended in cell and position order\n", __func__);
+        return false;
+    }
+    try {
+        try {
+            latent_first = store->append(ubatch.pos[0], ubatch.seq_id[0][0], ubatch.n_tokens);
+        } catch (const std::runtime_error &) {
+            // full ring: the oldest eligible pages age to q4_0, then the ubatch fits
+            if (!store->migrate_oldest_pages(mem->get_latent_readers(), UINT32_MAX)) {
+                throw;
+            }
+            latent_first = store->append(ubatch.pos[0], ubatch.seq_id[0][0], ubatch.n_tokens);
+        }
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: KV recency could not commit the ubatch: %s\n", __func__, error.what());
+        return false;
+    }
+    return true;
+}
+
+const llama_kv_recency_store * llama_memory_hybrid_idx_context::get_latent() const {
+    return mem ? mem->get_latent() : nullptr;
+}
+
 bool llama_memory_hybrid_idx_context::apply() {
     bool res = llama_memory_hybrid_context::apply();
+
+    if (res && mem && mem->get_latent() && !qsa_slots.empty()) {
+        res = latent_apply();
+    }
 
     if (ctx_idx) {
         res = res & ctx_idx->apply();

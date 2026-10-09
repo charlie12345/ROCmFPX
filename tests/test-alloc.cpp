@@ -642,6 +642,39 @@ static void test_reallocation() {
     }
 }
 
+// Same node and leaf counts, but a data tensor reached through a view moves earlier and shifts an input
+// into a leaf slot that previously held a preallocated tensor.
+static void test_reordered_leafs() {
+    dummy_backend backend = dummy_backend_init(64);
+    auto [wctx, wgraph, wctx_ptr] = make_context();
+    ggml_tensor * d0 = ggml_new_tensor_1d(wctx, GGML_TYPE_F32, 4);
+    ggml_tensor * d1 = ggml_new_tensor_1d(wctx, GGML_TYPE_F32, 4);
+    ggml_backend_buffer_ptr weights(ggml_backend_alloc_ctx_tensors_from_buft(wctx, &backend.buffer_type));
+    GGML_ASSERT(weights && d0->data && d1->data);
+    const auto build = [](ggml_context * ctx, ggml_cgraph * graph, ggml_tensor * a, ggml_tensor * b, ggml_tensor * c) {
+        ggml_tensor * y = ggml_add(ctx, ggml_view_1d(ctx, a, 4, 0), make_input_1d(ctx, 4));
+        y = ggml_add(ctx, y, ggml_view_1d(ctx, b, 4, 0));
+        y = ggml_add(ctx, y, make_input_1d(ctx, 4));
+        y = ggml_add(ctx, y, ggml_view_1d(ctx, c, 4, 0));
+        ggml_set_output(y);
+        ggml_build_forward_expand(graph, y);
+    };
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        build(ctx, graph, d0, d1, d0); // leafs: d0, input, d1, input
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+    }
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        build(ctx, graph, d1, d1, d0); // leafs: d1, input, input, d0
+        GGML_ASSERT(graph->n_leafs == 4 && graph->leafs[2]->data == nullptr);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+    }
+}
+
 static void test_backend_graph_optimize(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -1158,6 +1191,7 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_reordered_leafs", test_reordered_leafs);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_pinned_no_inplace", test_pinned_no_inplace);
     run("test_pinned_view_root_no_inplace", test_pinned_view_root_no_inplace);

@@ -378,6 +378,7 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+    bool                             kv_recency = false;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -442,6 +443,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --kv-recency                                experimental elastic recency KV (default: off)\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -556,6 +558,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             if (arg == "-h" || arg == "--help") {
                 print_usage(argc, argv);
                 exit(0);
+            } else if (arg == "--kv-recency") {
+                params.kv_recency = true;
             } else if (arg == "--version") {
                 llama_print_build_info(llama_version());
                 exit(0);
@@ -1242,6 +1246,7 @@ struct cmd_params_instance {
     bool               repack;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    bool               kv_recency = false;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1319,6 +1324,7 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        cparams.kv_recency      = kv_recency;
 
         return cparams;
     }
@@ -1472,6 +1478,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     }
     // clang-format on
 
+    for (auto & instance : instances) {
+        instance.kv_recency = params.kv_recency;
+    }
     return instances;
 }
 
@@ -1499,6 +1508,7 @@ struct test {
     llama_lazy_mode          lazy_mode;
     int                      main_gpu;
     bool                     no_kv_offload;
+    bool                     kv_recency;
     llama_flash_attn_type    flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
@@ -1540,6 +1550,7 @@ struct test {
         lazy_mode      = inst.lazy_mode;
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
+        kv_recency    = inst.kv_recency;
         flash_attn     = inst.flash_attn;
         devices        = inst.devices;
         tensor_split   = inst.tensor_split;
@@ -1605,7 +1616,7 @@ struct test {
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
-            "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+            "main_gpu",       "no_kv_offload",  "kv_recency",    "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
             "no_op_offload",  "no_host",        "repack",        "fit_target",    "fit_min_ctx",
@@ -1625,7 +1636,7 @@ struct test {
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
             return INT;
         }
-        if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
+        if (field == "f16_kv" || field == "no_kv_offload" || field == "kv_recency" || field == "cpu_strict" ||
             field == "embeddings" || field == "no_host" || field == "repack") {
             return BOOL;
         }
@@ -1697,6 +1708,7 @@ struct test {
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
+                                            std::to_string(kv_recency),
                                             std::to_string((int) flash_attn),
                                             devices_to_string(devices),
                                             tensor_split_str,

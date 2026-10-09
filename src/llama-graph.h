@@ -24,6 +24,7 @@ struct llama_prec_policy;
 struct llama_memory_context_i;
 
 class llama_kv_cache_context;
+class llama_kv_cache_recency_context;
 class llama_kv_cache_dsa_context;
 class llama_kv_cache_dsa_iswa_context;
 class llama_kv_cache_msa_context;
@@ -363,6 +364,31 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+};
+
+// elastic recency cache: one homogeneous Q4/Q8 attention region per allocated slab
+class llm_graph_input_attn_kv_recency : public llm_graph_input_attn_kv {
+public:
+    llm_graph_input_attn_kv_recency(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache_recency_context * rctx) :
+        llm_graph_input_attn_kv(hparams, cparams, nullptr),
+        rctx(rctx) {
+    }
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    // regions and their slabs change as the cache grows and ages
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        return false;
+    }
+
+    std::vector<std::pair<ggml_type, uint32_t>> regions;
+    std::vector<ggml_tensor *> kq_masks; // F16 [n_rows, n_tokens], one per region
+
+    const llama_kv_cache_recency_context * rctx;
 };
 
 // V-less input for the KV cache
@@ -1229,6 +1255,16 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
+
+    // stores K/V in the recency cache and attends over all its regions with one global softmax
+    ggml_tensor * build_attn_recency(
+            llm_graph_input_attn_kv_recency * inp,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * sinks,
+                  float   kq_scale,
+                    int   il) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,

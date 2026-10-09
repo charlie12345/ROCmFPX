@@ -2441,6 +2441,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NO_HOST"));
     add_opt(common_arg(
+        {"--kv-recency"},
+        "experimental elastic recency KV: live for one dense sequence with q8_0 K/V and flash attention on, otherwise planner only",
+        [](common_params & params) {
+            params.kv_recency = true;
+        }
+    ));
+    add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"

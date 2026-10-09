@@ -137,6 +137,10 @@ struct llama_context {
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
     // returns nullptr only if ret != GGML_STATUS_SUCCESS
+    // live elastic recency memory, or nullptr when this context does not qualify
+    llama_memory_i * kv_recency_live(const llama_memory_params & params_mem, const llama_context_params & params);
+    llama_memory_i * kv_recency_glm (const llama_memory_params & params_mem, const llama_context_params & params);
+
     llm_graph_result * process_ubatch(
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,

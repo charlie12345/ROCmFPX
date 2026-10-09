@@ -9008,6 +9008,30 @@ void ggml_compute_forward_top_k(
     }
 }
 
+void ggml_compute_forward_attn_merge(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * a = dst->src[0];
+    const auto * b = dst->src[1];
+    const int64_t dv = a->ne[0] - 2;
+    const bool normalize = ggml_get_op_params_i32(dst, 0) != 0;
+    const int64_t rows = ggml_nrows(dst);
+    for (int64_t row = params->ith; row < rows; row += params->nth) {
+        const float * pa = (const float *) ((const char *) a->data + row*a->nb[1]);
+        const float * pb = (const float *) ((const char *) b->data + row*b->nb[1]);
+        float * out = (float *) ((char *) dst->data + row*dst->nb[1]);
+        const bool has_a = pa[dv+1] > 0;
+        const bool has_b = pb[dv+1] > 0;
+        const float maximum = has_a && has_b ? std::max(pa[dv], pb[dv]) : has_a ? pa[dv] : has_b ? pb[dv] : -INFINITY;
+        const float wa = has_a ? expf(pa[dv] - maximum) : 0;
+        const float wb = has_b ? expf(pb[dv] - maximum) : 0;
+        const float sum = (has_a ? pa[dv+1]*wa : 0) + (has_b ? pb[dv+1]*wb : 0);
+        const float scale = normalize ? (sum > 0 ? 1.0f/sum : 0) : 1.0f;
+        for (int64_t d = 0; d < dv; ++d) {
+            out[d] = ((has_a ? pa[d]*wa : 0) + (has_b ? pb[d]*wb : 0))*scale;
+        }
+        if (!normalize) { out[dv] = maximum; out[dv+1] = sum; }
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -9035,7 +9059,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
-    GGML_ASSERT(ne0 == DV);
+    const bool partial_output = dst->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL;
+    GGML_ASSERT(ne0 == DV + (partial_output ? 2 : 0));
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous
@@ -9233,7 +9258,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         } else {
             // V /= S
             const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
-            ggml_vec_scale_f32(DV, VKQ32, S_inv);
+            if (!partial_output) { ggml_vec_scale_f32(DV, VKQ32, S_inv); }
 
             // dst indices
             const int i1 = iq1;
@@ -9241,7 +9266,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             const int i3 = iq3;
 
             // permute(0, 2, 1, 3)
-            memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
+            float * output = (float *) ((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1);
+            memcpy(output, VKQ32, DV*sizeof(float));
+            if (partial_output) { output[DV] = M; output[DV+1] = S; }
         }
     }
 }
@@ -9269,7 +9296,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
-    GGML_ASSERT(ne0 == DV);
+    const bool partial_output = dst->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL;
+    GGML_ASSERT(ne0 == DV + (partial_output ? 2 : 0));
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous
@@ -9507,6 +9535,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
                 if (s > M[tq]) {
                     ms = expf(M[tq] - s);
+                    M[tq] = s;
                     ggml_vec_scale_f32(DV, VKQ32 + tq * DV, ms);
                 } else {
                     vs = expf(s - M[tq]);
@@ -9519,7 +9548,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         for (int tq = 0; tq < tile_rows; tq++) {
             // V /= S
             const float S_inv = S[tq] == 0.0f ? 0.0f : 1.0f / S[tq];
-            ggml_vec_scale_f32(DV, VKQ32 + tq * DV, S_inv);
+            if (!partial_output) { ggml_vec_scale_f32(DV, VKQ32 + tq * DV, S_inv); }
 
             // dst indices
             const int i1 = iq1 + tq;
@@ -9527,7 +9556,9 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             const int i3 = iq3;
 
             // permute(0, 2, 1, 3)
-            memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32 + tq * DV, nb1);
+            float * output = (float *) ((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1);
+            memcpy(output, VKQ32 + tq * DV, DV*sizeof(float));
+            if (partial_output) { output[DV] = M[tq]; output[DV+1] = S[tq]; }
         }
 
         ir += tile_rows;
@@ -9597,12 +9628,15 @@ static void ggml_flash_attn_ext_reduce_partials(
         }
 
         // Normalize and write to output
-        if (S_final != 0.0f) {
+        const bool partial_output = dst->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL;
+        if (!partial_output && S_final != 0.0f) {
             const float S_inv = 1.0f / S_final;
             ggml_vec_scale_f32(DV, VKQ_final, S_inv);
         }
         // iq1=0, iq3=0 for decode
-        memcpy((char *) dst->data + (0*ne2*ne1 + q_head + 0*ne1)*nb1, VKQ_final, nb1);
+        float * output = (float *) ((char *) dst->data + (0*ne2*ne1 + q_head + 0*ne1)*nb1);
+        memcpy(output, VKQ_final, DV*sizeof(float));
+        if (partial_output) { output[DV] = M_final; output[DV+1] = S_final; }
     }
 }
 
@@ -9628,7 +9662,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t N  = neq1;
 
 
-    GGML_ASSERT(ne0 == DV);
+    const bool partial_output = dst->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL;
+    GGML_ASSERT(ne0 == DV + (partial_output ? 2 : 0));
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous

@@ -800,6 +800,95 @@ struct indexer_layout {
     int nq, nk, nm;
 };
 
+// Any multiple of 4 heads (GLM-5.3-Flash: 32): the same tiles as qsa_indexer_wmma16_keyreg, with the queries staged
+// 4 heads per pass while each warp keeps its 16 keys in registers and the relu-weighted head sum accumulates across
+// passes. Blocks walk the keys fastest, so the 16 tokens' queries stay in L2 between neighbouring blocks.
+template <typename K, int NH>
+__global__ __launch_bounds__(128) void qsa_indexer_wmma16_heads(
+        const char * q, const char * k, const char * w, const char * mask,
+        char * dst, indexer_layout s) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+    using namespace ggml_cuda_mma;
+    using AB=tile<16,8,half2,DATA_LAYOUT_I_MAJOR_MIRRORED>;
+    using C=tile<16,16,float,DATA_LAYOUT_J_MAJOR>;
+    static_assert(NH % 4 == 0, "heads in passes of 4");
+    const int warp=threadIdx.y,lane=threadIdx.x,tid=warp*32+lane;
+    const int qfirst=int(blockIdx.y)*16,kfirst=int(blockIdx.x)*64,stream=blockIdx.z;
+    __shared__ half2 query_tile[16][260];
+    AB keys[8];
+#pragma unroll
+    for(int part=0;part<8;++part) {
+#pragma unroll
+        for(int l=0;l<AB::ne;++l) {
+            const int key=kfirst+warp*16+AB::get_i(l),d=part*16+2*AB::get_j(l);
+            float2 value=make_float2(0,0);
+            if(key<s.nk) {
+                const K * src=(const K *)(k+size_t(stream)*s.k3+size_t(key)*s.k2);
+                value=make_float2(float(src[d]),float(src[d+1]));
+            }
+            keys[part].x[l]=__float22half2_rn(value);
+        }
+    }
+    float score[C::ne];
+#pragma unroll
+    for(int l=0;l<C::ne;++l) score[l]=0.0f;
+
+#pragma unroll 1
+    for(int h0=0;h0<NH;h0+=4) {
+        __syncthreads();   // the previous pass is done with the tile
+#pragma unroll 1
+        for(int i=tid;i<16*128;i+=128) {
+            const int row=i/128,col=4*(i%128),token=qfirst+row;
+            float4 value=make_float4(0,0,0,0);
+            if(token<s.nq) {
+                const float * src=(const float *)(q+size_t(stream)*s.q3+size_t(token)*s.q2+size_t(h0+col/128)*s.q1);
+                const int d=col%128;
+                value=make_float4(src[d],src[d+1],src[d+2],src[d+3]);
+            }
+            query_tile[row][col/2]=__float22half2_rn(make_float2(value.x,value.y));
+            query_tile[row][col/2+1]=__float22half2_rn(make_float2(value.z,value.w));
+        }
+        __syncthreads();
+        C acc[4];
+#pragma unroll
+        for(int head=0;head<4;++head) {
+#pragma unroll
+            for(int l=0;l<C::ne;++l) acc[head].x[l]=0.0f;
+        }
+#pragma unroll
+        for(int part=0;part<8;++part) {
+#pragma unroll
+            for(int head=0;head<4;++head) {
+                AB query;
+#pragma unroll
+                for(int l=0;l<AB::ne;++l) query.x[l]=query_tile[AB::get_i(l)][head*64+part*8+AB::get_j(l)];
+                mma(acc[head],query,keys[part]);
+            }
+        }
+#pragma unroll
+        for(int l=0;l<C::ne;++l) {
+            const int token=qfirst+C::get_i(l);
+            if(token<s.nq) {
+                const float * wr=(const float *)(w+size_t(stream)*s.w3+size_t(token)*s.w1);
+#pragma unroll
+                for(int head=0;head<4;++head) score[l]+=fmaxf(acc[head].x[l],0.0f)*wr[h0+head];
+            }
+        }
+    }
+#pragma unroll
+    for(int l=0;l<C::ne;++l) {
+        const int token=qfirst+C::get_i(l),key=kfirst+warp*16+C::get_j(l);
+        if(token<s.nq && key<s.nk) {
+            const half * mr=(const half *)(mask+size_t(stream%s.nm)*s.m3+size_t(token)*s.m1);
+            float * out=(float *)(dst+size_t(stream)*s.d3+size_t(token)*s.d1);
+            out[key]=score[l]+float(mr[key]);
+        }
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+
 template <typename K>
 __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
         const char * q, const char * k, const char * w, const char * mask,
@@ -872,14 +961,16 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
 #endif
 }
 
+// nh: the head counts the WMMA kernels take (4 alone, 32 and 64 in passes of 4)
 static bool supports_indexer4(int device, const ggml_tensor * dst) {
     const auto * q=dst->src[0], * k=dst->src[1], * w=dst->src[2], * m=dst->src[3];
     if (!q || !k || !w || !m || !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc)) { return false; }
+    const int64_t nh = q->ne[1];
     if (q->type != GGML_TYPE_F32 || (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) ||
             w->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 ||
-            q->ne[0] != 128 || q->ne[1] != 4 || k->ne[0] != 128 || k->ne[1] != 1 ||
+            q->ne[0] != 128 || (nh != 4 && nh != 32 && nh != 64) || k->ne[0] != 128 || k->ne[1] != 1 ||
             q->ne[2] < 1 || q->ne[2] > 262140 || q->ne[3] > 65535 || k->ne[2] > INT_MAX ||
-            q->ne[3] != k->ne[3] || w->ne[0] != 4 || w->ne[1] != q->ne[2] ||
+            q->ne[3] != k->ne[3] || w->ne[0] != nh || w->ne[1] != q->ne[2] ||
             w->ne[2] != 1 || w->ne[3] != q->ne[3] || m->ne[0] != k->ne[2] ||
             m->ne[1] != q->ne[2] || m->ne[2] != 1 || m->ne[3] < 1 || q->ne[3] % m->ne[3] != 0) { return false; }
     for (const auto * t : {q, k, w, m, dst}) {
@@ -900,6 +991,14 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         m->nb[1],m->nb[3],dst->nb[1],dst->nb[3],int(q->ne[2]),int(k->ne[2]),int(m->ne[3])};
     const dim3 grid((s.nk+63)/64,(s.nq+15)/16,q->ne[3]), block(32,4);
     ggml_cuda_kernel_launch_params launch(grid,block,0,ctx.stream());
+    if (q->ne[1] != 4) {
+        const bool f32 = k->type == GGML_TYPE_F32;
+        const auto kernel = q->ne[1] == 32 ? (f32 ? qsa_indexer_wmma16_heads<float, 32> : qsa_indexer_wmma16_heads<half, 32>)
+                                           : (f32 ? qsa_indexer_wmma16_heads<float, 64> : qsa_indexer_wmma16_heads<half, 64>);
+        ggml_cuda_kernel_launch(kernel,launch,(const char*)q->data,(const char*)k->data,(const char*)w->data,(const char*)m->data,(char*)dst->data,s);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (k->type==GGML_TYPE_F32) {
         ggml_cuda_kernel_launch(qsa_indexer_wmma16_keyreg<float>,launch,(const char*)q->data,(const char*)k->data,(const char*)w->data,(const char*)m->data,(char*)dst->data,s);
     } else {

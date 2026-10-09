@@ -2751,6 +2751,9 @@ struct llama_model_glm5_next : public llama_model_base {
     // k-pool indexer inputs on top of the generic hybrid input
     class llm_graph_input_kpool;
 
+    // elastic recency latent inputs (--kv-recency)
+    class llm_graph_input_latent;
+
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
 
@@ -2803,6 +2806,14 @@ struct llama_model_glm5_next : public llama_model_base {
         ggml_tensor * build_dsa_layer(ggml_tensor * cur, const llama_layer & layer,
                                       const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_attn_k * inp_attn,
                                       llm_graph_input_kpool * inp_kpool, ggml_tensor ** prev_sel, int il);
+
+        llm_graph_input_latent * build_inp_latent(const llama_memory_hybrid_idx_context * mctx_hyb);
+
+        // stores the latent in the q8_0 ring and attends over every ring and q4_0 slab with one global softmax
+        ggml_tensor * build_latent_attn(ggml_tensor * q_absorbed, ggml_tensor * kv_cmpr, ggml_tensor * mask, const llama_layer & layer,
+                                        const llama_memory_hybrid_idx_context * mctx_hyb, float kq_scale, int il);
+
+        llm_graph_input_latent * inp_latent = nullptr;
 
     };
 

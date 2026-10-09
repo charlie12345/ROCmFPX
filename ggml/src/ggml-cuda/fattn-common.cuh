@@ -53,7 +53,7 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
 
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
-    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -1309,8 +1309,16 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// chunk_counts: ggml_cuda_flash_attn_ext_compact_mask_scratch(mask) ints (none needed when it returns 0) for the
+// parallel scan of long masks; nullptr keeps the single-block scan
+int  ggml_cuda_flash_attn_ext_compact_mask_scratch(const ggml_tensor * mask);
+// compact f16 copies of the listed q8_0 K rows (512 wide) and of their mask columns for every query; lists then index them
+void ggml_cuda_flash_attn_ext_sparse_gather(
+        const ggml_tensor * K, const ggml_tensor * mask, int n_queries, int32_t * indices, int n_lists, int n_kv_max,
+        half * K_c, half * mask_c, cudaStream_t stream);
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
+        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream,
+        int32_t * chunk_counts = nullptr);
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
@@ -1505,13 +1513,14 @@ static __global__ void flash_attn_stream_k_fixup_general(
     *dst = dst_val / rowsum;
 }
 
-template<int D> // D == head size
+template<int D, bool partial = false> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_combine_results(
         const float  * VKQ_parts_ptr,
         const float2 * VKQ_meta_ptr,
         float * dst_ptr,
-        const int parallel_blocks) {
+        const int parallel_blocks,
+        const float max_offset) {
     ggml_cuda_pdl_lc();
     const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
     const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
@@ -1533,7 +1542,7 @@ static __global__ void flash_attn_combine_results(
 
     VKQ_parts += j_dst_unrolled * parallel_blocks*D;
     VKQ_meta  += j_dst_unrolled * parallel_blocks;
-    dst       += j_dst_unrolled *                 D;
+    dst       += j_dst_unrolled * (partial ? D + 2 : D);
 
     const int tid = threadIdx.x;
     __builtin_assume(tid < D);
@@ -1546,30 +1555,41 @@ static __global__ void flash_attn_combine_results(
 
     __syncthreads();
 
-    float kqmax = meta[0].x;
-    for (int l = 1; l < parallel_blocks; ++l) {
-        kqmax = max(kqmax, meta[l].x);
+    float kqmax = partial ? -INFINITY : meta[0].x;
+    for (int l = partial ? 0 : 1; l < parallel_blocks; ++l) {
+        if (!partial || meta[l].y > 0) { kqmax = max(kqmax, meta[l].x); }
     }
 
     float VKQ_numerator   = 0.0f;
     float VKQ_denominator = 0.0f;
     for (int l = 0; l < parallel_blocks; ++l) {
+        if (partial && meta[l].y <= 0) { continue; }
         const float KQ_max_scale = expf(meta[l].x - kqmax);
-
         VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    if constexpr (partial) {
+        // canonical state for kernels whose running max carries max_offset
+        const float offset_scale = expf(max_offset);
+        dst[tid] = VKQ_numerator*offset_scale;
+        if (tid == 0) { dst[D] = kqmax - max_offset; dst[D+1] = VKQ_denominator*offset_scale; }
+    } else {
+        GGML_UNUSED(max_offset);
+        dst[tid] = VKQ_numerator / VKQ_denominator;
+    }
 }
 
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
+    const int warp_size = WARP_SIZE, const bool async_kv_preload = false, const float partial_max_offset = 0.0f
 ) {
     constexpr int ncols = ncols1 * ncols2;
+    // partial output relies on the parallel-block combine; f16 K/V conversion covers one bounded region at a time
+    const bool partial = dst->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL;
+    GGML_ASSERT(!partial || (!stream_k && !use_sparse));
 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -1614,7 +1634,16 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    // sparse decode with q8_0 K (V a view of it): convert only the listed rows after the compaction, not the whole cache
+    const bool sparse_compact = use_sparse && need_f16_K && K->type == GGML_TYPE_Q8_0 && K->ne[0] == 512 && V_is_K_view &&
+        K->ne[2] == 1 && K->ne[3] == 1 && mask && mask->ne[2] == 1 && mask->ne[3] == 1 && Q->ne[1] <= 8 && Q->ne[3] == 1 &&
+        K->nb[1] == ggml_row_size(K->type, K->ne[0]);
+    ggml_cuda_pool_alloc<half> K_compact(pool);
+    ggml_cuda_pool_alloc<half> mask_compact(pool);
+    const char * mask_data = mask ? (const char *) mask->data : nullptr;
+    size_t nb31 = mask ? mask->nb[1] : 0, nb32 = mask ? mask->nb[2] : 0, nb33 = mask ? mask->nb[3] : 0;
+
+    if (need_f16_K && K->type != GGML_TYPE_F16 && !sparse_compact) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
@@ -1642,7 +1671,7 @@ void launch_fattn(
         K_data = (char *) K_f16;
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (need_f16_V && V->type != GGML_TYPE_F16 && !sparse_compact) {
         if (V_is_K_view) {
             V_data = K_data;
             nb21   = nb11;
@@ -1693,8 +1722,29 @@ void launch_fattn(
 
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
 
-        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        const size_t n_scratch = size_t(ggml_cuda_flash_attn_ext_compact_mask_scratch(mask))*n_lists;
+        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists + n_scratch);
+        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream,
+            n_scratch ? KV_max.ptr + size_t(n_kv_max)*n_lists + n_lists : nullptr);
+        if (sparse_compact) {
+            const size_t n_cols_c = size_t(n_kv_max)*n_lists;
+            K_compact.alloc(n_cols_c*K->ne[0]);
+            mask_compact.alloc(size_t(Q->ne[1])*n_cols_c);
+            ggml_cuda_flash_attn_ext_sparse_gather(K, mask, (int) Q->ne[1], KV_max.ptr, (int) n_lists, n_kv_max,
+                K_compact.ptr, mask_compact.ptr, main_stream);
+            K_data = (const char *) K_compact.ptr;
+            V_data = K_data;
+            nb11 = K->ne[0]*sizeof(half);
+            nb12 = nb11*n_cols_c;
+            nb13 = nb12;
+            nb21 = nb11;
+            nb22 = nb12;
+            nb23 = nb13;
+            mask_data = (const char *) mask_compact.ptr;
+            nb31 = n_cols_c*sizeof(half);
+            nb32 = nb31*mask->ne[1];
+            nb33 = nb32*mask->ne[2];
+        }
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
@@ -1804,7 +1854,8 @@ void launch_fattn(
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
 
-        if (parallel_blocks > 1) {
+        // partial output always goes through the combine, which writes the canonical state, even from one block
+        if (parallel_blocks > 1 || partial) {
             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
             dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
         }
@@ -1838,16 +1889,16 @@ void launch_fattn(
         (const char *) Q->data,
         K_data,
         V_data,
-        mask ? ((const char *) mask->data) : nullptr,
+        mask_data,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
-        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+        !stream_k && (parallel_blocks > 1 || partial) ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        nb31, nb32, nb33
     );
     CUDA_CHECK(cudaGetLastError());
 
@@ -1887,14 +1938,19 @@ void launch_fattn(
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
-    } else if (parallel_blocks > 1) {
+    } else if (parallel_blocks > 1 || partial) {
         const dim3 block_dim_combine(DV, 1, 1);
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+        if (partial) {
+            ggml_cuda_kernel_launch((flash_attn_combine_results<DV, true>), launch_params,
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, partial_max_offset);
+        } else {
+            ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, 0.0f);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }

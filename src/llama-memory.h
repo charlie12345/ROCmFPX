@@ -25,6 +25,9 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // glm5-next: build the attention cache without K layers, for latents in an attached recency store
+    bool recency_latent = false;
 };
 
 enum llama_memory_status {

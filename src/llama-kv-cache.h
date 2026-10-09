@@ -13,6 +13,9 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+// orthonormal Walsh-Hadamard rotation of size n x n (row-major), as used by quantized KV caches
+std::vector<float> llama_kv_cache_hadamard(int64_t n);
+
 //
 // llama_kv_cache
 //

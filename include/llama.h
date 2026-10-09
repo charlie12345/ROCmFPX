@@ -441,6 +441,8 @@ extern "C" {
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
         // [EXPERIMENTAL]
+        bool kv_recency; // log a proposed recency layout; normal KV remains active
+
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;

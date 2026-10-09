@@ -7,6 +7,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-recency.h"
+#include "llama-kv-recency-plan.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -81,6 +84,163 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+// glm5-next: hybrid memory whose K-only attention latents live in an elastic recency store, or nullptr.
+llama_memory_i * llama_context::kv_recency_glm(const llama_memory_params & params_mem, const llama_context_params & params) {
+    const auto & hparams = model.hparams;
+    const char * reason = nullptr;
+    if (hparams.no_alloc) {
+        reason = "memory estimation run";
+    } else if (params.type_k != GGML_TYPE_Q8_0) {
+        reason = "the K cache type must be q8_0";
+    } else if (!cparams.flash_attn || cparams.auto_fa) {
+        reason = "flash attention must be enabled explicitly";
+    } else if (cparams.n_seq_max != 1 || !cparams.causal_attn || cparams.ctx_other || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+        reason = "only one causal sequence in a default context is supported";
+    } else if (model.n_devices() > 1) {
+        reason = "multiple devices are not supported";
+    }
+    if (reason) {
+        LLAMA_LOG_WARN("kv recency: live latents unavailable: %s\n", reason);
+        return nullptr;
+    }
+    try {
+        llama_kv_recency_plan_params plan_params;
+        plan_params.logical_ctx = cparams.n_ctx_seq;
+        plan_params.ring_one_slab = true;
+        if (const char * hot = getenv("LLAMA_KV_RECENCY_HOT")) {
+            plan_params.hot_tokens = uint32_t(atoi(hot));
+        }
+        if (const char * slab = getenv("LLAMA_KV_RECENCY_SLAB")) {
+            plan_params.slab_tokens = uint32_t(atoi(slab));
+        }
+        // one migration must free room for a whole ubatch: large prefill ubatches migrate in larger batches
+        const uint32_t page = plan_params.page_tokens;
+        plan_params.migrate_tokens = std::max(plan_params.migrate_tokens, (cparams.n_ubatch + page - 1)/page*page);
+        auto latent_params = params_mem;
+        latent_params.recency_latent = true;
+        std::unique_ptr<llama_memory_i> mem(model.create_memory(latent_params, cparams));
+        auto * hybrid = dynamic_cast<llama_memory_hybrid_idx *>(mem.get());
+        if (!hybrid) {
+            throw std::invalid_argument("unexpected memory layout");
+        }
+        std::vector<uint32_t> layer_ids;
+        std::map<ggml_backend_buffer_type_t, size_t> budgets;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (hparams.is_recr(il)) {
+                continue;
+            }
+            auto * buft = cparams.offload_kqv ? ggml_backend_dev_buffer_type(model.dev_layer(il)) : ggml_backend_cpu_buffer_type();
+            layer_ids.push_back(il);
+            plan_params.layers.push_back({hparams.n_lora_kv, 0, buft});
+            if (!budgets.count(buft)) {
+                // free memory after the other caches, minus a 1 GiB margin; compute buffers are not included
+                auto * dev = ggml_backend_buft_get_device(buft);
+                dev = dev ? dev : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                size_t free = 0;
+                size_t total = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                budgets[buft] = free > (size_t(1) << 30) ? free - (size_t(1) << 30) : 0;
+            }
+        }
+        const auto plan = llama_kv_recency_plan_admit(plan_params, budgets);
+        plan_params.hot_tokens = plan.hot_tokens;
+        std::vector<ggml_backend_t> readers;
+        for (const auto & backend : backends) {
+            readers.push_back(backend.get());
+        }
+        hybrid->latent_attach(plan_params, layer_ids, std::move(readers));
+        LLAMA_LOG_INFO("kv recency: live elastic latents: %zu layers, context = %u, hot = %u q8_0, ring = %u, cold = %u q4_0, page = %u, slab = %u\n",
+                layer_ids.size(), plan.logical_ctx, plan.hot_tokens, plan.ring_tokens, plan.cold_tokens, plan.page_tokens, plan.slab_tokens);
+        LLAMA_LOG_INFO("kv recency: full-session latent slabs = %zu bytes, migration workspace = %zu bytes; allocated lazily\n",
+                plan.committed_alloc_bytes, plan.migration_workspace_bytes);
+        return mem.release();
+    } catch (const std::exception & error) {
+        LLAMA_LOG_WARN("kv recency: live latents unavailable: %s\n", error.what());
+        return nullptr;
+    }
+}
+
+// Live elastic recency cache for one dense sequence, or nullptr to keep the ordinary cache.
+llama_memory_i * llama_context::kv_recency_live(const llama_memory_params & params_mem, const llama_context_params & params) {
+    const auto & hparams = model.hparams;
+    const char * reason = nullptr;
+    if (hparams.no_alloc) {
+        // dry-run estimates keep the ordinary q8_0 cache size, which bounds the elastic session up to its ring headroom
+        reason = "memory estimation run";
+    } else if (model.arch != LLM_ARCH_LLAMA && model.arch != LLM_ARCH_QWEN2 && model.arch != LLM_ARCH_QWEN3 && model.arch != LLM_ARCH_QWEN3MOE) {
+        // other graphs may read the ordinary attention input directly
+        reason = "the architecture is not qualified";
+    } else if (params.type_k != GGML_TYPE_Q8_0 || params.type_v != GGML_TYPE_Q8_0) {
+        reason = "K and V cache types must be q8_0";
+    } else if (!cparams.flash_attn || cparams.auto_fa) {
+        reason = "flash attention must be enabled explicitly";
+    } else if (cparams.n_seq_max != 1 || !cparams.causal_attn || cparams.ctx_other || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+        reason = "only one causal sequence in a default context is supported";
+    } else if (hparams.is_mla() || hparams.swa_type != LLAMA_SWA_TYPE_NONE || hparams.n_layer_kv_from_start >= 0 ||
+            hparams.n_pos_per_embd() != 1 || model.n_devices() > 1) {
+        reason = "the model layout is shared, indexed, SWA, multi-position or multi-device";
+    }
+    std::vector<uint32_t> layer_ids;
+    if (!reason) {
+        // reuse the model's memory selection: only a plain KV cache layout qualifies
+        auto probe_cparams = cparams;
+        probe_cparams.n_ctx = probe_cparams.n_ctx_seq = 256;
+        std::unique_ptr<llama_memory_i> probe(model.create_memory(params_mem, probe_cparams));
+        if (!probe || typeid(*probe) != typeid(llama_kv_cache)) {
+            reason = "the model does not use a plain KV cache";
+        } else {
+            layer_ids = static_cast<llama_kv_cache *>(probe.get())->get_layer_ids();
+        }
+    }
+    if (reason) {
+        LLAMA_LOG_WARN("kv recency: live cache unavailable: %s\n", reason);
+        return nullptr;
+    }
+    try {
+        llama_kv_recency_plan_params plan_params;
+        plan_params.logical_ctx = cparams.n_ctx_seq;
+        // experimental geometry overrides for tests
+        if (const char * hot = getenv("LLAMA_KV_RECENCY_HOT")) {
+            plan_params.hot_tokens = uint32_t(atoi(hot));
+        }
+        if (const char * slab = getenv("LLAMA_KV_RECENCY_SLAB")) {
+            plan_params.slab_tokens = uint32_t(atoi(slab));
+        }
+        std::map<ggml_backend_buffer_type_t, size_t> budgets;
+        for (const uint32_t il : layer_ids) {
+            if (hparams.n_embd_head_k(il) % ggml_blck_size(GGML_TYPE_Q8_0) || hparams.n_embd_head_v(il) % ggml_blck_size(GGML_TYPE_Q8_0)) {
+                throw std::invalid_argument("KV recency requires block-aligned attention heads");
+            }
+            auto * buft = cparams.offload_kqv ? ggml_backend_dev_buffer_type(model.dev_layer(il)) : ggml_backend_cpu_buffer_type();
+            plan_params.layers.push_back({hparams.n_embd_k_gqa(il), hparams.n_embd_v_gqa(il), buft});
+            if (!budgets.count(buft)) {
+                // free memory now, minus a 1 GiB margin; compute buffers are reserved later and are not included
+                auto * dev = ggml_backend_buft_get_device(buft);
+                dev = dev ? dev : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                size_t free = 0;
+                size_t total = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                budgets[buft] = free > (size_t(1) << 30) ? free - (size_t(1) << 30) : 0;
+            }
+        }
+        const auto plan = llama_kv_recency_plan_admit(plan_params, budgets);
+        plan_params.hot_tokens = plan.hot_tokens;
+        std::vector<ggml_backend_t> readers;
+        for (const auto & backend : backends) {
+            readers.push_back(backend.get());
+        }
+        auto * result = new llama_kv_cache_recency_live(model, layer_ids, plan_params, std::move(readers));
+        LLAMA_LOG_INFO("kv recency: live elastic cache: context = %u, hot = %u q8_0, ring = %u, cold = %u q4_0, page = %u, slab = %u\n",
+                plan.logical_ctx, plan.hot_tokens, plan.ring_tokens, plan.cold_tokens, plan.page_tokens, plan.slab_tokens);
+        LLAMA_LOG_INFO("kv recency: full-session slabs = %zu bytes, migration workspace = %zu bytes; allocated lazily\n",
+                plan.committed_alloc_bytes, plan.migration_workspace_bytes);
+        return result;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_WARN("kv recency: live cache unavailable: %s\n", error.what());
+        return nullptr;
+    }
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -275,6 +435,7 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.kv_recency = params.kv_recency;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -394,10 +555,54 @@ llama_context::llama_context(
             /*.type_v    =*/ params.type_v,
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.mem_other =*/ llama_kv_cache_recency::unwrap(llama_get_memory(cparams.ctx_other)),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        if (cparams.kv_recency) {
+            memory.reset(model.arch == LLM_ARCH_GLM5_NEXT ? kv_recency_glm(params_mem, params) : kv_recency_live(params_mem, params));
+        }
+        const bool recency_live = memory != nullptr;
+        if (!memory) {
+            memory.reset(model.create_memory(params_mem, cparams));
+        }
+        if (cparams.kv_recency && !recency_live) {
+            LLAMA_LOG_INFO("kv recency: planner only; normal KV remains active (K=%s, V=%s)\n",
+                    ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+            if (!memory || typeid(*memory) != typeid(llama_kv_cache) || hparams.is_mla() ||
+                    hparams.swa_type != LLAMA_SWA_TYPE_NONE || hparams.n_layer_kv_from_start >= 0 ||
+                    cparams.ctx_other || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || model.n_devices() > 1) {
+                LLAMA_LOG_WARN("kv recency: planner unavailable for this shared, hybrid, indexed, SWA or multi-device layout\n");
+            } else {
+                try {
+                    llama_kv_recency_plan_params plan_params;
+                    plan_params.logical_ctx = cparams.n_ctx_seq;
+                    plan_params.streams = cparams.kv_unified ? 1 : cparams.n_seq_max;
+                    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                        if (!hparams.has_kv(il)) {
+                            continue;
+                        }
+                        if (hparams.n_embd_head_k(il) % ggml_blck_size(GGML_TYPE_Q8_0) ||
+                                hparams.n_embd_head_v(il) % ggml_blck_size(GGML_TYPE_Q8_0)) {
+                            throw std::invalid_argument("KV recency requires block-aligned attention heads");
+                        }
+                        auto * buft = cparams.offload_kqv ? ggml_backend_dev_buffer_type(model.dev_layer(il))
+                                                       : ggml_backend_cpu_buffer_type();
+                        plan_params.layers.push_back({hparams.n_embd_k_gqa(il), hparams.n_embd_v_gqa(il), buft});
+                    }
+                    const auto plan = llama_kv_recency_plan_create(plan_params);
+                    LLAMA_LOG_INFO("kv recency: logical context = %u, padded physical tokens = %u, streams = %u\n",
+                            plan.logical_ctx, plan.physical_tokens, plan_params.streams);
+                    LLAMA_LOG_INFO("kv recency: page = %u, migration = %u, prefix = 0, hot = %u q8_0, cold = %u q4_0\n",
+                            plan.page_tokens, plan.migrate_tokens, plan.hot_tokens, plan.cold_tokens);
+                    LLAMA_LOG_INFO("kv recency: nominal hot = %zu, cold = %zu bytes; backend estimates hot = %zu, cold = %zu, migration reserve = %zu bytes\n",
+                            plan.hot_bytes, plan.cold_bytes, plan.hot_alloc_bytes, plan.cold_alloc_bytes, plan.migration_reserve_bytes);
+                    memory = std::make_unique<llama_kv_cache_recency>(std::move(memory), plan);
+                    LLAMA_LOG_INFO("kv recency: delegate wrapper active; normal KV remains active\n");
+                } catch (const std::exception & error) {
+                    LLAMA_LOG_WARN("kv recency: planner unavailable: %s; normal KV remains active\n", error.what());
+                }
+            }
+        }
     }
 
     // init backends
@@ -3879,6 +4084,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_recency                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

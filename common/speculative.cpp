@@ -2751,6 +2751,11 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        // the draft head is one layer: its prompt catch-up splits the target's ubatches into pieces of at most 1024,
+        // so its compute buffers (attention mask, indexer scores, MoE scratch) do not duplicate the target's
+        // (GLM-5.3-Flash at -c 65536 -ub 4096: 3.5 GB less, same speed; at -ub 8192 or 128K context the full-size
+        // copies pushed the box below its memory reserve)
+        cparams.n_ubatch = std::min<uint32_t>(cparams.n_ubatch, 1024);
     }
 
     // the draft context holds as many tokens per sequence as the target context

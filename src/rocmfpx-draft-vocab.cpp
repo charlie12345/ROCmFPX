@@ -81,7 +81,7 @@ void draft_vocabulary::upload(ggml_tensor * projection, ggml_tensor * scatter) c
     ggml_backend_tensor_set(scatter, data_->scatter.data(), 0, data_->scatter.size() * sizeof(int64_t));
 }
 std::shared_ptr<draft_vocabulary> draft_vocabulary_for(const llama_model * model) {
-    if (!model || model->arch != LLM_ARCH_QWEN4EXP) return {};
+    if (!model || (model->arch != LLM_ARCH_QWEN4EXP && model->arch != LLM_ARCH_GLM5_NEXT)) return {};
     const char * setting = std::getenv("ROCMFPX_DRAFT_VOCAB");
     if (!setting || !*setting) return {};
     char * end = nullptr;

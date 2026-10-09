@@ -694,6 +694,39 @@ llama_model_loader::llama_model_loader(
 
             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
         }
+
+        // Weight override sidecar: a GGUF whose tensors replace the same-named ones (e.g. requantized dense weights made
+        // by tools/requant-sidecar), so a variant only needs its changed tensors on disk. LLAMA_WEIGHT_OVERRIDE=<path>.
+        if (const char * ov = getenv("LLAMA_WEIGHT_OVERRIDE"); ov != nullptr && *ov != '\0') {
+            struct ggml_context * octx = NULL;
+            struct gguf_init_params oparams = {
+                /*.no_alloc = */ true,
+                /*.ctx      = */ &octx,
+            };
+            gguf_context_ptr octx_gguf { gguf_init_from_file(ov, oparams) };
+            if (!octx_gguf) {
+                throw std::runtime_error(format("%s: failed to load weight override %s", __func__, ov));
+            }
+            const uint16_t oidx = (uint16_t) files.size();
+            files.emplace_back(new llama_file(ov, "rb", use_direct_io));
+            contexts.emplace_back(octx);
+            int n_over = 0;
+            for (ggml_tensor * cur = ggml_get_first_tensor(octx); cur; cur = ggml_get_next_tensor(octx, cur)) {
+                auto it = weights_map.find(std::string(cur->name));
+                if (it == weights_map.end()) {
+                    throw std::runtime_error(format("weight override: tensor '%s' is not in the model", ggml_get_name(cur)));
+                }
+                const ggml_tensor * old = it->second.tensor;
+                if (!ggml_are_same_shape(old, cur)) {
+                    throw std::runtime_error(format("weight override: tensor '%s' has a different shape", ggml_get_name(cur)));
+                }
+                n_bytes += ggml_nbytes(cur);
+                n_bytes -= ggml_nbytes(old);
+                it->second = llama_tensor_weight(files.back().get(), oidx, octx_gguf.get(), cur);
+                ++n_over;
+            }
+            LLAMA_LOG_INFO("%s: %d tensors taken from weight override %s\n", __func__, n_over, ov);
+        }
     } else if (file != nullptr) {
         struct ggml_context * ctx = NULL;
         struct gguf_init_params params = {

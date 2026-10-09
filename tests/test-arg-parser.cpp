@@ -172,6 +172,15 @@ static void test(void) {
 
     std::vector<std::string> argv;
 
+    {
+        common_params recency;
+        assert(!recency.kv_recency && !llama_context_default_params().kv_recency);
+        argv = {"binary_name", "--kv-recency", "-m", "unused.gguf"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), recency, LLAMA_EXAMPLE_COMMON));
+        assert(recency.kv_recency && common_context_params_to_llama(recency).kv_recency);
+        assert(recency.cache_type_k == GGML_TYPE_F16 && recency.cache_type_v == GGML_TYPE_F16);
+    }
+
     printf("test-arg-parser: test invalid usage\n\n");
 
     // missing value
