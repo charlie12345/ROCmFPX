@@ -777,7 +777,10 @@ bool ggml_cuda_mmid_prefer_blas(const ggml_tensor * src0, int64_t n_tokens) {
 bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (!mmb_enabled()) return false;
     if (ggml_cuda_mm_prefer_blas(src0, src1->ne[1] * src1->ne[2] * src1->ne[3])) return false;
-    if (src0->type == GGML_TYPE_Q8_0) return false;   // int8 MMQ is faster and closer to the reference for dense Q8_0
+#if defined(GGML_USE_HIP)
+    // measured on gfx1151 only: int8 MMQ is faster and closer to the reference for dense Q8_0
+    if (src0->type == GGML_TYPE_Q8_0) return false;
+#endif // defined(GGML_USE_HIP)
     const bool quant = mmb_quant_type(src0->type);
     const bool bf16w = src0->type == GGML_TYPE_BF16 && mmb_bf16w();
     const bool f32w  = src0->type == GGML_TYPE_F32 && mmb_f32split();
