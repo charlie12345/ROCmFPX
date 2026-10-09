@@ -996,9 +996,13 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     // capture; the direct execution and prefill copy paths retain their dispatch.
     bool capture_scalar_copy = false;
 #if defined(GGML_USE_HIP)
+    // default on with managed (unified) memory, where captured copy nodes are unreliable; the switch still overrides
     static const bool graph_copy_kernel = [] {
         const char * value = getenv("ROCMFPX_HIP_GRAPH_COPY_KERNEL");
-        return value && atoi(value) == 1;
+        if (value) {
+            return atoi(value) == 1;
+        }
+        return getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr;
     }();
     const bool scalar_copy = src0->type == src1->type &&
         (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
