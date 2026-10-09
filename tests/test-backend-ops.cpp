@@ -10066,6 +10066,34 @@ struct test_mmb_quant_hc : test_case {
     }
 };
 
+// hyper-connection combine built with dsv4_hc_post, followed by the grouped RMS norm of the next block
+struct test_hc_post_norm : test_case {
+    const int tokens;
+    explicit test_hc_post_norm(int tokens) : tokens(tokens) {}
+    std::string op_desc(ggml_tensor *) override { return "HC_POST_NORM"; }
+    std::string vars() override { return VAR_TO_STR(tokens); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    double max_nmse_err() override { return 1e-6; }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE) init_tensor_uniform(t);
+        }
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int embd = 2560, hc = 4;
+        auto * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
+        auto * block    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, tokens);
+        auto * inject   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+        auto * gamma    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc);
+        auto * w = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 0.25f)), 2.0f);
+        if (gf) { ggml_build_forward_expand(gf, residual); ggml_build_forward_expand(gf, block); ggml_build_forward_expand(gf, w); }
+        auto * res = ggml_dsv4_hc_post(ctx, block, residual, w, nullptr);
+        auto * xn  = ggml_mul(ctx, ggml_rms_norm(ctx, res, 1e-6f), gamma);
+        return ggml_add(ctx, xn, res);
+    }
+};
+
 struct test_ple_conv : test_case {
     const ggml_type type;
     const int channels, tokens, slots, escape;
@@ -10202,6 +10230,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int tokens : {1, 33, 512, 513}) {
+        test_cases.emplace_back(new test_hc_post_norm(tokens));
+    }
     for (auto type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int tokens : {255,256,257,383,384,385}) test_cases.emplace_back(new test_ple_conv(type,256,tokens));
         test_cases.emplace_back(new test_ple_conv(type,256,256,1));
