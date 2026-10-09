@@ -960,6 +960,13 @@ static void top_k_parallel_radix_cuda(
         <<<nrows, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k);
 }
 
+static __global__ void top_k_copy_rows(const int * __restrict__ src, int * __restrict__ dst, const int ncols, const int k, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = src[(i / k) * ncols + i % k];
+    }
+}
+
 static bool top_k_use_small_kernel(int ncols, int nrows, int k) {
     if (k == 1) {
         return true;
@@ -1009,12 +1016,15 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         top_k_small_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
     } else if (ncols > 1024) {
         top_k_parallel_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+    } else if (k == ncols) {
+        argsort_f32_i32_cuda_bitonic(src0_d, dst_d, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
     } else {
+        // a kernel instead of cudaMemcpy2DAsync: captured device-to-device copy nodes corrupt data on gfx1151
         ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
         int * tmp_dst = temp_dst_alloc.get();
         argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
-        CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
-                                     cudaMemcpyDeviceToDevice, stream));
+        const int64_t n = k * nrows;
+        top_k_copy_rows<<<(n + 255) / 256, 256, 0, stream>>>(tmp_dst, dst_d, ncols, k, n);
     }
 #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
     ggml_cuda_pool & pool = ctx.pool();

@@ -12052,6 +12052,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // many rows with k close to or equal to ncols (sparse attention block selection)
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, 512, 1, 1}, 512));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, 513, 1, 1}, 256));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {1000, 33, 1, 1}, 999));
     for (int k : {4, 8, 16, 32}) {
         for (int nrows : {1, 8, 16}) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {202048, nrows, 1, 1}, k));
