@@ -778,8 +778,10 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
     if (!mmb_enabled()) return false;
     if (ggml_cuda_mm_prefer_blas(src0, src1->ne[1] * src1->ne[2] * src1->ne[3])) return false;
 #if defined(GGML_USE_HIP)
-    // measured on gfx1151 only: int8 MMQ is faster and closer to the reference for dense Q8_0
-    if (src0->type == GGML_TYPE_Q8_0) return false;
+    // measured on gfx1151 only: int8 MMQ is faster and closer to the reference for dense Q8_0 (Qwen3.8-Flash-Next HC
+    // up/down, 10240 <-> 320). Weights with fewer than 256 rows or columns stay on MMB: for GLM-5.3-Flash's thin
+    // projections (4096 -> 64/128, 128 -> 8192) MMQ ran at the same speed but raised 8K KLD 0.0150 -> 0.0175.
+    if (src0->type == GGML_TYPE_Q8_0 && src0->ne[0] >= 256 && src0->ne[1] >= 256) return false;
 #endif // defined(GGML_USE_HIP)
     const bool quant = mmb_quant_type(src0->type);
     const bool bf16w = src0->type == GGML_TYPE_BF16 && mmb_bf16w();
