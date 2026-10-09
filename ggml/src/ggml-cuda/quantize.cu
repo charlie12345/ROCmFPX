@@ -462,7 +462,19 @@ static __global__ void quantize_mmq_q8_1(
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
 
-    const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
+#ifdef GGML_USE_HIP
+    // Walk the row chunks of one token in consecutive workgroups. With the default order
+    // (token fastest) neighbouring workgroups read 2 KiB pieces of different rows, which on
+    // gfx1151 drops the quantization of a 10240-wide F32 activation to ~115 GB/s.
+    const int flat = blockIdx.y*gridDim.x + blockIdx.x;
+    const int row  = scatter ? (int) blockIdx.x : flat / (int) gridDim.y;
+    const int col  = scatter ? (int) blockIdx.y : flat % (int) gridDim.y;
+#else
+    const int row  = blockIdx.x;
+    const int col  = blockIdx.y;
+#endif // GGML_USE_HIP
+
+    const int64_t i0 = ((int64_t)blockDim.x*col + threadIdx.x)*4;
 
     if (i0 >= ne0) {
         return;
@@ -473,11 +485,11 @@ static __global__ void quantize_mmq_q8_1(
 
     int64_t base_idx;
     if constexpr (scatter) {
-        base_idx = (int64_t) blockIdx.x * s02; // one physical row per token
+        base_idx = (int64_t) row * s02; // one physical row per token
     } else {
         const int64_t i2  = blockIdx.z % ne2;
         const int64_t i3  = blockIdx.z / ne2;
-        const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+        const int64_t i01 = ids ? ids[row] : row;
         base_idx = i3*s03 + i2*s02 + i01*s01;
     }
 
@@ -540,11 +552,11 @@ static __global__ void quantize_mmq_q8_1(
     for (int slot = 0; slot < nwrite; ++slot) {
         int64_t ib;
         if constexpr (scatter) {
-            const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            const int64_t i = ids[(int64_t) row * n_expert_used + slot];
             ib = k_block*ne1 + i;
         } else {
             const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
-            ib = ib0 + k_block*ne1 + blockIdx.x;
+            ib = ib0 + k_block*ne1 + row;
         }
 
         if constexpr (i4_grid) {

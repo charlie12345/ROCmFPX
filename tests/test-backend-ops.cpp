@@ -11566,6 +11566,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));
+    // MMQ activation quantization with many row chunks per token (HIP walks a token's chunks in order)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0_ROCMI4, GGML_TYPE_F32, 48, 300, 6144, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0_ROCMI4, GGML_TYPE_F32, 64, 160, 1536, {2, 2}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0,        GGML_TYPE_F32, 40, 257, 10240, {1, 1}, {1, 1}));
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1, 64, 256, {1,  1}, {1, 1}));
     }
