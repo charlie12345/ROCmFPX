@@ -9319,6 +9319,63 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// GLM-5.3-Flash decode pattern: the pooled indexer keys are gathered from the q8_0 cache (GET_ROWS) and reshaped before
+// the lightning indexer; HIP reads the cache rows in place and skips the gather
+struct test_lightning_indexer_pool_gather : public test_case {
+    const int64_t nh;      // indexer heads
+    const int64_t n_cells; // cache rows
+    const int64_t n_pool;  // gathered pooled rows
+    const int64_t nb;      // queries
+
+    std::string vars() override {
+        return VARS_TO_STR4(nh, n_cells, n_pool, nb);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_lightning_indexer_pool_gather(int64_t nh = 32, int64_t n_cells = 4096, int64_t n_pool = 1024, int64_t nb = 1)
+        : nh(nh), n_cells(n_cells), n_pool(n_pool), nb(nb) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, nh, nb, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 128, n_cells);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_pool);
+        ggml_set_name(idx, "idx");
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, 1);
+        ggml_set_name(w, "w");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_pool, nb, 1, 1);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * pooled = ggml_get_rows(ctx, cache, idx);
+        pooled = ggml_reshape_3d(ctx, pooled, 128, 1, n_pool);
+        ggml_tensor * out = ggml_lightning_indexer(ctx, q, pooled, w, m);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> dist(0, (int32_t) n_cells - 1);
+                for (auto & v : data) {
+                    v = dist(rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -12091,6 +12148,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, 512, 1, 1}, 512));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, 513, 1, 1}, 256));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {1000, 33, 1, 1}, 999));
+    // GLM-5.3-Flash DSA decode: one score row per query over the pools (16K pools at 64K context), k = 512
+    for (int64_t ncols : {16384, 32768}) {
+        for (int64_t nrows : {1, 3}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {ncols, nrows, 1, 1}, 512));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {ncols, nrows, 1, 1}, 512, true));
+        }
+    }
     for (int k : {4, 8, 16, 32}) {
         for (int nrows : {1, 8, 16}) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {202048, nrows, 1, 1}, k));
@@ -12447,11 +12511,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
 
+    for (int64_t nh : {32, 64}) {
+        for (int64_t nb : {1, 3, 4, 16}) {
+            test_cases.emplace_back(new test_lightning_indexer_pool_gather(nh, 4096, 1024, nb));
+        }
+    }
+    test_cases.emplace_back(new test_lightning_indexer_pool_gather(32, 4096, 1000, 1));
+
     // sparse attn (GLM-5.3-Flash DSA shape: 512-wide K-only latent, gqa 64, V a view of K): prefill groups, a ragged group, decode
     for (ggml_type kv_type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 16384, 32, true, false, 0, 0, GGML_PREC_F32, kv_type, kv_type, {0, 1, 2, 3}, true, true, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 16384, 37, true, false, 0, 0, GGML_PREC_F32, kv_type, kv_type, {0, 1, 2, 3}, true, true, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1},  8192,  1, true, false, 0, 0, GGML_PREC_F32, kv_type, kv_type, {0, 1, 2, 3}, true, true, 2048));
+        // decode and verification batches over a cache of at least 8x the selection: the split list kernel
+        for (int64_t nb : {1, 3, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 16384, nb, true, false, 0, 0, GGML_PREC_F32, kv_type, kv_type, {0, 1, 2, 3}, true, true, 2048));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, kv_type, kv_type, {0, 1, 2, 3}, true, true, 2304));
         // WMMA prefill once the selection is at most half of the keys (2 x n_kv_max <= kv): each token walks its
         // selected cells; 2048 keys select all of them and stay on the two-token kernel
         for (int64_t kv : {2048, 4096, 8192, 16384}) {
@@ -12743,6 +12819,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
     }
+    // decode and verification batches (heads on the WMMA rows)
+    for (int bs : { 2, 4, 16 }) {
+        for (int nh : { 32, 64 }) {
+            for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+                test_cases.emplace_back(new test_lightning_indexer(128, nh, 1000, bs, 1, 1, type_K));
+                test_cases.emplace_back(new test_lightning_indexer(128, nh, 256, bs, 4, 1, type_K));
+            }
+        }
+    }
 
     for (int tokens : {128, 511, 512, 513, 1024}) {
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
@@ -12759,6 +12844,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // GLM-5.3-Flash DSA prefill attention at depth: 512 queries, each walking its own 2048-cell selection list
+    for (int kv : {65536, 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, 2048));
+    }
+    // GLM-5.3-Flash DSA decode attention: one query, 64 heads on one latent KV head, 2048 selected cells, deep caches
+    for (int kv : {16384, 65536, 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, 2048));
+    }
+    // GLM-5.3-Flash decode GEMVs of the KDA layers (f_a/g_a, beta, f_b/g_b) and the mHC mixes
+    for (auto mk : std::vector<std::array<int64_t, 2>>{{128, 4096}, {64, 4096}, {8192, 128}, {24, 16384}, {512, 4096}, {1536, 4096}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], 1, mk[1], {1, 1}, {1, 1}));
+    }
     // GLM-5.3-Flash MLA absorption at a 4096-token ubatch: per head 256 -> 512 (k_b) and 512 -> 256 (v_b), 64 heads
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 4096, 256, {64, 1}, {1, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 4096, 512, {64, 1}, {1, 1}, {0, 2, 1, 3}));
@@ -13316,6 +13413,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     }
                 }
             }
+        }
+    }
+    // GLM-5.3-Flash decode / verification at 128K: 32768 pooled rows read in place from the q8_0 cache
+    for (int64_t nb : {1, 4}) {
+        test_cases.emplace_back(new test_lightning_indexer_pool_gather(32, 131072, 32768, nb));
+    }
+    // DSA decode top-k over the pools (16K / 32K pools at 64K / 128K), k = 512
+    for (int64_t ncols : {16384, 32768}) {
+        for (int64_t nrows : {1, 4}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {ncols, nrows, 1, 1}, 512));
         }
     }
 

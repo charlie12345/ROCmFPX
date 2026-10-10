@@ -1,6 +1,7 @@
 #include "fattn-glm512.cuh"
 #include "convert.cuh"
 #include "fattn-common.cuh"
+#include "dsa-mask.cuh"
 
 #include <cstring>
 
@@ -33,12 +34,19 @@ static __device__ __forceinline__ g5_v16h g5_ld16(const _Float16 * p) {
 #endif
 
 // partial: rows of D+2 values per head, the unnormalized output then (max, sum), as FLASH_ATTN_EXT_PARTIAL defines
-template <bool partial>
-__launch_bounds__(G5_NT, 1)
+// split (chunk > 0, lists only): block (t, s) walks entries [s*chunk, (s+1)*chunk) of token t's list and writes its
+// partial to slice s of dst (glm512_split_combine merges the slices). kq8: K is the q8_0 cache itself (K8, row stride
+// sk8 blocks), dequantized while a key block is staged, so decode does not convert the whole cache first.
+// The f16 instantiations are limited to 192 VGPRs (8 waves per SIMD, about 100 bytes of spills) so that two blocks
+// share a WGP and one block's barriers overlap the other's math; the q8_0 decode split runs a few dozen blocks and
+// keeps its registers.
+template <bool partial, bool kq8 = false>
+__launch_bounds__(G5_NT, kq8 ? 1 : 8)
 __global__ void flash_attn_glm512(
         const float * __restrict__ Q, const half * __restrict__ K, const half * __restrict__ mask, float * __restrict__ dst,
         const int n_kv, const int64_t sq_tok, const int64_t sq_head, const int64_t sk, const int64_t sm, const float scale,
-        const int32_t * __restrict__ lists = nullptr, const int32_t * __restrict__ counts = nullptr, const int n_kv_max = 0) {
+        const int32_t * __restrict__ lists = nullptr, const int32_t * __restrict__ counts = nullptr, const int n_kv_max = 0,
+        const int chunk = 0, const block_q8_0 * __restrict__ K8 = nullptr, const int64_t sk8 = 0) {
 #if defined(GGML_USE_HIP) && defined(RDNA3)
     __shared__ __align__(16) _Float16 Ks[G5_KB][G5_D + 8];   // key rows
     __shared__ __align__(16) _Float16 Kt[G5_D][G5_KB];       // the same rows transposed (built in the softmax phase), B of P*V
@@ -47,6 +55,7 @@ __global__ void flash_attn_glm512(
     __shared__ float m_s[G5_H];
     __shared__ float l_s[G5_H];
     __shared__ float a_s[G5_H];
+    __shared__ float Mv[G5_KB];                               // mask values of the staged rows (prefetched list walk)
 
     const int t    = blockIdx.x;
     const int tid  = threadIdx.x;
@@ -88,15 +97,76 @@ __global__ void flash_attn_glm512(
     // list mode: walk this token's selected cells (a sorted list) instead of every key block
     const int32_t * lst = lists ? lists + (int64_t) t*n_kv_max : nullptr;
     const int n_iter = lists ? counts[t] : n_kv;
+    int kb_beg = 0, kb_end = n_iter;
+    if (chunk > 0) {
+        kb_beg = blockIdx.y*chunk;
+        kb_end = min(n_iter, kb_beg + chunk);
+        dst   += (int64_t) blockIdx.y*gridDim.x*G5_H*(G5_D + 2);
+    }
     auto mask_at = [&](const int kk) -> float {
         if (lists) {
-            return kk < n_iter ? __half2float(mrow[lst[kk]]) : -INFINITY;
+            return kk < kb_end ? __half2float(mrow[lst[kk]]) : -INFINITY;
         }
         return __half2float(mrow[kk]);
     };
+    // list walk: the next block's rows and mask values are loaded into registers while this block computes, so the
+    // dependent list -> row gathers are not exposed after every barrier (kq8: the raw 16 quants and the block scale,
+    // dequantized when staged)
+    const bool pf = lists != nullptr;
+    const int  srow = tid / 32;
+    const int  scol = (tid % 32)*16;
+    uint4 nk0 = make_uint4(0, 0, 0, 0), nk1 = nk0;
+    float nmv = -INFINITY;
+    auto fetch = [&](const int kb) {
+        const int idx = kb + srow < kb_end ? lst[kb + srow] : -1;
+        if (idx >= 0 && kq8) {
+            const block_q8_0 * b = K8 + (int64_t) idx*sk8 + scol/QK8_0;
+            const uint16_t * qs = (const uint16_t *) (b->qs + scol%QK8_0);
+            nk0 = make_uint4(qs[0] | (uint32_t) qs[1] << 16, qs[2] | (uint32_t) qs[3] << 16,
+                             qs[4] | (uint32_t) qs[5] << 16, qs[6] | (uint32_t) qs[7] << 16);
+            nk1.x = __half_as_ushort(b->d);
+            nmv = __half2float(mrow[idx]);
+        } else if (idx >= 0) {
+            const uint4 * src = (const uint4 *) (K + (int64_t) idx*sk + scol);
+            nk0 = src[0];
+            nk1 = src[1];
+            nmv = __half2float(mrow[idx]);
+        } else {
+            nk0 = make_uint4(0, 0, 0, 0);
+            nk1 = nk0;
+            nmv = -INFINITY;
+        }
+    };
+    if (pf && kb_beg < kb_end) {
+        fetch(kb_beg);
+    }
     __syncthreads();
 
-    for (int kb = 0; kb < n_iter; kb += G5_KB) {
+    for (int kb = kb_beg; kb < kb_end; kb += G5_KB) {
+        if (pf && kq8) {
+            // -inf rows (past the list end) were zeroed: their quants and scale are 0
+            const float d = __half2float(__ushort_as_half((unsigned short) nk1.x));
+            const uint32_t qw[4] = {nk0.x, nk0.y, nk0.z, nk0.w};
+            __align__(16) _Float16 v[16];
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                v[e] = (_Float16) (d*(float) (int8_t) ((qw[e/4] >> (8*(e%4))) & 0xff));
+            }
+            *(uint4 *) &Ks[srow][scol]     = *(const uint4 *) &v[0];
+            *(uint4 *) &Ks[srow][scol + 8] = *(const uint4 *) &v[8];
+        } else if (pf) {
+            *(uint4 *) &Ks[srow][scol]     = nk0;
+            *(uint4 *) &Ks[srow][scol + 8] = nk1;
+        }
+        if (pf) {
+            if (tid % 32 == 0) {
+                Mv[srow] = nmv;
+            }
+            __syncthreads();
+            if (kb + G5_KB < kb_end) {
+                fetch(kb + G5_KB);
+            }
+        } else {
         // every warp sees the same 16 mask values, so the skip is uniform without a barrier
         if (!lists) {
             const float mv = __half2float(mrow[kb + r]);
@@ -109,8 +179,22 @@ __global__ void flash_attn_glm512(
         {
             const int row = tid / 32;
             const int col = (tid % 32)*16;
-            const int idx = lists ? (kb + row < n_iter ? lst[kb + row] : -1) : kb + row;
-            if (idx >= 0) {
+            const int idx = lists ? (kb + row < kb_end ? lst[kb + row] : -1) : kb + row;
+            if (idx >= 0 && kq8) {
+                // half of a 34-byte q8_0 block: its scale, then 16 of its 32 values (2-byte aligned)
+                const block_q8_0 * b = K8 + (int64_t) idx*sk8 + col/QK8_0;
+                const float d = __half2float(b->d);
+                const uint16_t * qs = (const uint16_t *) (b->qs + col%QK8_0);
+                __align__(16) _Float16 v[16];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const uint16_t w = qs[e];
+                    v[2*e]     = (_Float16) (d*(float) (int8_t) (w & 0xff));
+                    v[2*e + 1] = (_Float16) (d*(float) (int8_t) (w >> 8));
+                }
+                *(uint4 *) &Ks[row][col]     = *(const uint4 *) &v[0];
+                *(uint4 *) &Ks[row][col + 8] = *(const uint4 *) &v[8];
+            } else if (idx >= 0) {
                 const uint4 * src = (const uint4 *) (K + (int64_t) idx*sk + col);
                 *(uint4 *) &Ks[row][col]     = src[0];
                 *(uint4 *) &Ks[row][col + 8] = src[1];
@@ -120,6 +204,7 @@ __global__ void flash_attn_glm512(
             }
         }
         __syncthreads();
+        }
 
         // partial scores over this warp's 128 dims: rows = heads, columns = keys
         {
@@ -157,8 +242,8 @@ __global__ void flash_attn_glm512(
             const int k0 = (tid % 8)*2;
             float s0 = Sp[0][h][k0]     + Sp[1][h][k0]     + Sp[2][h][k0]     + Sp[3][h][k0];
             float s1 = Sp[0][h][k0 + 1] + Sp[1][h][k0 + 1] + Sp[2][h][k0 + 1] + Sp[3][h][k0 + 1];
-            s0 += mask_at(kb + k0);
-            s1 += mask_at(kb + k0 + 1);
+            s0 += pf ? Mv[k0]     : mask_at(kb + k0);
+            s1 += pf ? Mv[k0 + 1] : mask_at(kb + k0 + 1);
             float bmax = fmaxf(s0, s1);
 #pragma unroll
             for (int off = 1; off < 8; off *= 2) {
@@ -224,9 +309,36 @@ __global__ void flash_attn_glm512(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q, K, mask, dst, n_kv, sq_tok, sq_head, sk, sm, scale);
+    GGML_UNUSED_VARS(Q, K, mask, dst, n_kv, sq_tok, sq_head, sk, sm, scale, lists, counts, n_kv_max, chunk, K8, sk8);
     NO_DEVICE_CODE;
 #endif // defined(GGML_USE_HIP) && defined(RDNA3)
+}
+
+// merges the n_split partial slices of the split kernel: dst[t][h] = sum_s w_s O_s / sum_s w_s l_s, w_s = exp(m_s - max m)
+__global__ void glm512_split_combine(const float * __restrict__ part, float * __restrict__ dst, const int n_q, const int n_split) {
+    const int h = blockIdx.x, t = blockIdx.y;
+    constexpr int row = G5_D + 2;
+    float m = -INFINITY;
+    for (int s = 0; s < n_split; ++s) {
+        m = fmaxf(m, part[(((int64_t) s*n_q + t)*G5_H + h)*row + G5_D]);
+    }
+    float l = 0.0f;
+    float acc[G5_D/128] = {0.0f};
+    for (int s = 0; s < n_split; ++s) {
+        const float * p = part + (((int64_t) s*n_q + t)*G5_H + h)*row;
+        const float ms = p[G5_D];
+        const float w  = ms == -INFINITY ? 0.0f : expf(ms - m);
+        l += w*p[G5_D + 1];
+#pragma unroll
+        for (int i = 0; i < G5_D/128; ++i) {
+            acc[i] += w*p[threadIdx.x + 128*i];
+        }
+    }
+    const float inv = l > 0.0f ? 1.0f/l : 0.0f;
+#pragma unroll
+    for (int i = 0; i < G5_D/128; ++i) {
+        dst[((int64_t) t*G5_H + h)*G5_D + threadIdx.x + 128*i] = acc[i]*inv;
+    }
 }
 
 // Two query tokens per block (128 rows: token-major, then head), 32 warps: warp w owns rows 16*(w/4).. and dims
@@ -432,6 +544,59 @@ bool ggml_cuda_flash_attn_ext_glm512(ggml_backend_cuda_context & ctx, ggml_tenso
     if (max_bias != 0.0f || logit_softcap != 0.0f) {
         return false;
     }
+    // DSA decode and verification batches (1-8 queries, selection at most 1/8 of the cache): each query's selection list
+    // is split over about one block per CU, the q8_0 cache rows are dequantized while staged, and the partial slices
+    // are merged. The tile kernel took about 300 us per call for 2048 selected rows (one block per 8 heads).
+    {
+        static const bool decode_split = [] {
+            const char * e = getenv("GGML_CUDA_GLM512_DECODE");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        const int32_t n_sel = partial ? 0 : ggml_get_op_params_i32(dst, 4);
+        const bool k_ok = (K->type == GGML_TYPE_Q8_0 && K->nb[1] == ggml_row_size(GGML_TYPE_Q8_0, K->ne[0]) && K->nb[1] % sizeof(block_q8_0) == 0) ||
+                          (K->type == GGML_TYPE_F16 && K->nb[0] == sizeof(half) && K->nb[1] % 16 == 0);
+        if (decode_split && !partial && n_sel > 0 && 8*int64_t(n_sel) <= K->ne[1] && Q->ne[1] >= 1 && Q->ne[1] <= 8 && k_ok &&
+                Q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && mask->type == GGML_TYPE_F16 &&
+                Q->ne[0] == G5_D && K->ne[0] == G5_D && V->ne[0] == G5_D && Q->ne[2] == G5_H && K->ne[2] == 1 &&
+                Q->ne[3] == 1 && K->ne[3] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1 && mask->ne[0] >= K->ne[1] &&
+                mask->ne[1] >= Q->ne[1] && V->data == K->data && V->nb[1] == K->nb[1] && V->type == K->type &&
+                ggml_is_contiguous(dst) && Q->nb[0] == sizeof(float) && mask->nb[0] == sizeof(half)) {
+            cudaStream_t stream = ctx.stream();
+            const int n_q  = (int) Q->ne[1];
+            const int nsm  = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+            const int per  = std::max(1, nsm/n_q);                          // splits per query, about one block per CU
+            const int chunk   = std::max(G5_KB, (int) GGML_PAD((n_sel + per - 1)/per, G5_KB));
+            const int n_split = (n_sel + chunk - 1)/chunk;
+
+            // the selection lists come from the DSA mask build when it made them (dsa-mask.cu), else from the mask
+            ggml_cuda_pool_alloc<int32_t> lists(ctx.pool());
+            const int32_t * lst_d = nullptr, * cnt_d = nullptr;
+            if (ctx.curr_stream_no != 0 || !ggml_cuda_dsa_lists_lookup(ctx.device, mask, n_q, n_sel, &lst_d, &cnt_d)) {
+                const int64_t n_scratch = int64_t(ggml_cuda_flash_attn_ext_compact_mask_scratch(mask))*n_q;
+                lists.alloc(int64_t(n_q)*n_sel + n_q + n_scratch);
+                int32_t * counts = lists.ptr + int64_t(n_q)*n_sel;
+                ggml_cuda_flash_attn_ext_compact_mask(mask, lists.ptr, counts, n_q, 1, n_sel, stream, n_scratch ? counts + n_q : nullptr);
+                lst_d = lists.ptr;
+                cnt_d = counts;
+            }
+
+            ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) n_split*n_q*G5_H*(G5_D + 2));
+            const dim3 grid((unsigned) n_q, (unsigned) n_split, 1);
+            if (K->type == GGML_TYPE_Q8_0) {
+                flash_attn_glm512<true, true><<<grid, dim3(G5_NT, 1, 1), 0, stream>>>((const float *) Q->data, nullptr,
+                    (const half *) mask->data, part.ptr, (int) K->ne[1], Q->nb[1]/sizeof(float), Q->nb[2]/sizeof(float), 0,
+                    mask->nb[1]/sizeof(half), scale, lst_d, cnt_d, n_sel, chunk,
+                    (const block_q8_0 *) K->data, K->nb[1]/sizeof(block_q8_0));
+            } else {
+                flash_attn_glm512<true, false><<<grid, dim3(G5_NT, 1, 1), 0, stream>>>((const float *) Q->data, (const half *) K->data,
+                    (const half *) mask->data, part.ptr, (int) K->ne[1], Q->nb[1]/sizeof(float), Q->nb[2]/sizeof(float),
+                    K->nb[1]/sizeof(half), mask->nb[1]/sizeof(half), scale, lst_d, cnt_d, n_sel, chunk);
+            }
+            glm512_split_combine<<<dim3(G5_H, (unsigned) n_q, 1), dim3(128, 1, 1), 0, stream>>>(part.ptr, (float *) dst->data, n_q, n_split);
+            CUDA_CHECK(cudaGetLastError());
+            return true;
+        }
+    }
     // shape: 512-wide K-only latents (V is K), one KV head, 64 query heads, one sequence, enough queries to fill the GPU
     if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F16 ||
             Q->ne[0] != G5_D || V->ne[0] != G5_D || K->ne[0] != G5_D || Q->ne[2] != G5_H || K->ne[2] != 1 ||
@@ -486,18 +651,23 @@ bool ggml_cuda_flash_attn_ext_glm512(ggml_backend_cuda_context & ctx, ggml_tenso
     ggml_cuda_pool_alloc<int32_t> lists(ctx.pool());
     if (use_lists) {
         const int64_t n_q = Q->ne[1];
-        const int64_t n_scratch = int64_t(ggml_cuda_flash_attn_ext_compact_mask_scratch(mask))*n_q;
-        lists.alloc(n_q*n_kv_max + n_q + n_scratch);
-        int32_t * counts = lists.ptr + n_q*n_kv_max;
-        ggml_cuda_flash_attn_ext_compact_mask(mask, lists.ptr, counts, (int) n_q, 1, n_kv_max, stream,
-            n_scratch ? counts + n_q : nullptr);
+        const int32_t * lst_d = nullptr, * cnt_d = nullptr;
+        if (ctx.curr_stream_no != 0 || !ggml_cuda_dsa_lists_lookup(ctx.device, mask, (int) n_q, n_kv_max, &lst_d, &cnt_d)) {
+            const int64_t n_scratch = int64_t(ggml_cuda_flash_attn_ext_compact_mask_scratch(mask))*n_q;
+            lists.alloc(n_q*n_kv_max + n_q + n_scratch);
+            int32_t * counts = lists.ptr + n_q*n_kv_max;
+            ggml_cuda_flash_attn_ext_compact_mask(mask, lists.ptr, counts, (int) n_q, 1, n_kv_max, stream,
+                n_scratch ? counts + n_q : nullptr);
+            lst_d = lists.ptr;
+            cnt_d = counts;
+        }
         kernel<<<grid, block, 0, stream>>>((const float *) Q->data, K_h, (const half *) mask->data, (float *) dst->data,
             (int) K->ne[1], Q->nb[1]/sizeof(float), Q->nb[2]/sizeof(float), sk, mask->nb[1]/sizeof(half), scale,
-            lists.ptr, counts, n_kv_max);
+            lst_d, cnt_d, n_kv_max, 0, nullptr, 0);
     } else {
         kernel<<<grid, block, 0, stream>>>((const float *) Q->data, K_h, (const half *) mask->data, (float *) dst->data,
             (int) K->ne[1], Q->nb[1]/sizeof(float), Q->nb[2]/sizeof(float), sk, mask->nb[1]/sizeof(half), scale,
-            nullptr, nullptr, 0);
+            nullptr, nullptr, 0, 0, nullptr, 0);
     }
     }
     CUDA_CHECK(cudaGetLastError());

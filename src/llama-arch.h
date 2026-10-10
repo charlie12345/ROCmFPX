@@ -550,6 +550,8 @@ enum llm_tensor {
     LLM_TENSOR_SSM_BETA,            // kimi: beta mixing coefficient and qwen3.5
     LLM_TENSOR_SSM_G_A,             // kimi: output gate projection A
     LLM_TENSOR_SSM_G_B,             // kimi: output gate projection B
+    LLM_TENSOR_SSM_FGB_A,           // glm5-next: f_a, g_a and beta stacked (merge sidecar)
+    LLM_TENSOR_SSM_FG_B,            // glm5-next: f_b and g_b as a 2-batch weight (merge sidecar)
     LLM_TENSOR_SSM_G,               // kimi-k3: full-rank KDA gate
     LLM_TENSOR_ATTN_RES_SCORE,      // kimi-k3: fused res_norm*res_proj (pre-attn)
     LLM_TENSOR_FFN_RES_SCORE,       // kimi-k3: fused res_norm*res_proj (pre-ffn)

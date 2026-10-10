@@ -556,6 +556,8 @@ struct llama_layer {
     struct ggml_tensor * ssm_g_a    = nullptr;
     struct ggml_tensor * ssm_g_b    = nullptr;
     struct ggml_tensor * ssm_o_norm = nullptr;
+    struct ggml_tensor * ssm_fgb_a  = nullptr; // glm5-next merge sidecar: [f_a; g_a; beta] rows
+    struct ggml_tensor * ssm_fg_b   = nullptr; // glm5-next merge sidecar: f_b and g_b, batch of 2
 
     // kimi-k3
     struct ggml_tensor * ssm_g           = nullptr; // full-rank KDA gate (replaces ssm_g_a/ssm_g_b)

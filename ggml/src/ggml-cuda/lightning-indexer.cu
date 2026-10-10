@@ -798,6 +798,7 @@ static bool ggml_cuda_lightning_indexer_generic_supported(int device, const ggml
 struct indexer_layout {
     size_t q1, q2, q3, k2, k3, w1, w3, m1, m3, d1, d3;
     int nq, nk, nm;
+    const int32_t * kidx = nullptr;   // block_q8_0 keys: key i is cache row kidx[i] (row stride k2)
 };
 
 // Any multiple of 4 heads (GLM-5.3-Flash: 32): the same tiles as qsa_indexer_wmma16_keyreg, with the queries staged
@@ -823,8 +824,15 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_heads(
             const int key=kfirst+warp*16+AB::get_i(l),d=part*16+2*AB::get_j(l);
             float2 value=make_float2(0,0);
             if(key<s.nk) {
-                const K * src=(const K *)(k+size_t(stream)*s.k3+size_t(key)*s.k2);
-                value=make_float2(float(src[d]),float(src[d+1]));
+                if constexpr (std::is_same_v<K, block_q8_0>) {
+                    // pooled keys read in place from the q8_0 cache through the gather's row list
+                    const block_q8_0 * b=(const block_q8_0 *)(k+size_t(stream)*s.k3+size_t(s.kidx[key])*s.k2)+d/QK8_0;
+                    const float sc=__half2float(b->d);
+                    value=make_float2(sc*float(b->qs[d%QK8_0]),sc*float(b->qs[d%QK8_0+1]));
+                } else {
+                    const K * src=(const K *)(k+size_t(stream)*s.k3+size_t(key)*s.k2);
+                    value=make_float2(float(src[d]),float(src[d+1]));
+                }
             }
             keys[part].x[l]=__float22half2_rn(value);
         }
@@ -882,6 +890,111 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_heads(
             const half * mr=(const half *)(mask+size_t(stream%s.nm)*s.m3+size_t(token)*s.m1);
             float * out=(float *)(dst+size_t(stream)*s.d3+size_t(token)*s.d1);
             out[key]=score[l]+float(mr[key]);
+        }
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+
+// Decode and verification batches (at most 16 queries): the tiles above put 16 queries on the WMMA rows, so a
+// single decode query used one row in 16 while every block still ran all its head passes. Here the rows are 16 heads
+// of one query: per 16-head group, 8 WMMAs give the heads' scores for a warp's 16 keys, and the relu-weighted head
+// sum is a reduction over the tile's rows (8 rows per lane, then the other half-wave). The block's 64 keys are
+// staged once in LDS with whole-row loads (q8_0: one 34-byte block per thread, dequantized once) instead of
+// per-element gathers, and each query's heads are staged together.
+template <typename K, int NH>
+__global__ __launch_bounds__(128) void qsa_indexer_wmma16_decode(
+        const char * q, const char * k, const char * w, const char * mask,
+        char * dst, indexer_layout s) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+    using namespace ggml_cuda_mma;
+    using AB=tile<16,8,half2,DATA_LAYOUT_I_MAJOR_MIRRORED>;
+    using C=tile<16,16,float,DATA_LAYOUT_J_MAJOR>;
+    static_assert(NH % 16 == 0, "heads in groups of 16");
+    const int warp=threadIdx.y,lane=threadIdx.x,tid=warp*32+lane;
+    const int kfirst=int(blockIdx.x)*64,stream=blockIdx.z;
+    __shared__ __align__(16) half2 key_tile[64][68];
+    __shared__ __align__(16) half2 query_tile[NH][68];
+    if constexpr (std::is_same_v<K, block_q8_0>) {
+        // 64 keys x 4 blocks of 32 values: two blocks per thread
+#pragma unroll
+        for(int p=tid;p<64*4;p+=128) {
+            const int row=p/4,blk=p%4,key=kfirst+row;
+            half2 v[16];
+            if(key<s.nk) {
+                const block_q8_0 * b=(const block_q8_0 *)(k+size_t(stream)*s.k3+size_t(s.kidx[key])*s.k2)+blk;
+                const float sc=__half2float(b->d);
+                const uint16_t * qs=(const uint16_t *) b->qs;
+#pragma unroll
+                for(int e=0;e<16;++e) {
+                    const uint16_t x=qs[e];
+                    v[e]=__float22half2_rn(make_float2(sc*float((int8_t)(x&0xff)),sc*float((int8_t)(x>>8))));
+                }
+            } else {
+#pragma unroll
+                for(int e=0;e<16;++e) v[e]=make_half2(0.0f,0.0f);
+            }
+#pragma unroll
+            for(int e=0;e<16;e+=4) *(uint4 *)&key_tile[row][blk*16+e]=*(const uint4 *)&v[e];
+        }
+    } else {
+        // 64 keys x 32 groups of 4 values
+#pragma unroll 4
+        for(int p=tid;p<64*32;p+=128) {
+            const int row=p/32,d=4*(p%32),key=kfirst+row;
+            float4 value=make_float4(0,0,0,0);
+            if(key<s.nk) {
+                const K * src=(const K *)(k+size_t(stream)*s.k3+size_t(key)*s.k2)+d;
+                value=make_float4(float(src[0]),float(src[1]),float(src[2]),float(src[3]));
+            }
+            key_tile[row][d/2]=__float22half2_rn(make_float2(value.x,value.y));
+            key_tile[row][d/2+1]=__float22half2_rn(make_float2(value.z,value.w));
+        }
+    }
+    __syncthreads();
+    AB keys[8];
+#pragma unroll
+    for(int part=0;part<8;++part) {
+#pragma unroll
+        for(int l=0;l<AB::ne;++l) keys[part].x[l]=key_tile[warp*16+AB::get_i(l)][part*8+AB::get_j(l)];
+    }
+    const int key=kfirst+warp*16+C::get_j(0);   // this lane's column (the same for every l)
+#pragma unroll 1
+    for(int token=0;token<s.nq;++token) {
+        if(token>0) {
+            __syncthreads();   // the previous query is done with the tile
+        }
+        for(int i=tid;i<NH*32;i+=128) {
+            const int row=i/32,d=4*(i%32);
+            const float * src=(const float *)(q+size_t(stream)*s.q3+size_t(token)*s.q2+size_t(row)*s.q1)+d;
+            const float4 value=make_float4(src[0],src[1],src[2],src[3]);
+            query_tile[row][d/2]=__float22half2_rn(make_float2(value.x,value.y));
+            query_tile[row][d/2+1]=__float22half2_rn(make_float2(value.z,value.w));
+        }
+        __syncthreads();
+        const float * wr=(const float *)(w+size_t(stream)*s.w3+size_t(token)*s.w1);
+        float score=0.0f;
+#pragma unroll
+        for(int h0=0;h0<NH;h0+=16) {
+            C acc;
+#pragma unroll
+            for(int l=0;l<C::ne;++l) acc.x[l]=0.0f;
+#pragma unroll
+            for(int part=0;part<8;++part) {
+                AB query;
+#pragma unroll
+                for(int l=0;l<AB::ne;++l) query.x[l]=query_tile[h0+AB::get_i(l)][part*8+AB::get_j(l)];
+                mma(acc,query,keys[part]);
+            }
+#pragma unroll
+            for(int l=0;l<C::ne;++l) score+=fmaxf(acc.x[l],0.0f)*wr[h0+C::get_i(l)];
+        }
+        score+=__shfl_xor(score,16,32);
+        if(lane<16 && key<s.nk) {
+            const half * mr=(const half *)(mask+size_t(stream%s.nm)*s.m3+size_t(token)*s.m1);
+            float * out=(float *)(dst+size_t(stream)*s.d3+size_t(token)*s.d1);
+            out[key]=score+float(mr[key]);
         }
     }
 #else
@@ -981,7 +1094,64 @@ static bool supports_indexer4(int device, const ggml_tensor * dst) {
     return dst->ne[0]==k->ne[2] && dst->ne[1]==q->ne[2] && dst->ne[2]==1 && dst->ne[3]==q->ne[3];
 }
 
+// GLM-5.3-Flash decode gathers every pooled indexer key from the q8_0 cache into an f32 copy before scoring
+// (GET_ROWS, about 56 us at 64K for one query). When the indexer's keys are such a gather (through views), the
+// 32/64-head kernel reads the cache rows in place instead, and the gather is skipped when nothing else reads it
+// (ggml_cuda_lightning_indexer_gather_skippable). Reading in place is correct either way: nothing writes the
+// pooled rows between the gather and the indexer. GGML_CUDA_INDEXER_GATHER=0 disables it.
+const ggml_tensor * ggml_cuda_lightning_indexer_pool_gather(int device, const ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_INDEXER_GATHER");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!enabled || dst->op != GGML_OP_LIGHTNING_INDEXER || !supports_indexer4(device, dst)) {
+        return nullptr;
+    }
+    const auto * q = dst->src[0], * k = dst->src[1];
+    // decode and verification batches only: in prefill every block of 16 queries would dequantize the pooled rows
+    // again, which costs more than one f32 copy (pp4096 at depth 128K: 401.9 with the copy, 395.4 in place)
+    if ((q->ne[1] != 32 && q->ne[1] != 64) || q->ne[2] > 16 || q->ne[3] != 1 || k->type != GGML_TYPE_F32 || k->ne[3] != 1) {
+        return nullptr;
+    }
+    const ggml_tensor * gr = k;
+    while (gr->view_src && (gr->op == GGML_OP_RESHAPE || gr->op == GGML_OP_VIEW) && gr->view_offs == 0) {
+        gr = gr->view_src;
+    }
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || !ggml_is_contiguous(gr)) {
+        return nullptr;
+    }
+    const ggml_tensor * src = gr->src[0], * idx = gr->src[1];
+    if (!src || !idx || src->type != GGML_TYPE_Q8_0 || src->ne[0] != 128 || src->nb[1] % 2 != 0 ||
+            src->ne[2] != 1 || src->ne[3] != 1 || idx->type != GGML_TYPE_I32 || !ggml_is_contiguous(idx) ||
+            ggml_nelements(idx) != k->ne[2] || ggml_nelements(gr) != 128*k->ne[2] || k->nb[2] != 128*sizeof(float)) {
+        return nullptr;
+    }
+    return gr;
+}
+
+// heads on the WMMA rows for at most 16 queries (qsa_indexer_wmma16_decode); GGML_CUDA_INDEXER_DECODE=0 disables it
+static bool indexer_decode_tiles(const ggml_tensor * q) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_INDEXER_DECODE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled && q->ne[2] <= 16 && (q->ne[1] == 32 || q->ne[1] == 64);
+}
+
 void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (const ggml_tensor * gr = ggml_cuda_lightning_indexer_pool_gather(ctx.device, dst)) {
+        const auto * q=dst->src[0], * k=dst->src[1], * w=dst->src[2], * m=dst->src[3];
+        indexer_layout s{q->nb[1],q->nb[2],q->nb[3],gr->src[0]->nb[1],0,w->nb[1],w->nb[3],
+            m->nb[1],m->nb[3],dst->nb[1],dst->nb[3],int(q->ne[2]),int(k->ne[2]),int(m->ne[3]),(const int32_t *) gr->src[1]->data};
+        const dim3 grid((s.nk+63)/64,(s.nq+15)/16,q->ne[3]), block(32,4);
+        ggml_cuda_kernel_launch_params launch(grid,block,0,ctx.stream());
+        const auto kernel = indexer_decode_tiles(q)
+            ? (q->ne[1] == 32 ? qsa_indexer_wmma16_decode<block_q8_0, 32> : qsa_indexer_wmma16_decode<block_q8_0, 64>)
+            : (q->ne[1] == 32 ? qsa_indexer_wmma16_heads<block_q8_0, 32>  : qsa_indexer_wmma16_heads<block_q8_0, 64>);
+        ggml_cuda_kernel_launch(kernel,launch,(const char*)q->data,(const char*)gr->src[0]->data,(const char*)w->data,(const char*)m->data,(char*)dst->data,s);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (!supports_indexer4(ctx.device, dst)) {
         ggml_cuda_lightning_indexer_generic(ctx, dst);
         return;
@@ -993,8 +1163,11 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_kernel_launch_params launch(grid,block,0,ctx.stream());
     if (q->ne[1] != 4) {
         const bool f32 = k->type == GGML_TYPE_F32;
-        const auto kernel = q->ne[1] == 32 ? (f32 ? qsa_indexer_wmma16_heads<float, 32> : qsa_indexer_wmma16_heads<half, 32>)
-                                           : (f32 ? qsa_indexer_wmma16_heads<float, 64> : qsa_indexer_wmma16_heads<half, 64>);
+        const auto kernel = indexer_decode_tiles(q)
+            ? (q->ne[1] == 32 ? (f32 ? qsa_indexer_wmma16_decode<float, 32> : qsa_indexer_wmma16_decode<half, 32>)
+                              : (f32 ? qsa_indexer_wmma16_decode<float, 64> : qsa_indexer_wmma16_decode<half, 64>))
+            : (q->ne[1] == 32 ? (f32 ? qsa_indexer_wmma16_heads<float, 32>  : qsa_indexer_wmma16_heads<half, 32>)
+                              : (f32 ? qsa_indexer_wmma16_heads<float, 64>  : qsa_indexer_wmma16_heads<half, 64>));
         ggml_cuda_kernel_launch(kernel,launch,(const char*)q->data,(const char*)k->data,(const char*)w->data,(const char*)m->data,(char*)dst->data,s);
         CUDA_CHECK(cudaGetLastError());
         return;

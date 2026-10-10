@@ -1340,6 +1340,11 @@ struct ggml_cuda_pool_alloc {
     ggml_cuda_pool_alloc& operator=(ggml_cuda_pool_alloc &&) = delete;
 };
 
+// q8_1 copy of a GEMV activation shared by consecutive GEMVs (ggml-cuda.cu); nullptr when not cached.
+// hit: the copy is already valid; otherwise the caller writes it into the returned buffer.
+struct ggml_backend_cuda_context;
+void * ggml_cuda_q8_act_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int64_t ne10_padded, size_t nbytes, bool & hit);
+
 
 // backend interface
 

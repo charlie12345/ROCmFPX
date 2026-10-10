@@ -109,15 +109,24 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
 
             create_tensor_qkv(layer, i, n_embd, d_inner, d_inner, d_inner, flags);
 
-            layer.ssm_f_a  = create_tensor(tn(LLM_TENSOR_SSM_F_A,  "weight", i), {n_embd, head_dim}, flags);
-            layer.ssm_f_b  = create_tensor(tn(LLM_TENSOR_SSM_F_B,  "weight", i), {head_dim, d_inner}, flags);
-            layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head}, flags);
+            // tools/merge-sidecar: f_a, g_a and beta stacked over one input, f_b and g_b as one 2-batch weight; with
+            // both present the separate tensors are not loaded
+            layer.ssm_fgb_a = create_tensor(tn(LLM_TENSOR_SSM_FGB_A, "weight", i), {n_embd, 2*head_dim + n_head}, TENSOR_NOT_REQUIRED);
+            layer.ssm_fg_b  = create_tensor(tn(LLM_TENSOR_SSM_FG_B,  "weight", i), {head_dim, d_inner, 2}, TENSOR_NOT_REQUIRED);
+            if ((layer.ssm_fgb_a == nullptr) != (layer.ssm_fg_b == nullptr)) {
+                throw std::runtime_error("merge sidecar: ssm_fgb_a and ssm_fg_b must come together");
+            }
+            const int kda_sep = layer.ssm_fgb_a ? flags | TENSOR_SKIP : flags;
+
+            layer.ssm_f_a  = create_tensor(tn(LLM_TENSOR_SSM_F_A,  "weight", i), {n_embd, head_dim}, kda_sep);
+            layer.ssm_f_b  = create_tensor(tn(LLM_TENSOR_SSM_F_B,  "weight", i), {head_dim, d_inner}, kda_sep);
+            layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head}, kda_sep);
 
             layer.ssm_a    = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN, i), {n_head}, flags);
             layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", i), {d_inner}, flags);
 
-            layer.ssm_g_a    = create_tensor(tn(LLM_TENSOR_SSM_G_A,  "weight", i), {n_embd, head_dim}, flags);
-            layer.ssm_g_b    = create_tensor(tn(LLM_TENSOR_SSM_G_B,  "weight", i), {head_dim, d_inner}, flags);
+            layer.ssm_g_a    = create_tensor(tn(LLM_TENSOR_SSM_G_A,  "weight", i), {n_embd, head_dim}, kda_sep);
+            layer.ssm_g_b    = create_tensor(tn(LLM_TENSOR_SSM_G_B,  "weight", i), {head_dim, d_inner}, kda_sep);
             layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {head_dim}, flags);
             layer.wo         = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {d_inner, n_embd}, flags);
         } else {
@@ -843,8 +852,21 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     cb(Vcur, "kda_v_conv", il);
 
     // Decay gate, ssm_a holds -exp(A_log)
-    ggml_tensor * f_a = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
-    ggml_tensor * g1  = ggml_mul_mat(ctx0, layer.ssm_f_b, f_a);
+    ggml_tensor * g1   = nullptr;   // f_b(f_a(x))
+    ggml_tensor * g2   = nullptr;   // g_b(g_a(x))
+    ggml_tensor * beta = nullptr;   // beta(x)
+    if (layer.ssm_fgb_a) {
+        // merged weights: one GEMM for [f_a; g_a; beta], one 2-batch GEMM for f_b and g_b
+        ggml_tensor * fgb = ggml_mul_mat(ctx0, layer.ssm_fgb_a, cur);                     // [2*head_dim + n_head, n_tokens]
+        ggml_tensor * fg  = ggml_view_3d(ctx0, fgb, head_dim, n_tokens, 2, fgb->nb[1], head_dim*ggml_element_size(fgb), 0);
+        ggml_tensor * gb  = ggml_mul_mat(ctx0, layer.ssm_fg_b, fg);                       // [d_inner, n_tokens, 2]
+        g1   = ggml_view_2d(ctx0, gb, d_inner, n_tokens, gb->nb[1], 0);
+        g2   = ggml_view_2d(ctx0, gb, d_inner, n_tokens, gb->nb[1], gb->nb[2]);
+        beta = ggml_cont(ctx0, ggml_view_2d(ctx0, fgb, n_head_kda, n_tokens, fgb->nb[1], 2*head_dim*ggml_element_size(fgb)));
+    } else {
+        ggml_tensor * f_a = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
+        g1 = ggml_mul_mat(ctx0, layer.ssm_f_b, f_a);
+    }
     g1 = ggml_add(ctx0, g1, layer.ssm_dt_b);
 
     ggml_tensor * A = ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head_kda, 1);
@@ -863,7 +885,9 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
 
     g1 = ggml_reshape_4d(ctx0, g1, head_dim, n_head_kda, n_seq_tokens, n_seqs);
 
-    ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
+    if (!beta) {
+        beta = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
+    }
     beta = ggml_reshape_4d(ctx0, beta, 1, n_head_kda, n_seq_tokens, n_seqs);
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "kda_beta", il);
@@ -885,8 +909,12 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     cb(output, "kda_scan_out", il);
 
     // output gate, then RMSNorm(o) * Sigmoid(g2)
-    ggml_tensor * g_a = ggml_mul_mat(ctx0, layer.ssm_g_a, cur);
-    ggml_tensor * g2  = ggml_mul_mat(ctx0, layer.ssm_g_b, g_a);
+    if (!g2) {
+        ggml_tensor * g_a = ggml_mul_mat(ctx0, layer.ssm_g_a, cur);
+        g2 = ggml_mul_mat(ctx0, layer.ssm_g_b, g_a);
+    } else if (!ggml_is_contiguous(g2)) {
+        g2 = ggml_cont(ctx0, g2);
+    }
     g2 = ggml_reshape_3d(ctx0, g2, head_dim, n_head_kda, n_tokens);
 
     ggml_tensor * o      = ggml_reshape_3d(ctx0, output, head_dim, n_head_kda, n_tokens);

@@ -967,6 +967,192 @@ static __global__ void top_k_copy_rows(const int * __restrict__ src, int * __res
     }
 }
 
+// One block per row for a few long rows (GLM-5.3-Flash DSA decode: one score row per query over all pools, k = 512):
+// four 8-bit radix passes find the k-th largest key, then one pass gathers. The parallel radix path takes 12 launches
+// per call (about 70 us at 16K pools on gfx1151, mostly launch gaps); this is one. The row stays in L2 between
+// passes. Like the parallel path, the order of the selected indices is unspecified and ties at the threshold are
+// taken in arrival order. GGML_CUDA_TOP_K_ROW_BLOCK=0 disables it.
+static __device__ __forceinline__ uint32_t top_k_ordered_key(const float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+template <int NT>
+static __global__ void __launch_bounds__(NT) top_k_row_block_cuda(const float * __restrict__ src, int * __restrict__ dst,
+        const int ncols, const int k) {
+    __shared__ uint32_t scan[256];
+    __shared__ uint32_t s_prefix, s_mask, s_need;
+    __shared__ int s_gt, s_eq;
+    const int tid = threadIdx.x;
+    const float * x = src + (int64_t) blockIdx.x*ncols;
+    int * out = dst + (int64_t) blockIdx.x*k;
+
+    uint32_t prefix = 0, mask = 0, need = k;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int b = tid; b < 256; b += NT) {
+            scan[b] = 0;
+        }
+        __syncthreads();
+        for (int i = tid; i < ncols; i += NT) {
+            const uint32_t u = top_k_ordered_key(x[i]);
+            if ((u & mask) == prefix) {
+                atomicAdd(&scan[255 - ((u >> shift) & 255)], 1u);   // bins from the largest digit down
+            }
+        }
+        __syncthreads();
+        // inclusive scan over the 256 bins (largest digit first)
+        for (int off = 1; off < 256; off *= 2) {
+            uint32_t v = 0;
+            if (tid < 256 && tid >= off) {
+                v = scan[tid - off];
+            }
+            __syncthreads();
+            if (tid < 256) {
+                scan[tid] += v;
+            }
+            __syncthreads();
+        }
+        // the bin where the running count first reaches need holds the k-th largest key
+        if (tid < 256) {
+            const uint32_t before = tid > 0 ? scan[tid - 1] : 0;
+            if (before < need && scan[tid] >= need) {
+                s_need   = need - before;
+                s_prefix = prefix | ((uint32_t) (255 - tid) << shift);
+                s_mask   = mask | (255u << shift);
+            }
+        }
+        __syncthreads();
+        prefix = s_prefix;
+        mask   = s_mask;
+        need   = s_need;
+        __syncthreads();
+    }
+    // prefix is now the k-th largest key: take every larger key and the first `need` equal ones
+    if (tid == 0) {
+        s_gt = 0;
+        s_eq = 0;
+    }
+    __syncthreads();
+    const int n_gt = k - (int) need;
+    for (int i = tid; i < ncols; i += NT) {
+        const uint32_t u = top_k_ordered_key(x[i]);
+        if (u > prefix) {
+            out[atomicAdd(&s_gt, 1)] = i;
+        } else if (u == prefix) {
+            const int p = atomicAdd(&s_eq, 1);
+            if (p < (int) need) {
+                out[n_gt + p] = i;
+            }
+        }
+    }
+}
+
+// The same selection with the row held in registers (R values per thread, read once instead of five times), the
+// histogram atomics spread over 8 sub-histograms (the first digit of nearby scores lands in a few bins), and the
+// 256-bin scan done with wave shuffles (two barriers instead of sixteen).
+template <int NT, int R>
+static __global__ void __launch_bounds__(NT) top_k_row_block_reg_cuda(const float * __restrict__ src, int * __restrict__ dst,
+        const int ncols, const int k) {
+    constexpr int NH = 8;
+    __shared__ uint32_t hist[NH][256];
+    __shared__ uint32_t wsum[8];
+    __shared__ uint32_t s_prefix, s_mask, s_need;
+    __shared__ int s_gt, s_eq;
+    const int tid = threadIdx.x, lane = tid % 32, wv = tid / 32;
+    const float * x = src + (int64_t) blockIdx.x*ncols;
+    int * out = dst + (int64_t) blockIdx.x*k;
+
+    uint32_t key[R];
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+        const int i = tid + j*NT;
+        key[j] = i < ncols ? top_k_ordered_key(x[i]) : 0;
+    }
+
+    uint32_t prefix = 0, mask = 0, need = k;
+#pragma unroll 1
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int b = tid; b < NH*256; b += NT) {
+            (&hist[0][0])[b] = 0;
+        }
+        __syncthreads();
+        uint32_t * h = hist[wv % NH];
+#pragma unroll
+        for (int j = 0; j < R; ++j) {
+            if (tid + j*NT < ncols && (key[j] & mask) == prefix) {
+                atomicAdd(&h[255 - ((key[j] >> shift) & 255)], 1u);   // bins from the largest digit down
+            }
+        }
+        __syncthreads();
+        // inclusive scan over the 256 bins: threads 0..255 (8 waves), shuffles within a wave, then the wave totals
+        uint32_t own = 0, v = 0;
+        if (tid < 256) {
+#pragma unroll
+            for (int c = 0; c < NH; ++c) {
+                own += hist[c][tid];
+            }
+            v = own;
+#pragma unroll
+            for (int off = 1; off < 32; off *= 2) {
+                const uint32_t t = __shfl_up(v, off, 32);
+                if (lane >= off) {
+                    v += t;
+                }
+            }
+            if (lane == 31) {
+                wsum[wv] = v;
+            }
+        }
+        __syncthreads();
+        // the bin where the running count first reaches need holds the k-th largest key
+        if (tid < 256) {
+            for (int w = 0; w < wv; ++w) {
+                v += wsum[w];
+            }
+            const uint32_t before = v - own;
+            if (before < need && v >= need) {
+                s_need   = need - before;
+                s_prefix = prefix | ((uint32_t) (255 - tid) << shift);
+                s_mask   = mask | (255u << shift);
+            }
+        }
+        __syncthreads();
+        prefix = s_prefix;
+        mask   = s_mask;
+        need   = s_need;
+        __syncthreads();
+    }
+    if (tid == 0) {
+        s_gt = 0;
+        s_eq = 0;
+    }
+    __syncthreads();
+    const int n_gt = k - (int) need;
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+        const int i = tid + j*NT;
+        if (i < ncols) {
+            const uint32_t u = key[j];
+            if (u > prefix) {
+                out[atomicAdd(&s_gt, 1)] = i;
+            } else if (u == prefix) {
+                const int p = atomicAdd(&s_eq, 1);
+                if (p < (int) need) {
+                    out[n_gt + p] = i;
+                }
+            }
+        }
+    }
+}
+
+static bool top_k_use_row_block(int ncols, int nrows, int k) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_TOP_K_ROW_BLOCK");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled && nrows <= 16 && ncols > 1024 && ncols <= 65536 && k >= 1 && k <= ncols;   // vocab-sized rows keep the multi-block path
+}
+
 static bool top_k_use_small_kernel(int ncols, int nrows, int k) {
     if (k == 1) {
         return true;
@@ -1014,6 +1200,19 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool & pool = ctx.pool();
     if (top_k_use_small_kernel(ncols, nrows, k)) {
         top_k_small_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+    } else if (top_k_use_row_block(ncols, nrows, k)) {
+        static const bool reg = [] {
+            const char * e = getenv("GGML_CUDA_TOP_K_ROW_REG");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        if (reg && ncols <= 1024*32) {
+            top_k_row_block_reg_cuda<1024, 32><<<nrows, 1024, 0, stream>>>(src0_d, dst_d, (int) ncols, (int) k);
+        } else if (reg) {
+            top_k_row_block_reg_cuda<1024, 64><<<nrows, 1024, 0, stream>>>(src0_d, dst_d, (int) ncols, (int) k);
+        } else {
+            top_k_row_block_cuda<1024><<<nrows, 1024, 0, stream>>>(src0_d, dst_d, (int) ncols, (int) k);
+        }
+        CUDA_CHECK(cudaGetLastError());
     } else if (ncols > 1024) {
         top_k_parallel_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
     } else if (k == ncols) {

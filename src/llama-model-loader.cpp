@@ -714,7 +714,13 @@ llama_model_loader::llama_model_loader(
             for (ggml_tensor * cur = ggml_get_first_tensor(octx); cur; cur = ggml_get_next_tensor(octx, cur)) {
                 auto it = weights_map.find(std::string(cur->name));
                 if (it == weights_map.end()) {
-                    throw std::runtime_error(format("weight override: tensor '%s' is not in the model", ggml_get_name(cur)));
+                    // a tensor the model file does not have (e.g. merged weights from tools/merge-sidecar): the
+                    // architecture loads it only if it asks for it, otherwise it is reported as unused
+                    weights_map.emplace(cur->name, llama_tensor_weight(files.back().get(), oidx, octx_gguf.get(), cur));
+                    n_elements += ggml_nelements(cur);
+                    n_bytes    += ggml_nbytes(cur);
+                    ++n_over;
+                    continue;
                 }
                 const ggml_tensor * old = it->second.tensor;
                 if (!ggml_are_same_shape(old, cur)) {

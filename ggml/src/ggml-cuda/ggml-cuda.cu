@@ -84,6 +84,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx, const 
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/dsa-mask.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -4357,6 +4358,55 @@ static int ggml_cuda_try_kda_gate_chain(ggml_backend_cuda_context & ctx, const g
 // try_fuse result: this node needs no launch of its own, nothing after it is skipped
 #define GGML_CUDA_FUSE_HANDLED (-1)
 
+// The pooled indexer keys' GET_ROWS needs no launch when every reader (of it or of a view of it) is a lightning
+// indexer that reads the q8_0 cache rows in place (ggml_cuda_lightning_indexer_pool_gather).
+static bool ggml_cuda_lightning_indexer_gather_skippable(const ggml_cgraph * cgraph, int i, int device) {
+    const ggml_tensor * gr = cgraph->nodes[i];
+    if (gr->op != GGML_OP_GET_ROWS || (gr->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    constexpr int window = 256;
+    const int end = std::min(cgraph->n_nodes, i + window);
+    std::vector<int> group = { i };
+    for (int n = i + 1; n < end; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        if ((t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_src == gr) {
+            if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                return false;
+            }
+            group.push_back(n);
+        }
+    }
+    int n_idx = 0;
+    for (const int gi : group) {
+        const ggml_tensor * x = cgraph->nodes[gi];
+        int readers = 0;
+        for (int n = gi + 1; n < end; ++n) {
+            const ggml_tensor * t = cgraph->nodes[n];
+            bool reads = false;
+            for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+                reads |= t->src[s] == x;
+            }
+            if (!reads) {
+                continue;
+            }
+            ++readers;
+            if ((t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_src == gr) {
+                continue;
+            }
+            if (t->op == GGML_OP_LIGHTNING_INDEXER && ggml_cuda_lightning_indexer_pool_gather(device, t) == gr) {
+                ++n_idx;
+                continue;
+            }
+            return false;
+        }
+        if (readers != ggml_node_get_use_count(cgraph, gi)) {
+            return false;
+        }
+    }
+    return n_idx > 0;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4368,6 +4418,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_GET_ROWS && ggml_cuda_gdn_state_gather_skippable(cgraph, i)) {
         return GGML_CUDA_FUSE_HANDLED;   // the delta net reads the recurrent cache directly
+    }
+    if ((node->op == GGML_OP_REPEAT || node->op == GGML_OP_SET_ROWS) && ggml_cuda_dsa_mask_part_skippable(cgraph, i)) {
+        return GGML_CUDA_FUSE_HANDLED;   // the DSA selection mask is written in one pass at its ADD
+    }
+    if (node->op == GGML_OP_ADD) {
+        ggml_cuda_dsa_mask_match dm;
+        if (ggml_cuda_dsa_mask_match_at_add(cgraph, i, dm)) {
+            ggml_cuda_dsa_mask(*cuda_ctx, dm);
+            return GGML_CUDA_FUSE_HANDLED;
+        }
+    }
+    if (node->op == GGML_OP_GET_ROWS && ggml_cuda_lightning_indexer_gather_skippable(cgraph, i, cuda_ctx->device)) {
+        return GGML_CUDA_FUSE_HANDLED;   // the indexer reads the pooled keys from the cache directly
     }
     if (node->op == GGML_OP_MUL) {
         const int n = ggml_cuda_try_kda_gate_chain(*cuda_ctx, cgraph, i);
@@ -5272,7 +5335,78 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// q8_1 copy of a GEMV activation, reused by the following GEMVs that read the same tensor. In decode several
+// projections share one input (q/k/v, the KDA gates and beta, the MLA down projections, router and experts), and each
+// quantized it again with its own launch. The copy is dropped at the start of a graph and whenever a node writes into
+// the activation's memory. Main stream only. It only grows; an outgrown buffer is not freed because a captured graph
+// may still reference it. GGML_CUDA_Q8_ACT_CACHE=0 disables it.
+struct ggml_cuda_q8_act_slot {
+    void *       buf  = nullptr;
+    size_t       size = 0;
+    const char * src  = nullptr;
+    size_t       src_bytes = 0;
+    int64_t      key[8] = {};
+    bool         valid = false;
+};
+static ggml_cuda_q8_act_slot g_q8_act[GGML_CUDA_MAX_DEVICES];
+
+static bool ggml_cuda_q8_act_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_Q8_ACT_CACHE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static void ggml_cuda_q8_act_reset(int device) {
+    g_q8_act[device].valid = false;
+}
+
+static void ggml_cuda_q8_act_invalidate(int device, const ggml_tensor * t) {
+    ggml_cuda_q8_act_slot & s = g_q8_act[device];
+    if (!s.valid || t == nullptr || t->data == nullptr) {
+        return;
+    }
+    const char * a = (const char *) t->data;
+    const char * b = a + ggml_nbytes(t);
+    if (a < s.src + s.src_bytes && s.src < b) {
+        s.valid = false;
+    }
+}
+
+void * ggml_cuda_q8_act_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int64_t ne10_padded,
+        const size_t nbytes, bool & hit) {
+    hit = false;
+    if (!ggml_cuda_q8_act_enabled() || ctx.curr_stream_no != 0 || nbytes > (8u << 20)) {
+        return nullptr;
+    }
+    ggml_cuda_q8_act_slot & s = g_q8_act[ctx.device];
+    const int64_t key[8] = { src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                             (int64_t) src1->nb[1], (int64_t) src1->nb[2], (int64_t) src1->nb[3], ne10_padded };
+    if (s.valid && s.src == (const char *) src1->data && memcmp(s.key, key, sizeof(key)) == 0) {
+        hit = true;
+        return s.buf;
+    }
+    if (s.size < nbytes) {
+        void * p = nullptr;
+        if (ggml_cuda_device_malloc(&p, nbytes, ctx.device) != cudaSuccess) {
+            (void) cudaGetLastError();
+            s.valid = false;
+            return nullptr;
+        }
+        s.buf  = p;
+        s.size = nbytes;
+    }
+    s.src       = (const char *) src1->data;
+    s.src_bytes = ggml_nbytes(src1);
+    memcpy(s.key, key, sizeof(key));
+    s.valid     = true;
+    return s.buf;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+    ggml_cuda_q8_act_reset(cuda_ctx->device);
+    ggml_cuda_dsa_lists_reset(cuda_ctx->device);
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -5404,6 +5538,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 prev_i = i;
 
+                if (!ggml_cuda_is_view_or_noop(node)) {
+                    ggml_cuda_q8_act_invalidate(cuda_ctx->device, node);
+                    ggml_cuda_dsa_lists_invalidate(cuda_ctx->device, node);
+                }
                 if (ggml_cuda_is_view_or_noop(node)) {
                     continue;
                 }
@@ -5418,6 +5556,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;   // the node's work is done by a later node
                 }
                 if (nodes_to_skip != 0) {
+                    for (int j = i + 1; j <= i + nodes_to_skip && j < cgraph->n_nodes; ++j) {
+                        ggml_cuda_q8_act_invalidate(cuda_ctx->device, cgraph->nodes[j]);
+                        ggml_cuda_dsa_lists_invalidate(cuda_ctx->device, cgraph->nodes[j]);
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
