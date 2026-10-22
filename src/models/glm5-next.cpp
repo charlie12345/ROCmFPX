@@ -733,6 +733,12 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            res->t_layer_inp[il] = build_hc_mean(inpL);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
+
         ggml_tensor * residual = inpL;
         ggml_tensor * post = nullptr;
         ggml_tensor * comb = nullptr;
@@ -796,6 +802,12 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_out", il);
+    }
+
+    if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
+        res->t_layer_inp[n_layer] = build_hc_mean(inpL);
+        cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
+        ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
     }
 
     // narrow to the output tokens, then collapse the streams

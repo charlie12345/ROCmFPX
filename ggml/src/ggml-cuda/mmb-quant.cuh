@@ -156,15 +156,13 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
     }
     else if constexpr (TYPE == GGML_TYPE_IQ2_S) {
         const mmb_quant_slice out{dst, k0 % QK};
-#pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq2_s<float>(row, k0 / QK, out, tid);
-    }
-    else if constexpr (TYPE == GGML_TYPE_IQ3_XXS) {
-        const mmb_quant_slice out{dst, k0 % QK};
-#pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq3_xxs<float>(row, k0 / QK, out, tid);
+        dequantize_iq2_s<float>(row, k0 / QK, out, (lane % 4)*8 + (k0 % QK)/32 + lane/4);
     }
     // dequantize tid covers 8 values of sub-block tid%8: a 64-value slice needs only the 8 tids of its two sub-blocks
+    else if constexpr (TYPE == GGML_TYPE_IQ3_XXS) {
+        const mmb_quant_slice out{dst, k0 % QK};
+        dequantize_iq3_xxs<float>(row, k0 / QK, out, (lane % 4)*8 + (k0 % QK)/32 + lane/4);
+    }
     else if constexpr (TYPE == GGML_TYPE_IQ3_S) {
         const mmb_quant_slice out{dst, k0 % QK};
         dequantize_iq3_s<float>(row, k0 / QK, out, (lane % 4)*8 + (k0 % QK)/32 + lane/4);
@@ -274,16 +272,66 @@ __device__ __forceinline__ void mmb_iq3s_store_packed(const mmb_iq_raw * raw, ui
     }
 }
 
-// Block staging for IQ3_S / IQ4_XS tiles: a 256-value block covers 4 K steps, so every 4th step each tile row's
+// IQ3_XXS fields packed the same way (grid indices | 7 sign bits << 16, d | scale << 16).
+// The eighth sign bit is the parity of the other seven (ksigns_iq2xs), so the sign table needs no lookup.
+template <int BM, int STRIDE>
+__device__ __forceinline__ void mmb_iq3xxs_store_packed(const mmb_iq_raw * raw, uint16_t * tile, const uint32_t * grid) {
+    const int lane = threadIdx.x % 8, il = lane % 4, sb = lane / 4;
+#pragma unroll
+    for (int p = 0; p < BM / 32; ++p) {
+        uint16_t * dst = tile + (threadIdx.x / 8 + 32 * p) * STRIDE + 32 * sb;
+        const uint32_t s7 = (raw[p].a >> 16) & 0x7f;
+        const uint32_t signs = s7 | ((__popc(s7) & 1) << 7);
+        const uint32_t g1 = grid[raw[p].a & 0xff];
+        const uint32_t g2 = grid[(raw[p].a >> 8) & 0xff];
+        const float d = mmb_h2f((uint16_t) (raw[p].b & 0xffff)) * (0.5f + (float) (raw[p].b >> 16)) * 0.5f;
+        float v[8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            v[j]     = d * (float) ((g1 >> 8 * j) & 0xff) * ((signs >> j) & 1 ? -1.f : 1.f);
+            v[j + 4] = d * (float) ((g2 >> 8 * j) & 0xff) * ((signs >> (j + 4)) & 1 ? -1.f : 1.f);
+        }
+        *(uint4 *) (dst + 8 * il) = make_uint4(mmb_pack2(v[0], v[1]), mmb_pack2(v[2], v[3]), mmb_pack2(v[4], v[5]), mmb_pack2(v[6], v[7]));
+    }
+}
+
+// IQ2_S fields packed as (10-bit grid index | signs << 16, d | 4-bit scale << 16).
+// The grid holds 8 values per entry, stored in LDS as pairs of words.
+template <int BM, int STRIDE>
+__device__ __forceinline__ void mmb_iq2s_store_packed(const mmb_iq_raw * raw, uint16_t * tile, const uint32_t * grid) {
+    const int lane = threadIdx.x % 8, il = lane % 4, sb = lane / 4;
+#pragma unroll
+    for (int p = 0; p < BM / 32; ++p) {
+        uint16_t * dst = tile + (threadIdx.x / 8 + 32 * p) * STRIDE + 32 * sb;
+        const uint32_t idx = raw[p].a & 0x3ff, signs = (raw[p].a >> 16) & 0xff;
+        const uint32_t g1 = grid[2 * idx], g2 = grid[2 * idx + 1];
+        const float d = mmb_h2f((uint16_t) (raw[p].b & 0xffff)) * (0.5f + (float) (raw[p].b >> 16)) * 0.25f;
+        float v[8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            v[j]     = d * (float) ((g1 >> 8 * j) & 0xff) * ((signs >> j) & 1 ? -1.f : 1.f);
+            v[j + 4] = d * (float) ((g2 >> 8 * j) & 0xff) * ((signs >> (j + 4)) & 1 ? -1.f : 1.f);
+        }
+        *(uint4 *) (dst + 8 * il) = make_uint4(mmb_pack2(v[0], v[1]), mmb_pack2(v[2], v[3]), mmb_pack2(v[4], v[5]), mmb_pack2(v[6], v[7]));
+    }
+}
+
+// Block staging for IQ2_S / IQ3_S / IQ3_XXS / IQ4_XS tiles: a 256-value block covers 4 K steps, so every 4th step each tile row's
 // block is loaded into LDS with coalesced word loads, and the dequantization reads its fields there. Fetching the
 // fields of every step separately took about 20 scattered sub-word loads per thread and was the largest cost of the
 // routed tiles. Rows of IQ3_S blocks (110 bytes) are only 2-byte aligned: the staged words start at the aligned word
 // before the block, and the field offsets add the block's misalignment.
 template <int WTYPE>
-constexpr int mmb_stage_words() { return WTYPE == 32 + GGML_TYPE_IQ3_S ? 28 : WTYPE == 32 + GGML_TYPE_IQ4_XS ? 34 : 0; }
+constexpr int mmb_stage_words() {
+    return WTYPE == 32 + GGML_TYPE_IQ3_S ? 28 : WTYPE == 32 + GGML_TYPE_IQ3_XXS ? 25 : WTYPE == 32 + GGML_TYPE_IQ2_S ? 21 :
+           WTYPE == 32 + GGML_TYPE_IQ4_XS ? 34 : 0;
+}
 
 template <int WTYPE>
-constexpr int mmb_stage_block_bytes() { return WTYPE == 32 + GGML_TYPE_IQ3_S ? (int) sizeof(block_iq3_s) : (int) sizeof(block_iq4_xs); }
+constexpr int mmb_stage_block_bytes() {
+    return WTYPE == 32 + GGML_TYPE_IQ3_S ? (int) sizeof(block_iq3_s) : WTYPE == 32 + GGML_TYPE_IQ3_XXS ? (int) sizeof(block_iq3_xxs) :
+           WTYPE == 32 + GGML_TYPE_IQ2_S ? (int) sizeof(block_iq2_s) : (int) sizeof(block_iq4_xs);
+}
 
 template <int WTYPE>
 static __device__ __forceinline__ int mmb_stage_off(const uint8_t * w, const size_t row_bytes, const int row, const int bi) {
@@ -319,8 +367,8 @@ static __device__ __forceinline__ void mmb_stage_store(const uint32_t * reg, uin
     }
 }
 
-// the fields of K step ks of the staged rows of one stream, in the layouts mmb_iq_store (IQ4_XS) and
-// mmb_iq3s_store_packed (IQ3_S) take
+// the fields of K step ks of the staged rows of one stream, in the layouts mmb_iq_store (IQ4_XS),
+// mmb_iq3s_store_packed (IQ3_S), mmb_iq3xxs_store_packed (IQ3_XXS) and mmb_iq2s_store_packed (IQ2_S) take
 template <int WTYPE, int BM>
 static __device__ __forceinline__ void mmb_stage_fields(const uint32_t * lds, const uint8_t * w, const size_t row_bytes, const int rows,
         const int ks, mmb_iq_raw * raw) {
@@ -335,6 +383,17 @@ static __device__ __forceinline__ void mmb_stage_fields(const uint32_t * lds, co
             const uint32_t qs = rb[2 + 8 * ib + 2 * il] | ((uint32_t) rb[3 + 8 * ib + 2 * il] << 8);
             raw[p].a = qs | ((uint32_t) rb[66 + ib] << 16) | ((uint32_t) rb[74 + 4 * ib + il] << 24);
             raw[p].b = (rb[0] | ((uint32_t) rb[1] << 8)) | ((uint32_t) ((rb[106 + ib / 2] >> 4 * (ib % 2)) & 0xf) << 16);
+        } else if constexpr (WTYPE == 32 + GGML_TYPE_IQ3_XXS) {
+            const uint32_t q = rb[2 + 8 * ib + 2 * il] | ((uint32_t) rb[3 + 8 * ib + 2 * il] << 8);
+            const uint8_t * g = rb + 66 + 4 * ib;
+            const uint32_t aux = g[0] | ((uint32_t) g[1] << 8) | ((uint32_t) g[2] << 16) | ((uint32_t) g[3] << 24);
+            raw[p].a = q | (((aux >> 7 * il) & 0x7f) << 16);
+            raw[p].b = (rb[0] | ((uint32_t) rb[1] << 8)) | ((aux >> 28) << 16);
+        } else if constexpr (WTYPE == 32 + GGML_TYPE_IQ2_S) {
+            // d at 0, grid low bytes at 2, signs at 34, qh at 66, scales at 74
+            const uint32_t idx = rb[2 + 4 * ib + il] | (((uint32_t) rb[66 + ib] << (8 - 2 * il)) & 0x300);
+            raw[p].a = idx | ((uint32_t) rb[34 + 4 * ib + il] << 16);
+            raw[p].b = (rb[0] | ((uint32_t) rb[1] << 8)) | ((uint32_t) ((rb[74 + ib] >> 4 * (il / 2)) & 0xf) << 16);
         } else {
             // the 136-byte IQ4_XS block is word aligned
             const uint32_t * rw = (const uint32_t *) rb;

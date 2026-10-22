@@ -134,16 +134,36 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
 #pragma unroll
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
 
-    // IQ3_S grid in LDS for the dequantization in store_lds
-    __shared__ uint32_t grid_s[WTYPE == 32 + GGML_TYPE_IQ3_S ? 512 : 1];
+    // IQ3_XXS / IQ2_S: blocks staged in LDS every 4th K step as in the fused gate/up kernel.
+    // GLM-5.3 routed down at 4096 tokens: IQ3_XXS 39.0 -> 26.1 ms, IQ2_S 33.0 -> 25.8 ms (register prefetch: 29.8 / 32.2 ms).
+    // (the 256-column dense tiles keep the slice decode: with the staged words they exceed the 64 KB of LDS)
+    constexpr bool STAGE = (WTYPE == 32 + GGML_TYPE_IQ3_XXS || WTYPE == 32 + GGML_TYPE_IQ2_S) && BN <= 128;
+    // IQ3_S grid in LDS for mmb_iq_store, IQ3_XXS / IQ2_S grids for the staged tiles
+    __shared__ uint32_t grid_s[WTYPE == 32 + GGML_TYPE_IQ3_S ? 512 : !STAGE ? 1 : WTYPE == 32 + GGML_TYPE_IQ3_XXS ? 256 : 2048];
     if constexpr (WTYPE == 32 + GGML_TYPE_IQ3_S) {
         for (int i = tid; i < 512; i += MMB_NT) grid_s[i] = iq3s_grid[i];
         __syncthreads();
+    } else if constexpr (STAGE && WTYPE == 32 + GGML_TYPE_IQ3_XXS) {
+        for (int i = tid; i < 256; i += MMB_NT) grid_s[i] = iq3xxs_grid[i];
+        __syncthreads();
+    } else if constexpr (STAGE && WTYPE == 32 + GGML_TYPE_IQ2_S) {
+        for (int i = tid; i < 2048; i += MMB_NT) grid_s[i] = ((const uint32_t *) iq2s_grid)[i];
+        __syncthreads();
     }
+    constexpr int RW = STAGE ? mmb_stage_words<WTYPE>() : 0;
+    constexpr int STAGE_ITEMS = STAGE ? (BM * RW + MMB_NT - 1) / MMB_NT : 1;
+    __shared__ uint32_t wraw[STAGE ? BM * RW : 1];
+    uint32_t stage_reg[STAGE_ITEMS];
     int weight_ks = 0;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
         if constexpr (mmb_iq_prefetch<WTYPE>()) { mmb_iq_fetch<WTYPE, BM>(Wbase, wrow_bytes, a_rows, ks, iqr); }
+        if constexpr (STAGE) {
+            if (ks % 4 == 0) {
+                const uint8_t * ws[1] = { Wbase };
+                mmb_stage_load<WTYPE, BM, 1, MMB_NT>(ws, wrow_bytes, a_rows, ks / 4, stage_reg);
+            }
+        }
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) {
             const int row = tid + i * MMB_NT;
@@ -168,6 +188,15 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     };
     auto store_lds = [&]() {
         if constexpr (mmb_iq_prefetch<WTYPE>()) mmb_iq_store<WTYPE, BM, MMB_LDS_STRIDE>(iqr, As, weight_ks, grid_s);
+        else if constexpr (STAGE) {
+            if (weight_ks % 4 == 0) {
+                mmb_stage_store<WTYPE, BM, 1, MMB_NT>(stage_reg, wraw);
+                __syncthreads();
+            }
+            mmb_stage_fields<WTYPE, BM>(wraw, Wbase, wrow_bytes, a_rows, weight_ks, iqr);
+            if constexpr (WTYPE == 32 + GGML_TYPE_IQ3_XXS) mmb_iq3xxs_store_packed<BM, MMB_LDS_STRIDE>(iqr, As, grid_s);
+            else mmb_iq2s_store_packed<BM, MMB_LDS_STRIDE>(iqr, As, grid_s);
+        }
         else if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
@@ -375,13 +404,19 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     int brow[B_ITEMS];
 #pragma unroll
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
-    // IQ3_S grid in LDS for the dequantization in store_lds
-    __shared__ uint32_t grid_s[WTYPE == 32 + GGML_TYPE_IQ3_S ? 512 : 1];
+    // IQ3_S / IQ3_XXS / IQ2_S grid in LDS for the dequantization in store_lds
+    __shared__ uint32_t grid_s[WTYPE == 32 + GGML_TYPE_IQ3_S ? 512 : WTYPE == 32 + GGML_TYPE_IQ3_XXS ? 256 : WTYPE == 32 + GGML_TYPE_IQ2_S ? 2048 : 1];
     if constexpr (WTYPE == 32 + GGML_TYPE_IQ3_S) {
         for (int i = tid; i < 512; i += MMB_NT) grid_s[i] = iq3s_grid[i];
         __syncthreads();
+    } else if constexpr (WTYPE == 32 + GGML_TYPE_IQ3_XXS) {
+        for (int i = tid; i < 256; i += MMB_NT) grid_s[i] = iq3xxs_grid[i];
+        __syncthreads();
+    } else if constexpr (WTYPE == 32 + GGML_TYPE_IQ2_S) {
+        for (int i = tid; i < 2048; i += MMB_NT) grid_s[i] = ((const uint32_t *) iq2s_grid)[i];
+        __syncthreads();
     }
-    // IQ3_S / IQ4_XS: gate and up blocks staged in LDS every 4th K step (see mmb_stage_load)
+    // IQ3_S / IQ3_XXS / IQ2_S / IQ4_XS: gate and up blocks staged in LDS every 4th K step (see mmb_stage_load)
     constexpr int RW = mmb_stage_words<WTYPE>();
     constexpr bool STAGE = RW > 0;
     constexpr int STAGE_ITEMS = STAGE ? (2 * BM * RW + MMB_NT - 1) / MMB_NT : 1;
@@ -434,6 +469,12 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
             if constexpr (WTYPE == 32 + GGML_TYPE_IQ3_S) {
                 mmb_iq3s_store_packed<BM, MMB_LDS_STRIDE>(iqg, Ag, grid_s);
                 mmb_iq3s_store_packed<BM, MMB_LDS_STRIDE>(iqu, Au, grid_s);
+            } else if constexpr (WTYPE == 32 + GGML_TYPE_IQ3_XXS) {
+                mmb_iq3xxs_store_packed<BM, MMB_LDS_STRIDE>(iqg, Ag, grid_s);
+                mmb_iq3xxs_store_packed<BM, MMB_LDS_STRIDE>(iqu, Au, grid_s);
+            } else if constexpr (WTYPE == 32 + GGML_TYPE_IQ2_S) {
+                mmb_iq2s_store_packed<BM, MMB_LDS_STRIDE>(iqg, Ag, grid_s);
+                mmb_iq2s_store_packed<BM, MMB_LDS_STRIDE>(iqu, Au, grid_s);
             } else {
                 mmb_iq_store<WTYPE, BM, MMB_LDS_STRIDE>(iqg, Ag, weight_ks, grid_s);
                 mmb_iq_store<WTYPE, BM, MMB_LDS_STRIDE>(iqu, Au, weight_ks, grid_s);

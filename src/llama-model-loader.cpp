@@ -13,6 +13,8 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <filesystem>
+#include <sstream>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -695,9 +697,30 @@ llama_model_loader::llama_model_loader(
             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
         }
 
-        // Weight override sidecar: a GGUF whose tensors replace the same-named ones (e.g. requantized dense weights made
-        // by tools/requant-sidecar), so a variant only needs its changed tensors on disk. LLAMA_WEIGHT_OVERRIDE=<path>.
-        if (const char * ov = getenv("LLAMA_WEIGHT_OVERRIDE"); ov != nullptr && *ov != '\0') {
+        // Weight override sidecars: GGUFs whose tensors replace the same-named ones (e.g. requantized dense weights made by tools/requant-sidecar), so a variant only needs its changed tensors on disk.
+        // LLAMA_WEIGHT_OVERRIDE=<path>[:<path>...] (';' on Windows, like PATH); a later file wins when two provide the same tensor.
+#ifdef _WIN32
+        const char override_sep = ';';
+#else
+        const char override_sep = ':';
+#endif
+        // A value that names an existing file is one path, so a single path containing the separator keeps working.
+        std::vector<std::string> override_paths;
+        if (const char * env = getenv("LLAMA_WEIGHT_OVERRIDE"); env != nullptr && *env != '\0') {
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(env, ec)) {
+                override_paths.push_back(env);
+            } else {
+                std::stringstream ss(env);
+                for (std::string item; std::getline(ss, item, override_sep);) {
+                    if (!item.empty()) {
+                        override_paths.push_back(item);
+                    }
+                }
+            }
+        }
+        for (const std::string & ov_path : override_paths) {
+            const char * ov = ov_path.c_str();
             struct ggml_context * octx = NULL;
             struct gguf_init_params oparams = {
                 /*.no_alloc = */ true,

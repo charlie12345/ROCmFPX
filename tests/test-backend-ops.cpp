@@ -19,6 +19,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <numeric>
 #include <atomic>
 #include <array>
 #include <cfloat>
@@ -5659,15 +5660,28 @@ struct test_mul_mat_w4a4 : public test_mul_mat {
     }
 };
 
-static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats) {
+static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats, bool force_random = false) {
     std::random_device rd;
     std::default_random_engine rng(rd());
+    // GGML_TEST_MMID_IDS=random: each row picks its own experts, like real routing (default: every row uses experts 0..n_used-1)
+    static const bool random_ids = [] {
+        const char * value = getenv("GGML_TEST_MMID_IDS");
+        return value && strcmp(value, "random") == 0;
+    }();
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
             continue;
         }
         for (int64_t r = 0; r < ggml_nrows(t); r++) {
             std::vector<int32_t> data(t->ne[0]);
+            if ((random_ids || force_random) && t->ne[0] <= n_mats) {
+                std::vector<int32_t> all(n_mats);
+                std::iota(all.begin(), all.end(), 0);
+                std::shuffle(all.begin(), all.end(), rng);
+                std::copy(all.begin(), all.begin() + t->ne[0], data.begin());
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                continue;
+            }
             for (int i = 0; i < t->ne[0]; i++) {
                 data[i] = i % n_mats;
             }
@@ -5677,7 +5691,7 @@ static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats) {
     }
 }
 
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax = 1.0f) {
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax = 1.0f, bool force_random = false) {
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type == GGML_TYPE_I32) {
             continue;
@@ -5688,7 +5702,7 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax =
             init_tensor_uniform(t);
         }
     }
-    init_mul_mat_id_ids(ctx, n_mats);
+    init_mul_mat_id_ids(ctx, n_mats, force_random);
 }
 
 // GGML_OP_MUL_MAT_ID
@@ -8061,6 +8075,20 @@ struct test_mul_mat_vec_fusion : public test_case {
     double max_nmse_err() override {
         return 5e-3;
     }
+};
+
+// MUL_MAT_ID cases where each token picks its own experts (real routing), whatever GGML_TEST_MMID_IDS says: experts
+// then get unequal member counts and members whose first pair is in a later token
+struct test_mul_mat_id_routed : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+    std::string vars() override { return test_mul_mat_id::vars() + ",routed=1"; }
+    void initialize_tensors(ggml_context * ctx) override { init_mul_mat_id_tensors(ctx, n_mats, amax, true); }
+};
+
+struct test_mul_mat_vec_fusion_routed : public test_mul_mat_vec_fusion {
+    using test_mul_mat_vec_fusion::test_mul_mat_vec_fusion;
+    std::string vars() override { return test_mul_mat_vec_fusion::vars() + ",routed=1"; }
+    void initialize_tensors(ggml_context * ctx) override { init_mul_mat_id_tensors(ctx, n_mats, 1.0f, true); }
 };
 
 // GGML_OP_SUM
@@ -12644,7 +12672,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                 test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 32, 256,
                                     use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
                                 // multi-token batches (spec decoding)
-                                for (int64_t m_batch : { 2, 4, 8 }) {
+                                for (int64_t m_batch : { 2, 4, 5, 8, 16 }) {
                                     test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 32, 256,
                                         use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
                                 }
@@ -12659,6 +12687,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    // GLM-5.3 routed experts (top-8, real routing; 32 experts instead of 288 reach the same kernels) at prefill batch sizes
+    // (tile kernel; IQ2/IQ3 gate/up through the staged fused GLU path, down through the staged tile)
+    for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
+        for (int n : {640, 1024}) {
+            test_cases.emplace_back(new test_mul_mat_id_routed(type, GGML_TYPE_F32, 32, 8, false, 512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion_routed(type, GGML_GLU_OP_SWIGLU_CLAMP, n, 512, 2048,
+                true, 32, 8, true, false, true, false, {1, 1}));
+        }
+    }
+
+    // GLM-5.3 routed expert shapes (top-8, real routing, 32 experts) at speculative verify batch sizes
+    for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n : {2, 3, 4, 5, 7, 8, 12, 16}) {
+            test_cases.emplace_back(new test_mul_mat_id_routed(type, GGML_TYPE_F32, 32, 8, false, 512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion_routed(type, GGML_GLU_OP_SWIGLU_CLAMP, n, 512, 2048,
+                true, 32, 8, true, false, true, false, {1, 1}));
+        }
     }
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
@@ -12844,6 +12891,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
     // GLM-5.3-Flash DSA prefill attention at depth: 512 queries, each walking its own 2048-cell selection list
     for (int kv : {65536, 131072}) {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, 2048));
@@ -12886,7 +12934,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                                                           16384, queries, true, false, 0, 0, GGML_PREC_F32, type, type));
         }
     }
-
 
     // GLM-5.3-Flash routed-expert prefill: 288 experts, top-8, 2048 tokens, K=4096 (M=1024 keeps the weights small)
     for (ggml_type t : {GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S}) {

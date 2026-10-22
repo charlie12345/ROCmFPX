@@ -1972,7 +1972,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc, tensor->src[2]->ne[0])) {
         return false;
     }
 
@@ -2124,14 +2124,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
-    if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
-        if (ggml_is_quantized(src0->type)) {
-            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
-                return false;
-            }
-        } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+    if (ggml_is_quantized(src0->type)) {
+        if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc, dst->src[2]->ne[0])) {
             return false;
         }
+    } else if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
+        return false;
     }
 
     if (ggml_cuda_mmid_prefer_blas(src0, dst->ne[2])) {
@@ -2164,19 +2162,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
-                if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
-                    return;
-                }
-            } else {
-                if (GGML_CUDA_CC_IS_AMD(cc)) {
-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
-                    return;
-                }
+        if (ggml_is_quantized(src0->type)) {
+            // get_mmvq_mmid_max_batch is at most MMVQ_MMID_MAX_BATCH_SIZE
+            if (ne2 <= get_mmvq_mmid_max_batch(src0->type, cc, ids->ne[0])) {
+                ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                return;
             }
+        } else if (ne2 <= MMVQ_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
+            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+            return;
         }
 
         if (ggml_cuda_mmb_supported_mmid(src0, src1, ids, dst)) {
@@ -5404,6 +5398,70 @@ void * ggml_cuda_q8_act_lookup(ggml_backend_cuda_context & ctx, const ggml_tenso
     return s.buf;
 }
 
+#ifdef GGML_CUDA_NODE_PROFILE
+// Diagnostic build only: time every node (or fused group) with events, print totals at exit.
+// Run with GGML_CUDA_DISABLE_GRAPHS=1.
+struct ggml_cuda_node_profile {
+    std::map<std::string, std::pair<double, int64_t>> acc;
+    double total_ms = 0.0;
+    cudaEvent_t ev[GGML_CUDA_MAX_DEVICES][2] = {};   // per device: an event records on its own device's stream
+
+    ~ggml_cuda_node_profile() {
+        std::vector<std::pair<std::string, std::pair<double, int64_t>>> v(acc.begin(), acc.end());
+        std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
+        fprintf(stderr, "NODEPROF total %.3f ms\n", total_ms);
+        for (const auto & e : v) {
+            fprintf(stderr, "NODEPROF %10.3f ms %5.1f%% %8ld %s\n", e.second.first, 100.0*e.second.first/total_ms, (long) e.second.second, e.first.c_str());
+        }
+    }
+};
+
+static ggml_cuda_node_profile g_node_profile;
+
+static std::string ggml_cuda_node_profile_key(const ggml_tensor * first, const ggml_tensor * last) {
+    std::string name = first->name;
+    const size_t dash = name.find_last_of('-');
+    if (dash != std::string::npos && dash + 1 < name.size() && isdigit((unsigned char) name[dash + 1])) {
+        name = name.substr(0, dash);
+    }
+    std::string key;
+    if (last != first) {
+        key += std::string("FUSED(") + ggml_op_desc(last) + ") ";
+    }
+    key += std::string(ggml_op_desc(first)) + " " + name + " " + ggml_type_name(first->src[0] ? first->src[0]->type : first->type);
+    key += " n=" + std::to_string(first->src[1] ? first->src[1]->ne[first->op == GGML_OP_MUL_MAT_ID ? 2 : 1] : first->ne[1]);
+    return key;
+}
+
+struct ggml_cuda_node_profile_scope {
+    ggml_backend_cuda_context * ctx;
+    ggml_cgraph * cgraph;
+    const int first;
+    const int & cur;
+
+    ggml_cuda_node_profile_scope(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, const int & i) : ctx(ctx), cgraph(cgraph), first(i), cur(i) {
+        cudaEvent_t * ev = g_node_profile.ev[ctx->device];
+        if (!ev[0]) {
+            CUDA_CHECK(cudaEventCreate(&ev[0]));
+            CUDA_CHECK(cudaEventCreate(&ev[1]));
+        }
+        CUDA_CHECK(cudaEventRecord(ev[0], ctx->stream()));
+    }
+
+    ~ggml_cuda_node_profile_scope() {
+        cudaEvent_t * ev = g_node_profile.ev[ctx->device];
+        CUDA_CHECK(cudaEventRecord(ev[1], ctx->stream()));
+        CUDA_CHECK(cudaEventSynchronize(ev[1]));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, ev[0], ev[1]));
+        auto & e = g_node_profile.acc[ggml_cuda_node_profile_key(cgraph->nodes[first], cgraph->nodes[std::min(cur, cgraph->n_nodes - 1)])];
+        e.first  += ms;
+        e.second += 1;
+        g_node_profile.total_ms += ms;
+    }
+};
+#endif // GGML_CUDA_NODE_PROFILE
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     ggml_cuda_q8_act_reset(cuda_ctx->device);
     ggml_cuda_dsa_lists_reset(cuda_ctx->device);
@@ -5550,6 +5608,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+#ifdef GGML_CUDA_NODE_PROFILE
+                ggml_cuda_node_profile_scope node_profile_scope(cuda_ctx, cgraph, i);
+#endif // GGML_CUDA_NODE_PROFILE
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip == GGML_CUDA_FUSE_HANDLED) {
