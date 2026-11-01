@@ -400,8 +400,8 @@ questions about a text with calibrated probabilities instead of generated
 text, from an open decision model such as StartLux-Decision. Start a server
 with that model and `--classifier-config`, or run it as a child of a router
 (`--models-preset`) next to the big model: one port, one API key, both models.
-On the CPU (`-dev none -ngl 0`) StartLux-Decision-2B BF16 answers a yes/no
-question in 0.3 s and a 21-option choice in 0.85 s. Details:
+On the CPU (`-dev none -ngl 0`) StartLux-Decision v1.1 2B Instant BF16 answers
+a yes/no question in 0.3 s and a 21-option choice in 0.9 s. Details:
 [docs/classifier.md](docs/classifier.md).
 
 ## Several slots on one GPU

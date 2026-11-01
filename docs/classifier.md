@@ -32,17 +32,18 @@ Most current decision models (StartLux-Decision, Wald, decider, TinyJev v2): the
 prompt and the answer is the model's next-token logits of those letters.
 
 ```
-llama-server -m StartLux-Decision-2B-BF16.gguf --classifier-config classifier.json -dev none -ngl 0 -c 4096
+llama-server -m StartLux-Decision-v1.1-2B-Instant-BF16.gguf --classifier-config classifier.json -dev none -ngl 0 -c 4096 -b 4096 -ub 4096
 ```
 
 ```json
-{"name": "startlux-decision-2b", "family": "letter",
+{"name": "startlux-decision-v1.1-2b", "family": "letter",
  "letter": {
    "prompt": "<|im_start|>system\nApply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.<|im_end|>\n<|im_start|>user\nEvidence:\n{state}\n\nQuestion: {instructions}\nOptions:{options}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
    "empty_state": "(none)", "option_line": "\n{letter}) {text}", "variants": ["{letter}"],
    "state_format": "json", "json_index_min": 8, "score_format": "{name}: {desc}", "true_first": true,
    "noul_instructions": "Which answer fits the evidence?", "bare_keys": "bare", "same_as_name": true, "strip": true,
-   "temperature": {"noul": 2.2907, "choice": 1.5319, "score": 1.6163}}}
+   "share_prefix": false,
+   "temperature": {"noul": 1.2, "choice": 1.2937, "score": 1.2902}}}
 ```
 
 | Key | Meaning |
@@ -55,10 +56,12 @@ llama-server -m StartLux-Decision-2B-BF16.gguf --classifier-config classifier.js
 | `score_format`, `true_first`, `noul_instructions`, `same_as_name`, `strip` | how levels and yes/no are written |
 | `bare_keys` | choice keys that only number the options: `positional` drops a leading `a: `, `bare` shows the description alone |
 | `temperature` | a number, or a map looked up as `<type>\|<bucket>` (option count 2, 3-4, 5-8, 9+), `<type>`, `default` |
+| `share_prefix` | `false` reads every question whole. Required for a GGUF with `attention.causal = false`, which also needs `-b` and `-ub` equal to `-c` |
 | `style` | `ollama` (TinyJev v2): the options become the user message of Ollama's decision API, which `prompt` wraps as `{user}` |
 
-The questions of a request share their common token prefix (the state): it is decoded once and each question
-continues from a restored copy. More than 26 options are read in chunks whose winners meet in a final read.
+Unless `share_prefix` is false, the questions of a request share their common token prefix (the state): it is decoded
+once and each question continues from a restored copy. More than 26 options are read in chunks whose winners meet in a
+final read.
 
 ## Pointer family (with a head)
 
@@ -89,23 +92,28 @@ head or config starts a new file; a file over 64 MiB loses its older half at the
 
 ## Recommended model
 
-For a classifier that runs on the CPU next to a chat model: StartLux-Decision-2B, and on AMD Ryzen CPUs its **BF16**
-file rather than Q8_0. Ryzen 9 7900, 12 threads, OpenDecision 500 and 115 requests of our own:
+For a classifier that runs on the CPU next to a chat model: StartLux-Decision v1.1 2B Instant, and on AMD Ryzen CPUs in
+**BF16** rather than Q8_0. Ryzen 9 7900, 12 threads, OpenDecision 500 and 115 requests of our own:
 
 | Model | Family | OpenDecision 500 | Own requests | Latency |
 |---|---|---|---|---|
 | TinyJev-4B v1 | pointer | 476 | 105 | 0.86 - 0.89 s |
-| **StartLux-Decision-2B** | letter | 486 | 110 | 0.57 - 0.72 s |
+| **StartLux-Decision v1.1 2B Instant** | letter | 484 | 112 | 0.48 s |
 | Wald-4B v1.2 | letter | 488 | 111 | 1.1 - 1.25 s |
 | TinyJev-4B v2 | letter, `ollama` | 490 | 110 | 1.9 s |
 
-On the 2026-10-29 runtime (vanilla llama.cpp's x86 CPU work), StartLux-Decision-2B BF16 answers a yes/no question in
-0.20 - 0.30 s and a 21-option choice in 0.85 s, 0.47 s usage-weighted, with the same answers (every probability
-unchanged on all 615 cases). The other rows and the BF16 / Q8_0 comparison below were measured on the 2026-10-06 runtime.
+StartLux-Decision v1.1 2B Instant BF16 answers a yes/no question in 0.21 - 0.31 s and a 21-option choice in 0.89 s,
+0.48 s usage-weighted. The other rows were measured on the 2026-10-06 runtime.
 
-BF16 against Q8_0 for StartLux-Decision-2B: a yes/no question 0.39 s against 0.75 s, a 21-option choice 1.05 s
-against 2.0 s, at 3.8 GB against 2.0 GB. Its probabilities are cautious (the shipped temperatures flatten them), and
-the weights are CC BY-NC 4.0; Wald-4B is the Apache-2.0 alternative.
+BF16 against Q8_0 on the 2B size (v1, 2026-10-06 runtime): a yes/no question 0.39 s against 0.75 s, a 21-option choice
+1.05 s against 2.0 s, at 3.8 GB against 2.0 GB. The weights are CC BY-NC 4.0; Wald-4B is the Apache-2.0 alternative.
+
+No BF16 GGUF is published. Convert the checkpoint; the converter writes `attention.causal = false` into the file:
+
+```
+hf download startlux-models/StartLux-Decision-v1.1-2B-Instant --local-dir StartLux-Decision-v1.1-2B-Instant
+python convert_hf_to_gguf.py StartLux-Decision-v1.1-2B-Instant --outtype bf16 --no-mtp --outfile StartLux-Decision-v1.1-2B-Instant-BF16.gguf
+```
 
 ## Router mode
 
@@ -122,12 +130,15 @@ model = Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf
 load-on-startup = true
 gpu-keepalive-ms = 2000
 
-[startlux-decision-2b]
-model = StartLux-Decision-2B-BF16.gguf
+[startlux-decision-v1.1-2b]
+model = StartLux-Decision-v1.1-2B-Instant-BF16.gguf
 classifier-config = classifier.json
 load-on-startup = true
 dev = none
 ngl = 0
+c = 4096
+b = 4096
+ub = 4096
 ```
 
 ```
