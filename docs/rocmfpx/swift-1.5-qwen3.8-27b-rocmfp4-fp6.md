@@ -74,9 +74,12 @@ The tensor names are those of the `qwen35` 27B architecture, so the same file
 applies to Qwen3.8-27B itself and to other fine-tunes of it. Use an importance
 matrix computed for the model you quantize.
 
-For vision, pair the file with the f16 `mmproj` of the base Qwen3.8-27B model.
-Swift 1.5 ships its own projector; it is bit-identical to the base one
-(334/334 tensors), so either works.
+For vision, pair the file with the
+[BF16 `mmproj`](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF/blob/main/mmproj-Qwen3.8-27B-BF16.gguf)
+of the base Qwen3.8-27B model. On a Ryzen 9 7900 it encodes an image 8% faster
+than the f16 file on the CPU (9.18 against 9.95 s at 1,443 tokens), with the same
+values within rounding. Swift 1.5 ships an f16 projector that is bit-identical
+to the base f16 one (334/334 tensors), so that works too.
 
 ## Evidence
 
