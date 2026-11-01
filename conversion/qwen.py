@@ -680,6 +680,12 @@ class Qwen3_5TextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self._try_set_pooling_type()
+        # prompt-bidirectional checkpoints (StartLux-Decision Instant: "jev_prompt_attention": "bidirectional" in
+        # config.json) read the whole prompt with bidirectional attention in the full-attention layers; the
+        # linear-attention layers stay causal. llama.cpp does this with a non-causal context
+        if self.hparams.get("jev_prompt_attention", "causal") == "bidirectional":
+            logger.info("gguf: prompt-bidirectional checkpoint, writing attention.causal = false")
+            self.gguf_writer.add_causal_attention(False)
 
 
 def _is_openjev_checkpoint(dir_model: Path) -> bool:
