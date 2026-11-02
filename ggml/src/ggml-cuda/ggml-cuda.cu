@@ -44,6 +44,7 @@
 #include "ggml-cuda/wmma-gemm.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvdq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 // the 5-argument form lives in this backend's own moe-weighted-reduction.cu (shared-expert merge folded in)
 void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx, const ggml_tensor * experts,
@@ -1932,7 +1933,34 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+// [TAG_MMVQ_FUSE_VERIFY] on RDNA3.0 and RDNA4 the speculative verify batches (2..8 columns) take the MUL_MAT + ADD fusion, a
+// kernel less per residual. Only where the plain dispatch would run the matvec too. Not RDNA3.5: its unrolled Q8_0 kernel has
+// no fused form. GGML_HIP_MMVQ_FUSE_VERIFY=0: off.
+// gate + up + GLU is opt-in, GGML_HIP_MMVQ_FUSE_VERIFY_GLU=1: bit-identical, but on an RX 7900 XT at 4-5 columns the one kernel
+// took 2.2x the time of the two matvecs it replaces (2026-11-02, IQ4_XS). Not measured on RDNA4.
+static bool ggml_cuda_mmvq_fuses_columns(const ggml_tensor * tensor, const int cc) {
+#if defined(GGML_USE_HIP)
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_HIP_MMVQ_FUSE_VERIFY");
+        return v == nullptr || atoi(v) != 0;
+    }();
+    return enabled && (GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) && tensor->op == GGML_OP_MUL_MAT &&
+           ggml_cuda_should_use_mmvq(tensor->src[0]->type, cc, tensor->src[1]->ne[1]);
+#else
+    GGML_UNUSED_VARS(tensor, cc);
+    return false;
+#endif
+}
+
+static bool ggml_cuda_mmvq_fuse_verify_glu() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_HIP_MMVQ_FUSE_VERIFY_GLU");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool all_columns = false) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -1950,7 +1978,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
     //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 && !(all_columns && ggml_cuda_mmvq_fuses_columns(tensor, cc))) {
         return false;
     }
 
@@ -2151,6 +2179,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // GGML_CUDA_DQ_MMV / GGML_CUDA_DQ_Q6K (unset = arch default, 0 = off, non-zero = on)
+    const bool dq_default = GGML_CUDA_CC_IS_RDNA3_5(cc);
+    if (ggml_cuda_dq_mmv_enabled(dq_default) && ne11 == 1
+            && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K
+                || (src0->type == GGML_TYPE_Q6_K && ggml_cuda_dq_q6k_enabled(dq_default)))
+            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && src0->ne[0] % QK_K == 0) {
+        if (src0->type == GGML_TYPE_Q4_K) {
+            ggml_cuda_mul_mat_vec_dq_q4_K(ctx, src0, src1, dst);
+        } else if (src0->type == GGML_TYPE_Q5_K) {
+            ggml_cuda_mul_mat_vec_dq_q5_K(ctx, src0, src1, dst);
+        } else {
+            ggml_cuda_mul_mat_vec_dq_q6_K(ctx, src0, src1, dst);
+        }
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
@@ -4345,11 +4389,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
     if ((fuse_mask0 & (1u << 2)) && (node->op == GGML_OP_CONCAT || node->op == GGML_OP_SSM_CONV)) {
         ggml_cuda_gdn_conv_match gm;
-        if (node->op == GGML_OP_CONCAT && ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
-            ggml_cuda_gdn_conv_write_tail(*cuda_ctx, gm);
-            return 1;
+        if (node->op == GGML_OP_CONCAT) {
+            const bool fold = ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm) &&
+                              cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_gdn_conv_buffers_ok(cgraph, gm);
+            ggml_cuda_gdn_conv_set_folded(fold ? node : nullptr);
+            if (fold) {
+                return 1;   // nothing to run: the conv reads the two sources of the concat
+            }
         }
-        if (node->op == GGML_OP_SSM_CONV && ggml_cuda_gdn_conv_match_at_conv(cgraph, i, gm)) {
+        if (node->op == GGML_OP_SSM_CONV && ggml_cuda_gdn_conv_is_folded(node) && ggml_cuda_gdn_conv_match_at_conv(cgraph, i, gm)) {
             ggml_cuda_gdn_conv_direct(*cuda_ctx, gm);
             return 1;
         }
@@ -5017,7 +5065,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, /*all_columns =*/ ggml_cuda_mmvq_fuse_verify_glu())) {
+                const bool dq_default = GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc);
+                if (ggml_cuda_dq_mmv_enabled(dq_default) && ids == nullptr
+                        && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU
+                        && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K
+                            || (src0->type == GGML_TYPE_Q6_K && ggml_cuda_dq_q6k_enabled(dq_default)))
+                        && gate->src[0]->type == src0->type && ggml_are_same_shape(src0, gate->src[0])
+                        && src1->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32
+                        && src1->ne[1] == 1 && src0->ne[0] % QK_K == 0
+                        && ggml_is_contiguous(src0) && ggml_is_contiguous(gate->src[0])
+                        && ggml_is_contiguous(src1) && ggml_is_contiguous(glu)
+                        && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1) {
+                    ggml_cuda_mul_mat_vec_dq_glu(*cuda_ctx, src0, gate->src[0], src1, glu);
+                    fused_mul_mat_vec = true;
+                    fused_node_count  = 3;
+                    break;
+                }
+
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
@@ -5187,7 +5252,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             break;
         }
 
-        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+        // the kernel reads a bias at the destination's column stride
+        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node, /*all_columns =*/ ggml_are_same_stride(bias_tensor, bias_node))) {
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
@@ -5491,6 +5557,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                // [TAG_GDN_CONV_SNAP] the kernel at the SSM_CONV writes this snapshot
+                if (ggml_cuda_gdn_conv_folds(node)) {
                     continue;
                 }
 
@@ -6247,8 +6318,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
                 ggml_cuda_gdn_conv_match gm;
                 if (ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
-                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gm.x), cgraph->nodes[gm.conv_idx]);
-                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gm.state), cgraph->nodes[gm.conv_idx]);
+                    // the kernel reads them at the SSM_CONV and writes the SILU output
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gm.x), gm.conv_out);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gm.state), gm.conv_out);
                 }
                 continue;
             }
