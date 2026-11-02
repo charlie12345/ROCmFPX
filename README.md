@@ -32,23 +32,15 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
   prompts, our ROCmFPX-optimised quant of the same model:
   [ROCmFP4-FP6 recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md)
 
-- **Drafting without state copies.** After a rejected draft the recurrent
-  layers replay the accepted tokens instead of keeping a 150 MiB copy of their
-  state for every drafted token: 0.8 GB less VRAM with two slots, the same
-  output bit for bit. [More](#rollback-by-replay)
-
 - **Switching conversations costs seconds, not minutes.** Conversations are
   saved to SSD and restored when they come back, in about 3 s instead of a
-  minute or more of re-reading. [More](#the-ssd-prompt-cache)
+  minute or more of re-reading, even after a restart. New conversations pick up
+  from the system prompt and tools they share with earlier ones.
+  [More](#the-ssd-prompt-cache)
 
 - **Several agents on one GPU.** Two conversations share one memory pool, so a
   second agent runs beside the first, and an idle one costs nothing.
   [More](#several-slots-on-one-gpu)
-
-- **Shared system prompts.** Conversations that start with the same system
-  prompt and tools pick up from the state they share.
-
-- **Survives restarts.** The prompt cache carries over to the next run.
 
 - **Vision** for screenshots and photos.
 
