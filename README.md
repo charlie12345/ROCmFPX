@@ -14,12 +14,12 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 ## Highlights
 
 - **Faster agent loops than LM Studio on the same card.** With the same model,
-  quant and context, a scripted two-agent session finishes in 97 s instead of
+  quant and context, a scripted two-agent session finishes in 96 s instead of
   132 s. [Numbers](#speed)
 
 - **Multi-token prediction.** The model's own MTP head drafts tokens ahead: up
-  to 54 t/s on prose and 88 t/s on code. When an answer repeats text from the
-  prompt, as code edits do, n-gram drafting copies it at up to 305 t/s.
+  to 59 t/s on prose and 89 t/s on code. When an answer repeats text from the
+  prompt, as code edits do, n-gram drafting copies it at up to 308 t/s.
 
 - **Prompts on the matrix cores.** Prompt processing runs on RDNA3's WMMA units
   through [rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) by Adel
@@ -66,20 +66,20 @@ grows from 4k to 41k tokens, a 10k-token worker is called twice in between):
 
 | | LM Studio + MTP draft | this runtime |
 |---|---:|---:|
-| **the session, wall-clock** | **132 s** | **97 s** |
-| prefill t/s, cold 4k prompt | 728 | 990 |
+| **the session, wall-clock** | **132 s** | **96 s** |
+| prefill t/s, cold 4k prompt | 728 | 995 |
 | prefill t/s, 4.3k new tokens at 17k depth | 678 | 866 |
 | prefill t/s, 4.0k new tokens at 41k depth | 519 | 686 |
-| decode t/s at 4k depth | 51.6 | 67.4 |
+| decode t/s at 4k depth | 51.6 | 68.8 |
 | decode t/s at 17k depth | 56.6 | 66.4 |
-| decode t/s at 41k depth | 42.4 | 60.8 |
-| decode t/s, text copy boost: code edit that copies the prompt | unavailable | 305 |
+| decode t/s at 41k depth | 42.4 | 65.5 |
+| decode t/s, text copy boost: code edit that copies the prompt | unavailable | 308 |
 
-<sub>October 2026. Both run Swift 1.5 IQ4_XS at `-c 98304` with MTP drafting,
+<sub>October and November 2026. Both run Swift 1.5 IQ4_XS at `-c 98304` with MTP drafting,
 flash attention, a q4_0 KV cache and two sessions, the best run for each value
-(LM Studio: two runs, this runtime: sixteen). LM Studio is its ROCm llama.cpp
+(LM Studio: two runs, this runtime: twenty). LM Studio is its ROCm llama.cpp
 runtime 2.64.0 with batch 2048 / 1024; this runtime runs the quick start below.
-The edit row is the text copy boost, n-gram drafting, the best of fifteen edits;
+The edit row is the text copy boost, n-gram drafting, the best of 27 edits;
 LM Studio cannot run it, as its API does not switch Swift 1.5's thinking
 off.</sub>
 
@@ -89,31 +89,31 @@ The same session with each quant we tested:
 |---|---:|---:|---:|---:|---:|---:|
 | [Q4_K_M](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf)\* | 17.4 GB | 146.8 s | 1,211 s (spill) | 408 / 548 / 431 | 50.6 / 50.8 / 48.2 | 238 |
 | [Q4_K_S](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_S.gguf) | 16.4 GB | 112.6 s | 1,139 s (spill) | 889 / 769 / 616 | 49.2 / 51.7 / 48.8 | 247 |
-| [IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf) | 15.5 GB | 96.6 s | 132.4 s | 990 / 866 / 686 | 67.4 / 66.4 / 60.8 | 305 |
+| [IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf) | 15.5 GB | 95.9 s | 132.4 s | 995 / 866 / 686 | 68.8 / 66.4 / 65.5 | 308 |
 | [ROCmFP4-FP6](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md) | 16.1 GB | 104.5 s | | 923 / 798 / 634 | 60.2 / 56.4 / 58.5 | 243 |
 
 <sub>\* At 64k (`-c 65536`) and `-ub 512`: the smaller context and prompt
 batches keep Q4_K_M's spill into system RAM down while staying above Hermes'
 64,000-token minimum. The other quants ran at 96k with `-ub 1024`, IQ4_XS at
 `-ub 2048` since. Prefill and decode are this runtime's, in the session above;
-the better of two runs (IQ4_XS: the best of sixteen, Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M sit at the edge of
+the better of two runs (IQ4_XS: the best of twenty, Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M sit at the edge of
 the card's memory and read every prompt again in full. ROCmFP4-FP6 is a ROCmFPX
 format, which LM Studio does not load.</sub>
 
-Decode, 450-token answers at temperature 1, the best of nine:
+Decode, 450-token answers at temperature 1, the best of 27:
 
 | decode t/s | peak |
 |---|---:|
-| prose | 54.0 |
-| code | 88.2 |
+| prose | 59.3 |
+| code | 88.7 |
 | without MTP, prose or code | 36.8 |
 
 Cold prompts, each followed by a 300-token answer at that depth:
 
 | | 17k | 41k | 69k |
 |---|---:|---:|---:|
-| prefill t/s, average over the prompt | 875 | 782 | 689 |
-| decode t/s at that depth | 51.3 | 49.2 | 43.7 |
+| prefill t/s, average over the prompt | 953 | 854 | 742 |
+| decode t/s at that depth | 51.3 | 49.6 | 43.7 |
 
 ## Quick start
 
@@ -204,6 +204,11 @@ Environment variables:
 | `ROCMFPX_WMMA_GEMM_FP8_EMU` | not set here: `1` rounds the weights, `2` the activations, `3` both to E4M3 inside the f16 WMMA GEMM, to measure what an FP8 path costs in quality on any gfx11 card. |
 | `ROCMFPX_RS_REPLAY` | not set here, on by default for the Qwen3.5/3.6/3.8 family: [rollback by replay](#rollback-by-replay). `=0` keeps a copy of the recurrent state per drafted token, for comparisons. |
 | `ROCMFPX_MMQ_FUSION` | not set here: the fused gate/up/GLU prompt kernel for MoE experts runs on NVIDIA only by default. `=1` also runs it on RDNA3 (gfx1100-1102), where it is correct but slower: 3-16% on prompts with Qwen3-30B-A3B IQ4_XS on the RX 7900 XT. `=0` turns it off everywhere. |
+| `GGML_HIP_GDN_CONV_SNAP` | not set here, on by default: the conv of a Qwen3.5/3.6/3.8 DeltaNet layer reads its two inputs directly and writes the rollback snapshots itself, one kernel in place of the concat, the conv and a copy per snapshot. `=0` runs them separately. |
+| `GGML_HIP_MMVQ_FUSE_VERIFY` | not set here, on by default on RDNA3.0 and RDNA4: the matmul kernel adds the residual in verify batches of 2 to 8 tokens too. `=0` keeps the separate ADD. |
+| `GGML_HIP_MMVQ_FUSE_VERIFY_GLU` | not set here, off by default: `=1` also runs gate + up + GLU as one kernel at 2 to 8 tokens. Same text, but 2.2 times the time of the two matmuls at 5 tokens on the RX 7900 XT. Not measured on RDNA4. |
+| `GGML_CUDA_FA_WMMA_MAX_HEAD` | not set here: largest head size on the WMMA attention kernel, 576 on RDNA4 and 256 elsewhere. |
+| `GGML_CUDA_DQ_MMV`, `GGML_CUDA_DQ_Q6K` | not set here: K-quant decode in floats at one token, on by default on RDNA3.5 only. `=1` on the RX 7900 XT is 6 to 24% slower per kernel. |
 
 ## Other cards
 
@@ -258,6 +263,14 @@ would likely not help elsewhere stay limited to the RX 7900 series.
   quality: mean KL divergence against the Q8_0 rises by about 0.005 (IQ4_XS
   0.0205 to 0.0261), with every token of the test through FP8, where in use
   only prompt batches of 512 tokens or more are.
+- **RDNA4: attention and Q6_K prompts.** Heads above 256 (320, 512, 576) run on
+  the WMMA attention kernel with rows tuned on gfx1201, and Q6_K prompts load
+  their scales once per tile. Both come from rdna-boosts and neither has run on
+  an RDNA4 card here: they build for gfx1201, and the attention passes against
+  the CPU when forced on the RX 7900 XT, whose tile layout differs.
+- **RDNA3.5: K-quant decode in floats.** One-token decode of Q4_K, Q5_K and Q6_K
+  dequantizes to floats instead of quantizing the activation. AMD's kernel, on
+  by default on RDNA3.5 only, as it is slower on the RX 7900 XT.
 - **Cards with 24 GB or more: DFlash2.** Upstream's DFlash2 speculative
   decoding is in this build: a block-diffusion drafter (`-md`, e.g. the
   Qwen3.8-27B DFlash2 GGUF, Q8_0 2.06 GB) drafts 15 tokens per pass,
@@ -273,6 +286,9 @@ would likely not help elsewhere stay limited to the RX 7900 series.
   that kernel, which is tuned there; RDNA4 never uses it), and two rows per
   block for the 4- and 5-bit block types, whose gain on real models was 0.2 to
   3.7% and is not worth carrying untested.
+- **On RDNA3.0 and RDNA4:** the residual add inside the matmul kernel in verify
+  batches of 2 to 8 tokens. RDNA3.5 keeps the separate add, as its unrolled Q8_0
+  kernel has no fused form.
 - **Settings.** `-c`, `-ub 2048` and the VRAM split in this README are sized
   for 20 GB of VRAM. The speed tables are for the RX 7900 XT and will differ on
   other cards.
