@@ -111,6 +111,16 @@ GGML_CUDA_P2P=1 llama-cli -m model.gguf -sm tensor
 
 P2P requires driver support (usually restricted to workstation/datacenter GPUs) and **may cause crashes or corrupted outputs on some motherboards or BIOS configurations** (e.g. when IOMMU is enabled). If you see instability after enabling it, unset the variable.
 
+### 7. Direct AllReduce between two AMD cards (`GGML_CUDA_AR_P2P`)
+
+With two ROCm cards and `--split-mode tensor`, the internal AllReduce (`GGML_CUDA_ALLREDUCE=internal`) sends large tensors through host memory. `GGML_CUDA_AR_P2P=1` sends them directly between the cards instead, which is faster where the board and driver allow peer access. If the cards cannot reach each other it logs a warning and keeps the host-staged path. Windows builds use `GGML_CUDA_NO_PEER_COPY=ON`, so leave it off there.
+
+```bash
+GGML_CUDA_ALLREDUCE=internal GGML_CUDA_AR_P2P=1 GGML_CUDA_AR_P2P_ISSUER=1 llama-server -m model.gguf -sm tensor
+```
+
+`GGML_CUDA_AR_P2P_ISSUER` picks the device that issues both copies (default 1). Try the card that does not drive a display.
+
 ---
 
 ## Troubleshooting
