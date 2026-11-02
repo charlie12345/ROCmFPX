@@ -680,6 +680,27 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
+// [TAG_FA_WMMA_RDNA4] heads above 256 on the WMMA kernel, for the head / GQA shapes it is built for: Mistral Small 4 (320),
+// 512 and DeepSeek / GLM (576). RDNA4 only, the 320-576 rows of ggml_cuda_fattn_mma_get_config_rdna are tuned on gfx1201 and
+// RDNA3 keeps the tile kernel. GGML_CUDA_FA_WMMA_MAX_HEAD=n sets the cap on any RDNA card, to compare or to test the kernel.
+static bool ggml_cuda_fa_wmma_large_head(const ggml_tensor * Q, const ggml_tensor * V, const int gqa_ratio, const float logit_softcap, const int cc) {
+    static const int max_head_env = [] {
+        const char * v = getenv("GGML_CUDA_FA_WMMA_MAX_HEAD");
+        return v ? atoi(v) : 0;
+    }();
+    const int max_head = max_head_env > 0 ? max_head_env : (GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : 256);
+    const int head = (int) Q->ne[0];
+    if (head > max_head) {
+        return false;
+    }
+    switch (head) {
+        case 320: return V->ne[0] == 256 && gqa_ratio % 32 == 0 && logit_softcap == 0.0f;
+        case 512: return V->ne[0] == 512 && gqa_ratio %  2 == 0;
+        case 576: return V->ne[0] == 512 && gqa_ratio %  4 == 0 && logit_softcap == 0.0f;
+        default:  return false;
+    }
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -878,12 +899,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
-            Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
-        return BEST_FATTN_KERNEL_MMA_F16;
-    }
-
-    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] * gqa_ratio_eff > 32) {
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    if ((amd_wmma_available(cc) && gqa_opt_applies && (Q->ne[0] <= 256 || ggml_cuda_fa_wmma_large_head(Q, V, gqa_ratio, logit_softcap, cc))) &&
+            Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
