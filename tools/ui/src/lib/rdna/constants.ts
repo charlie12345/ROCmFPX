@@ -9,6 +9,11 @@ export const RDNA_TAGLINE = 'AGENT SERVER';
 export const RDNA_GITHUB_URL = 'https://github.com/serrynaimo/RDNA-FAST';
 /** The bench's name and version, as the speed card's footnote shows it; bump when the bench changes. */
 export const RDNA_BENCH_NAME = 'rdna-bench-v1';
+/**
+ * The priority of the chat's own requests (owner, 2026-11-03): the person at the chat goes first,
+ * other requests are held while it runs. The pre-encoding while typing keeps the default.
+ */
+export const RDNA_CHAT_PRIORITY = 'xhigh';
 /** The README's section on the SSD prompt cache (--cache-disk). */
 export const RDNA_SSD_CACHE_DOCS_URL = `${RDNA_GITHUB_URL}#the-ssd-prompt-cache`;
 

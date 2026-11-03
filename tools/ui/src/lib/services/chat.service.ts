@@ -32,6 +32,7 @@ import {
 	ReasoningFormat,
 	StreamConnectionState
 } from '$lib/enums';
+import { RDNA_CHAT_PRIORITY } from '$lib/rdna/constants';
 import { modelsStore } from '$lib/stores/models/index.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
 import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
@@ -1128,6 +1129,9 @@ export class ChatService {
 		if (options.model) {
 			requestBody.model = options.model;
 		}
+
+		// [RDNA-FAST] the chat's requests go first (servers without priorities ignore the field)
+		requestBody.priority = RDNA_CHAT_PRIORITY;
 
 		requestBody.reasoning_format = disableReasoningParsing
 			? ReasoningFormat.NONE

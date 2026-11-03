@@ -303,6 +303,8 @@ export interface ApiChatCompletionRequest {
 	}>;
 	stream?: boolean;
 	model?: string;
+	/** [RDNA-FAST] request priority: low, default, high or xhigh */
+	priority?: string;
 	return_progress?: boolean;
 	sse_ping_interval?: number;
 	tools?: ApiChatCompletionTool[];
