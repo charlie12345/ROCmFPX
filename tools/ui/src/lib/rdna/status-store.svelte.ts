@@ -65,7 +65,9 @@ import {
 	loadHistory,
 	loadPeaks,
 	loadPriority,
+	loadSeenHardware,
 	loadUiState,
+	saveSeenHardware,
 	saveUiState,
 	writePart
 } from './storage';
@@ -198,9 +200,19 @@ export class StatusStore {
 	/** The record glow of every speed figure (record-glow.svelte.ts). */
 	glow = new RecordGlow();
 	hwOverride = $state<string | null>(null);
-	hardware: string | null = $derived(this.hwOverride ?? hardwareLabel(this.selectedProps?.devices));
-	/** The label is settled: the owner named it, or /props answered (with or without devices). */
-	hardwareKnown: boolean = $derived(this.hwOverride !== null || this.selectedProps !== null);
+	/** The GPU name /props last reported for the model in this tab (storage.ts loadSeenHardware). */
+	hwSeen = $state<string | null>(null);
+	hardware: string | null = $derived(
+		this.hwOverride ??
+			(this.selectedProps ? hardwareLabel(this.selectedProps.devices) : this.hwSeen)
+	);
+	/**
+	 * The label is settled: the owner named it, /props answered (with or without devices), or this
+	 * tab saw the model's GPU before.
+	 */
+	hardwareKnown: boolean = $derived(
+		this.hwOverride !== null || this.selectedProps !== null || this.hwSeen !== null
+	);
 	hf = $state.raw<Record<string, HfView>>({});
 	hfView: HfView | null = $derived(this.selectedId ? (this.hf[this.selectedId] ?? null) : null);
 	history = $state.raw<RequestRecord[]>([]);
@@ -656,6 +668,7 @@ export class StatusStore {
 		this.prio = loadPriority(id);
 		this.classifier = loadClassifier(id);
 		this.hwOverride = loadHardwareLabel(id);
+		this.hwSeen = loadSeenHardware(id);
 		this.benchRuns = loadBenchRuns(id);
 
 		const cache = loadCache(id);
@@ -1024,7 +1037,13 @@ export class StatusStore {
 	private setProps(id: string, p: RdnaProps): void {
 		this.props = { ...this.props, [id]: p };
 
+		const label = hardwareLabel(p.devices);
+
+		if (label && label !== loadSeenHardware(id)) saveSeenHardware(id, label);
+
 		if (id !== this.selectedId) return;
+
+		if (label) this.hwSeen = label;
 
 		const disk = p.prompt_cache_disk;
 

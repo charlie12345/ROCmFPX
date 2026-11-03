@@ -155,6 +155,33 @@ export function loadClassifier(modelId: string): ClassifierMemory {
 	};
 }
 
+/**
+ * The GPU name /props last reported for a model, kept for the browser tab (sessionStorage, owner
+ * 2026-11-03): a reload shows it at once instead of the speed card's spinner, and the next /props
+ * answer replaces it if the hardware changed.
+ */
+function seenHardwareKey(modelId: string): string {
+	return `${STORAGE_PREFIX}:session:model:${modelId}:hwSeen`;
+}
+
+export function loadSeenHardware(modelId: string): string | null {
+	try {
+		const v = sessionStorage.getItem(seenHardwareKey(modelId));
+
+		return v && v.trim() ? v : null;
+	} catch {
+		return null;
+	}
+}
+
+export function saveSeenHardware(modelId: string, label: string): void {
+	try {
+		sessionStorage.setItem(seenHardwareKey(modelId), label);
+	} catch {
+		// a private window or blocked storage: the spinner shows until /props answers
+	}
+}
+
 export function loadHardwareLabel(modelId: string): string | null {
 	const v = readPart<string>(modelId, 'hw');
 
