@@ -256,6 +256,11 @@ struct server_task {
     // used by SERVER_TASK_TYPE_TTS
     mtmd_helper::gen_audio::inp tts_inp;
 
+    // [TAG_REQUEST_HISTORY] for GET /requests: unix epoch ms when the HTTP request arrived (0 = unknown), and the
+    // ggml_time_us() when a slot was picked for the task (before a prompt cache restore into it)
+    int64_t t_arrival_ms = 0;
+    int64_t t_start_us   = 0;
+
     server_task() = default;
 
     server_task(server_task_type type) : type(type) {}
@@ -333,6 +338,7 @@ struct server_task {
         copy.type      = type;
         copy.tokens    = tokens.clone();
         copy.id_slot   = -1; // child tasks cannot specify slot
+        copy.t_arrival_ms = t_arrival_ms; // [TAG_REQUEST_HISTORY]
 
         // use different sampling seed for each child
         // note: https://github.com/ggml-org/llama.cpp/pull/18700#discussion_r2675115723
@@ -801,6 +807,29 @@ struct server_prompt_disk_state {
     }
 };
 
+// [TAG_REQUEST_HISTORY] the disk tier's counters (the ones log_disk_state prints) for GET /props. The cache lives
+// on the main loop; it hands a copy of these to on_disk_stats after every call that may change them
+struct server_prompt_disk_stats {
+    bool     enabled       = false;
+    size_t   entries       = 0;
+    size_t   unusable      = 0;
+    size_t   bytes         = 0;
+    size_t   limit_bytes   = 0;
+    size_t   tokens        = 0;
+    uint64_t saves         = 0;
+    uint64_t loads         = 0;
+    uint64_t evictions     = 0;
+    uint64_t save_failures = 0;
+    bool     save_disabled = false;
+    uint64_t bytes_written = 0;
+    uint64_t bytes_read    = 0;
+    uint64_t bytes_evicted = 0;
+    double   restore_ms_total = 0.0; // disk restores: reading the entry's files into the slot
+    uint64_t restores_timed   = 0;
+
+    json to_json() const;
+};
+
 struct server_prompt_cache {
     server_prompt_cache(
             int32_t limit_size_mib,
@@ -859,6 +888,16 @@ struct server_prompt_cache {
     uint64_t disk_bytes_read    = 0;
     uint64_t disk_bytes_evicted = 0;
     uint64_t disk_save_failures = 0;
+
+    // [TAG_REQUEST_HISTORY] time of the successful disk restores (load_ms in the log)
+    double   disk_restore_ms_total = 0.0;
+    uint64_t disk_restores_timed   = 0;
+
+    // [TAG_REQUEST_HISTORY] see server_prompt_disk_stats; called on the cache's thread at the end of save(),
+    // save_prefix(), load() and update() while the disk tier is enabled
+    std::function<void(const server_prompt_disk_stats &)> on_disk_stats;
+
+    server_prompt_disk_stats disk_stats() const;
 
     // A durable write/removal failure opens this run-level circuit breaker.
     // Existing valid entries remain readable, but no further state files are

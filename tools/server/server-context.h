@@ -56,6 +56,9 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+
+    // [TAG_REQUEST_HISTORY] the backend devices the model runs on (the CPU device for a CPU-only model), for GET /props
+    std::vector<ggml_backend_dev_t> devices;
 };
 
 using server_state_callback_t = std::function<void(server_state, json /* payload */)>;
@@ -89,6 +92,10 @@ struct server_context {
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
+
+    // [TAG_REQUEST_HISTORY] add a finished request that did not pass through the task queue (the classifier) to
+    // GET /requests; thread-safe, the record gets its "id" from the task id sequence
+    void add_request_record(json record);
 };
 
 
@@ -111,6 +118,7 @@ struct server_routes {
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
+    server_http_context::handler_t get_requests; // [TAG_REQUEST_HISTORY]
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;

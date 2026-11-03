@@ -102,7 +102,13 @@ struct server_classifier {
     // System One request {state, questions, model?} -> {model, answers, latency_ms}
     // with --classifier-cache also "cached": true when every answer came from the cache (nothing was decoded)
     // throws std::invalid_argument for bad requests (-> 422); thread-safe (requests are serialized)
-    json classify(const json & body);
+    // [TAG_REQUEST_HISTORY] history (optional) receives the request's GET /requests record: the question types, the
+    // chosen labels and their probabilities, the tokens decoded and whether the cache answered, never a text. Its
+    // "id", "priority", "t_arrival_ms" and "t_end_ms" are null, for the caller to fill in
+    json classify(const json & body, json * history = nullptr);
+
+    // [TAG_REQUEST_HISTORY] the same record for a request that classify() did not answer (it threw)
+    static json history_error(double latency_ms);
 
     const classifier_config & config() const { return cfg; }
 
@@ -116,6 +122,7 @@ private:
         std::vector<int> close_pos;           // absolute positions of each <close>
         std::string cache_key;                // "" = cache off
         json answer;                          // null until answered (from the cache or the model)
+        bool cached = false;                  // [TAG_REQUEST_HISTORY] the answer came from the cache
     };
 
     void cache_open(const common_params & params);
@@ -123,9 +130,14 @@ private:
     bool cache_get(const std::string & key, json & answer);
     void cache_put(const std::string & key, const json & answer);
 
+    // [TAG_REQUEST_HISTORY] see classify(); n_decoded = the prompt tokens the model read for the request
+    json history_of(const std::vector<encoded_question> & enc, size_t n_decoded) const;
+
     // letter family
-    json classify_letter(const json & body);
-    std::vector<std::vector<double>> letter_reads(const std::vector<std::string> & prompts, const std::vector<int> & n_opts);
+    json classify_letter(const json & body, json * history);
+    // n_decoded (optional) is increased by the number of tokens decoded
+    std::vector<std::vector<double>> letter_reads(const std::vector<std::string> & prompts, const std::vector<int> & n_opts,
+                                                  size_t * n_decoded = nullptr);
     double letter_temperature(const std::string & type, size_t n) const;
     std::vector<encoded_question> encode_ollama(const json & body) const;
 

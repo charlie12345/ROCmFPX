@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -55,6 +56,11 @@ struct server_http_req {
     std::map<std::string, uploaded_file> files; // used for file uploads (form data)
     const std::function<bool()> & should_stop;
     std::string remote_addr = ""; // peer address as seen by the HTTP server
+
+    // [TAG_REQUEST_HISTORY] unix epoch ms when the request was received (set when the server builds this from the
+    // HTTP request, before the handler runs), so GET /requests can tell the queue wait and the time to first token
+    int64_t t_arrival_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
 
     std::string get_param(const std::string & key, const std::string & def = "") const {
         auto it = params.find(key);

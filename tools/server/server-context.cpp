@@ -429,6 +429,10 @@ struct server_slot {
         return task ? task->params.priority : (int32_t) SERVER_TASK_PRIORITY_DEFAULT;
     }
 
+    // [TAG_REQUEST_HISTORY] "done" / "error" once the task's final result or error was sent (none = cancelled);
+    // mutable: send_error() takes the slot as const
+    mutable const char * hist_status = nullptr;
+
     void hold_set(bool hold, int64_t t_now_ms) {
         if (hold == held) {
             return;
@@ -490,6 +494,8 @@ struct server_slot {
         t_hold_start = 0;
         t_held_ms    = 0;
         n_trickle    = 0;
+
+        hist_status  = nullptr; // [TAG_REQUEST_HISTORY]
 
         n_predict_max = -1;
 
@@ -749,14 +755,16 @@ struct server_slot {
         return stop_pos;
     }
 
+    // a decode reading every second once 16 tokens are out (was 3 s and 100 tokens): live displays such as
+    // llama-tray read these lines, and short answers got no reading at all
     void print_timings_tg() {
-        if (stats.n_gen < 100) {
+        if (stats.n_gen < 16) {
             return;
         }
 
         const int64_t t_now = ggml_time_us();
 
-        if (t_now - t_print_last < 3*1000*1000) {
+        if (t_now - t_print_last < 1000*1000) {
             return;
         }
 
@@ -766,7 +774,7 @@ struct server_slot {
         t_print_last = t_now;
         n_gen_last = stats.n_gen;
 
-        SLT_INF(*this, "n_gen = %6d, tg = %6.2f t/s, tg_3s = %6.2f t/s\n", (int) stats.n_gen, n_gen_second, n_gen_second_win);
+        SLT_INF(*this, "n_gen = %6d, tg = %6.2f t/s, tg_1s = %6.2f t/s\n", (int) stats.n_gen, n_gen_second, n_gen_second_win);
     }
 
     void print_timings_pp() const {
@@ -1131,6 +1139,23 @@ public:
         metrics.reset_bucket();
     }
 
+    // [TAG_REQUEST_HISTORY] thread-safe and without the model (also during sleep), for GET /requests and GET /props
+    json history_to_json() {
+        json requests = json::array();
+        {
+            std::lock_guard<std::mutex> lock(mutex_history);
+            for (const auto & record : history) {
+                requests.push_back(record);
+            }
+        }
+        return { {"requests", requests} };
+    }
+
+    json disk_stats_to_json() {
+        std::lock_guard<std::mutex> lock(mutex_disk_stats);
+        return disk_stats_pub.to_json();
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -1173,6 +1198,67 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+
+    // [TAG_REQUEST_HISTORY] the prompt cache's disk counters as the main loop last published them (prompt_cache
+    // itself is replaced on a wake from sleep, an HTTP thread must not touch it), for GET /props
+    std::mutex               mutex_disk_stats;
+    server_prompt_disk_stats disk_stats_pub;
+
+    // [TAG_REQUEST_HISTORY] the last finished requests for GET /requests, newest first. Written by the main loop
+    // (completions, when the slot is released) and by the classifier's HTTP threads, read by HTTP threads.
+    // A record holds counts, times and the chosen classifier label, never prompt, message or question text
+    static constexpr size_t n_history_max = 50;
+    std::mutex       mutex_history;
+    std::deque<json> history;
+
+    void history_add(json record) {
+        std::lock_guard<std::mutex> lock(mutex_history);
+        history.push_front(std::move(record));
+        if (history.size() > n_history_max) {
+            history.pop_back();
+        }
+    }
+
+    // called before the slot is reset, see release(); records completion and infill tasks
+    void history_add_slot(const server_slot & slot) {
+        const server_task & task = *slot.task;
+        if (task.type != SERVER_TASK_TYPE_COMPLETION && task.type != SERVER_TASK_TYPE_INFILL) {
+            return;
+        }
+        const auto & st = slot.stats;
+
+        // the slot keeps ggml_time_us(), the history unix epoch ms; a later time never maps to an earlier one
+        const int64_t t_now_us = ggml_time_us();
+        const int64_t t_now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        auto to_unix_ms = [&](int64_t t_us) { return t_now_ms - (t_now_us - t_us) / 1000; };
+
+        const int64_t t_start_ms   = to_unix_ms(task.t_start_us > 0 ? task.t_start_us : st.is_set() ? st.t_start : t_now_us);
+        // the two clocks are read apart: never let the arrival come after the start
+        const int64_t t_arrival_ms = task.t_arrival_ms > 0 ? std::min(task.t_arrival_ms, t_start_ms) : t_start_ms;
+
+        history_add({
+            {"kind",           "completion"},
+            {"id",             task.id},
+            {"slot",           slot.id},
+            {"priority",       server_task_priority_name(task.params.priority)},
+            {"status",         slot.hist_status ? slot.hist_status : "cancelled"},
+            {"t_arrival_ms",   t_arrival_ms},
+            {"t_start_ms",     t_start_ms},
+            // the first token is sampled from the last prompt batch, when the prompt time ends
+            {"t_first_ms",     st.n_gen > 0 ? json(to_unix_ms(st.t_prompt_last)) : json()},
+            {"t_end_ms",       t_now_ms},
+            {"n_ctx",          slot.prompt.n_tokens()},
+            {"n_prompt",       task.n_tokens()},
+            {"n_cache",        st.n_prompt_cached},
+            {"n_processed",    st.n_prompt_processed},
+            {"prompt_ms",      st.t_prompt_ms()},
+            {"n_gen",          st.n_gen},
+            {"gen_ms",         st.t_gen_ms()},
+            {"draft_n",        st.n_draft_tokens},
+            {"draft_accepted", st.n_draft_accepted},
+        });
+    }
 
     server_metrics metrics;
 
@@ -1698,6 +1784,7 @@ private:
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
                 }
+                history_add_slot(slot); // [TAG_REQUEST_HISTORY]
             };
 
             slot.reset();
@@ -1791,6 +1878,14 @@ private:
 
             prompt_cache->disk_min_tokens = (size_t) std::max(0, params_base.cache_disk_min_tokens);
             prompt_cache->disk_max_ckpts  = params_base.cache_disk_checkpoints;
+
+            // [TAG_REQUEST_HISTORY] publish the counters for GET /props, now (entries adopted from earlier runs) and
+            // after every cache call
+            prompt_cache->on_disk_stats = [this](const server_prompt_disk_stats & s) {
+                std::lock_guard<std::mutex> lock(mutex_disk_stats);
+                disk_stats_pub = s;
+            };
+            prompt_cache->on_disk_stats(prompt_cache->disk_stats());
             if (cache_disk_enabled) {
                 SRV_INF("prompt cache disk: min_tokens=%d checkpoints_per_entry=%d prefix_step=%d\n",
                         params_base.cache_disk_min_tokens, params_base.cache_disk_checkpoints, params_base.cache_disk_prefix_step);
@@ -2805,6 +2900,7 @@ private:
     }
 
     void send_error(const server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
+        slot.hist_status = "error"; // [TAG_REQUEST_HISTORY]
         send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx);
     }
 
@@ -2939,6 +3035,8 @@ private:
         }
 
         res->generation_params = slot.task->params; // copy the parameters
+
+        slot.hist_status = "done"; // [TAG_REQUEST_HISTORY]
 
         queue_results.send(std::move(res));
     }
@@ -3471,6 +3569,12 @@ private:
                     if (kv_pool_must_wait(task)) {
                         queue_tasks.defer(std::move(task));
                         break;
+                    }
+
+                    // [TAG_REQUEST_HISTORY] the task's start, unless it has to wait for another slot below
+                    task.t_start_us = ggml_time_us();
+                    for (auto & child : task.child_tasks) {
+                        child.t_start_us = task.t_start_us;
                     }
 
                     server_slot * slot = get_available_slot(task);
@@ -5807,6 +5911,17 @@ server_context_meta server_context::get_meta() const {
 
     const char * ftype_name = llama_ftype_name(llama_model_ftype(impl->model_tgt));
 
+    // [TAG_REQUEST_HISTORY] the model's devices; none (-dev none, or no GPU) = it runs on the CPU
+    std::vector<ggml_backend_dev_t> devices;
+    for (int i = 0; i < llama_model_n_devices(impl->model_tgt); i++) {
+        devices.push_back(llama_model_get_device(impl->model_tgt, i));
+    }
+    if (devices.empty()) {
+        if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            devices.push_back(cpu);
+        }
+    }
+
     return server_context_meta {
         /* build_info              */ std::string(llama_build_info()),
         /* model_name              */ impl->model_name,
@@ -5846,6 +5961,8 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params          */ llama_model_n_params(impl->model_tgt),
         /* model_size              */ llama_model_size(impl->model_tgt),
         /* model_ftype             */ ftype_name,
+
+        /* devices                 */ devices,
     };
 }
 
@@ -5873,6 +5990,12 @@ struct server_res_generator : server_res_spipe {
 
 void server_context::set_state_callback(server_state_callback_t callback) {
     impl->callback_state = std::move(callback);
+}
+
+// [TAG_REQUEST_HISTORY]
+void server_context::add_request_record(json record) {
+    record["id"] = impl->queue_tasks.get_new_id();
+    impl->history_add(std::move(record));
 }
 
 //
@@ -5999,6 +6122,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+
+            task.t_arrival_ms = req.t_arrival_ms; // [TAG_REQUEST_HISTORY]
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {
@@ -6334,6 +6459,32 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     return props;
 }
 
+// [TAG_REQUEST_HISTORY] for GET /props: the memory as the backend reports it (free / total, 0 when unknown)
+static json get_res_devices(const std::vector<ggml_backend_dev_t> & devices) {
+    json res = json::array();
+    for (ggml_backend_dev_t dev : devices) {
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        const char * type = "cpu";
+        switch (ggml_backend_dev_type(dev)) {
+            case GGML_BACKEND_DEVICE_TYPE_GPU:   type = "gpu";   break;
+            case GGML_BACKEND_DEVICE_TYPE_IGPU:  type = "igpu";  break;
+            case GGML_BACKEND_DEVICE_TYPE_ACCEL: type = "accel"; break;
+            case GGML_BACKEND_DEVICE_TYPE_META:  type = "meta";  break;
+            default: break;
+        }
+        res.push_back({
+            {"name",         ggml_backend_dev_name(dev)},
+            {"description",  string_strip(ggml_backend_dev_description(dev))}, // the CPU's brand string is space-padded
+            {"type",         type},
+            {"memory_total", total},
+            {"memory_free",  free},
+        });
+    }
+    return res;
+}
+
 json server_routes::get_model_info() const {
     return get_res_model_info(*meta);
 }
@@ -6495,12 +6646,29 @@ void server_routes::init_routes() {
     this->get_props = [this](const server_http_req &) {
         auto res = create_response(true);
         // note: do NOT use ctx_server here, this endpoint must be accessible during sleep
+        json props;
         if (queue_tasks.is_sleeping()) {
             std::unique_lock<std::mutex> lock(mutex_cache);
-            res->ok(cached_props);
+            props = cached_props;
         } else {
-            res->ok(get_res_props(*meta, params, false));
+            props = get_res_props(*meta, params, false);
         }
+        // [TAG_REQUEST_HISTORY] read now, also during sleep: the device memory from the backend, the disk cache
+        // counters from the copy the main loop publishes (a thread-safe call that does not touch the model)
+        props["devices"]           = get_res_devices(meta->devices);
+        props["prompt_cache_disk"] = ctx_server.disk_stats_to_json();
+        res->ok(props);
+        return res;
+    };
+
+    // [TAG_REQUEST_HISTORY] the last finished requests, newest first; does not touch the model, works during sleep
+    this->get_requests = [this](const server_http_req &) {
+        auto res = create_response(true);
+        if (!params.endpoint_slots) {
+            res->error(format_error_response("This server does not support the requests endpoint. Start it with `--slots`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        res->ok(ctx_server.history_to_json());
         return res;
     };
 

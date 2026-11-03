@@ -215,6 +215,7 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    ctx_http.get ("/requests",                 ex_wrapper(routes.get_requests)); // [TAG_REQUEST_HISTORY]
 
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
@@ -523,6 +524,7 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     routes.post_lora_adapters          = models_routes->proxy_post;
     routes.get_slots                   = models_routes->proxy_get;
     routes.post_slots                  = models_routes->proxy_post;
+    routes.get_requests                = models_routes->proxy_get; // [TAG_REQUEST_HISTORY]
 
     // --models-api-loopback-only: model management from loopback clients only (the API key alone may be shared
     // with outside callers that must not unload, reload or download models); only_reload limits it to ?reload
@@ -672,7 +674,7 @@ static int server_run_instance(common_params & params, server_role & role, commo
     std::shared_ptr<server_classifier> classifier;   // set once the model is loaded
     const bool has_classifier = !params.classifier_head.empty() || !params.classifier_config.empty();
     if (has_classifier) {
-        server_http_context::handler_t native_h = [&classifier](const server_http_req & req) -> server_http_res_ptr {
+        server_http_context::handler_t native_h = [&classifier, &ctx_server](const server_http_req & req) -> server_http_res_ptr {
             auto res = std::make_unique<server_http_res>();
             auto err = [&](int status, const std::string & type, const std::string & msg) {
                 res->status = status;
@@ -687,11 +689,35 @@ static int server_run_instance(common_params & params, server_role & role, commo
             if (body.is_discarded() || !body.is_object()) {
                 return err(400, "invalid_request_error", "request body must be a JSON object");
             }
+            // [TAG_REQUEST_HISTORY] the request in GET /requests; the classifier has no priority of its own, the
+            // record shows the one the request asked for
+            auto record = [&](json rec) {
+                int32_t priority = SERVER_TASK_PRIORITY_DEFAULT;
+                if (body.contains("priority") && body.at("priority").is_string()) {
+                    server_task_priority_from_name(body.at("priority").get<std::string>(), priority);
+                }
+                const int64_t t_end_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                rec["priority"]     = server_task_priority_name(priority);
+                rec["t_arrival_ms"] = req.t_arrival_ms;
+                rec["t_end_ms"]     = std::max(t_end_ms, req.t_arrival_ms);
+                ctx_server.add_request_record(std::move(rec));
+            };
+            auto ms_since_arrival = [&]() {
+                return (double) (std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count() - req.t_arrival_ms);
+            };
+            json history;
             try {
-                res->data = safe_json_to_str(cls->classify(body));
+                res->data = safe_json_to_str(cls->classify(body, &history));
             } catch (const std::invalid_argument & e) {
+                record(server_classifier::history_error(ms_since_arrival()));
                 return err(422, "invalid_request_error", e.what());
+            } catch (const std::exception &) {
+                record(server_classifier::history_error(ms_since_arrival()));
+                throw;
             }
+            record(std::move(history));
             return res;
         };
         ctx_http.post("/v1/classifier", ex_wrapper(native_h));

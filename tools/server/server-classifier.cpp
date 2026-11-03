@@ -442,7 +442,7 @@ std::vector<float> server_classifier::decode_chunk(const std::vector<llama_token
     return captured;
 }
 
-json server_classifier::classify(const json & body) {
+json server_classifier::classify(const json & body, json * history) {
     const auto t0 = std::chrono::steady_clock::now();
     if (!body.is_object() || !body.contains("state") || !body.contains("questions")) {
         throw std::invalid_argument("request needs {\"state\", \"questions\"}");
@@ -450,8 +450,10 @@ json server_classifier::classify(const json & body) {
     const json & qs = body.at("questions");
     if (!qs.is_object() || qs.size() == 0) { throw std::invalid_argument("questions must be a non-empty object"); }
     if (cfg.family == "letter") {
-        json res = classify_letter(body);
-        res["latency_ms"] = std::round(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() * 100.0) / 100.0;
+        json res = classify_letter(body, history);
+        const double latency_ms = std::round(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() * 100.0) / 100.0;
+        res["latency_ms"] = latency_ms;
+        if (history) { (*history)["latency_ms"] = latency_ms; }
         return res;
     }
 
@@ -516,9 +518,10 @@ json server_classifier::classify(const json & body) {
     if (!cache_ident.empty()) {
         for (auto & e : enc) {
             e.cache_key = cache_key(prefix, e);
-            if (cache_get(e.cache_key, e.answer)) { n_miss--; } else { e.answer = json(); }
+            if (cache_get(e.cache_key, e.answer)) { n_miss--; e.cached = true; } else { e.answer = json(); }
         }
     }
+    size_t n_decoded = 0;   // [TAG_REQUEST_HISTORY]
 
     // --- backbone: one pass for a single question; otherwise the state prefix once, then each row continues from it ---
     std::unique_lock<std::mutex> lock(mtx, std::defer_lock);
@@ -530,6 +533,7 @@ json server_classifier::classify(const json & body) {
         llama_memory_clear(mem, true);
         if (shared) {
             decode_chunk(prefix, 0, { (int) prefix.size() - 1 });   // one output keeps llama_decode on its ordinary path
+            n_decoded += prefix.size();
         }
     }
     const float scale = 1.0f / std::sqrt((float) cfg.head_dim) / (float) cfg.temperature;
@@ -542,10 +546,12 @@ json server_classifier::classify(const json & body) {
         if (shared) {
             llama_memory_seq_rm(mem, 0, (llama_pos) prefix.size(), -1);
             h = decode_chunk(e.row, (int) prefix.size(), want);
+            n_decoded += e.row.size();
         } else {
             std::vector<llama_token> all = prefix;
             all.insert(all.end(), e.row.begin(), e.row.end());
             h = decode_chunk(all, 0, want);
+            n_decoded += all.size();
         }
         auto row_of = [&](int pos) { return h.data() + (size_t) (std::lower_bound(want.begin(), want.end(), pos) - want.begin()) * n_embd; };
 
@@ -590,8 +596,85 @@ json server_classifier::classify(const json & body) {
     res["model"] = body.contains("model") && body.at("model").is_string() ? body.at("model").get<std::string>() : cfg.name;
     res["answers"] = answers;
     if (!cache_ident.empty()) { res["cached"] = n_miss == 0; }
-    res["latency_ms"] = std::round(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() * 100.0) / 100.0;
+    const double latency_ms = std::round(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() * 100.0) / 100.0;
+    res["latency_ms"] = latency_ms;
+    if (history) {
+        *history = history_of(enc, n_decoded);
+        (*history)["latency_ms"] = latency_ms;
+    }
     return res;
+}
+
+// [TAG_REQUEST_HISTORY] the top-level fields describe the first question (the request's order), "questions" all of
+// them; question ids, instructions, options and the state are left out, only the chosen label is shown
+json server_classifier::history_of(const std::vector<encoded_question> & enc, size_t n_decoded) const {
+    struct q_info { std::string type, answer; int n_options = 0; double prob = 0.0; bool cached = false; };
+    std::vector<q_info> qi;
+    for (const auto & e : enc) {
+        const json & a = e.answer;
+        q_info q;
+        q.type   = e.type == "boolean" ? "noul" : e.type;
+        q.cached = e.cached;
+        if (q.type == "noul") {
+            const double p = a.value("noul", 0.0);   // P(true)
+            q.answer    = p >= 0.5 ? "yes" : "no";
+            q.prob      = p >= 0.5 ? p : 1.0 - p;
+            q.n_options = 2;
+        } else if (q.type == "choice") {
+            q.answer    = a.value("choice", std::string());
+            q.prob      = a.contains("probabilities") && a.at("probabilities").contains(q.answer)
+                        ? a.at("probabilities").at(q.answer).get<double>() : 0.0;
+            q.n_options = (int) e.keys.size();
+        } else {   // score: the expected level
+            q.answer    = a.contains("score") ? a.at("score").dump() : "";
+            q.prob      = a.value("score", 0.0);
+        }
+        qi.push_back(std::move(q));
+    }
+    json questions = json::array();
+    bool all_cached = !qi.empty();
+    for (const auto & q : qi) {
+        questions.push_back({ {"type", q.type}, {"n_options", q.n_options}, {"answer", q.answer}, {"prob", q.prob}, {"cached", q.cached} });
+        all_cached = all_cached && q.cached;
+    }
+    const q_info first = qi.empty() ? q_info() : qi[0];
+    return {
+        {"kind",         "classifier"},
+        {"id",           nullptr},
+        {"priority",     nullptr},
+        {"status",       "done"},
+        {"type",         first.type},
+        {"n_options",    first.n_options},
+        {"answer",       first.answer},
+        {"prob",         first.prob},
+        {"latency_ms",   0.0},
+        {"cached",       all_cached},
+        {"n_prompt",     n_decoded},
+        {"t_arrival_ms", nullptr},
+        {"t_end_ms",     nullptr},
+        {"n_questions",  qi.size()},
+        {"questions",    questions},
+    };
+}
+
+json server_classifier::history_error(double latency_ms) {
+    return {
+        {"kind",         "classifier"},
+        {"id",           nullptr},
+        {"priority",     nullptr},
+        {"status",       "error"},
+        {"type",         ""},
+        {"n_options",    0},
+        {"answer",       ""},
+        {"prob",         0.0},
+        {"latency_ms",   latency_ms},
+        {"cached",       false},
+        {"n_prompt",     0},
+        {"t_arrival_ms", nullptr},
+        {"t_end_ms",     nullptr},
+        {"n_questions",  0},
+        {"questions",    json::array()},
+    };
 }
 
 // System One answer of one question from its probabilities (in the order of e.keys)
@@ -737,7 +820,8 @@ static const size_t SHARE_MIN_TOKENS = 16;
 // Several prompts share their common token prefix: it is decoded once, the sequence state is saved, and every prompt
 // continues from a restored copy. A state snapshot rather than removing the tail from the memory, because the
 // recurrent layers of hybrid models (Qwen3.5) cannot be rolled back to a position.
-std::vector<std::vector<double>> server_classifier::letter_reads(const std::vector<std::string> & prompts, const std::vector<int> & n_opts) {
+std::vector<std::vector<double>> server_classifier::letter_reads(const std::vector<std::string> & prompts, const std::vector<int> & n_opts,
+                                                                 size_t * n_decoded) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
     std::vector<std::vector<llama_token>> toks;
     for (const auto & p : prompts) {
@@ -765,6 +849,7 @@ std::vector<std::vector<double>> server_classifier::letter_reads(const std::vect
         for (size_t i = from; i < to; i++) { batch.add(toks[r][i], (llama_pos) i, 0, i + 1 == to); }
         const int rc = llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (rc != 0) { throw std::runtime_error(string_format("llama_process failed (%d)", rc)); }
+        if (n_decoded) { *n_decoded += to - from; }   // [TAG_REQUEST_HISTORY]
     };
     std::vector<uint8_t> prefix_state;
     if (common > 0) {
@@ -801,7 +886,7 @@ std::vector<std::vector<double>> server_classifier::letter_reads(const std::vect
     return out;
 }
 
-json server_classifier::classify_letter(const json & body) {
+json server_classifier::classify_letter(const json & body, json * history) {
     const json & qs = body.at("questions");
 
     // --- the texts the prompt shows ---
@@ -919,9 +1004,10 @@ json server_classifier::classify_letter(const json & body) {
     if (!cache_ident.empty()) {
         for (auto & e : enc) {
             e.cache_key = cache_key({}, e);
-            if (cache_get(e.cache_key, e.answer)) { n_miss--; } else { e.answer = json(); }
+            if (cache_get(e.cache_key, e.answer)) { n_miss--; e.cached = true; } else { e.answer = json(); }
         }
     }
+    size_t n_decoded = 0;   // [TAG_REQUEST_HISTORY]
 
     // --- reads ---
     struct read { size_t q; std::vector<int> idx; };
@@ -934,7 +1020,7 @@ json server_classifier::classify_letter(const json & body) {
         std::vector<std::string> prompts;
         std::vector<int> n;
         for (const auto & r : rs) { prompts.push_back(prompt_of(enc[r.q], r.idx)); n.push_back((int) r.idx.size()); }
-        return letter_reads(prompts, n);
+        return letter_reads(prompts, n, &n_decoded);
     };
     const auto first = run(reads);
 
@@ -977,5 +1063,6 @@ json server_classifier::classify_letter(const json & body) {
     res["model"] = body.contains("model") && body.at("model").is_string() ? body.at("model").get<std::string>() : cfg.name;
     res["answers"] = answers;
     if (!cache_ident.empty()) { res["cached"] = n_miss == 0; }
+    if (history) { *history = history_of(enc, n_decoded); }
     return res;
 }

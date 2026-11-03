@@ -2460,12 +2460,24 @@ void server_prompt_cache::disable_disk_saves(const char * reason, const std::str
             path.empty() ? "-" : path.c_str(), disk_owned_path.c_str());
 }
 
+// [TAG_REQUEST_HISTORY] hands the disk counters to on_disk_stats when the public method that holds it returns
+struct server_prompt_disk_publish {
+    const server_prompt_cache & cache;
+    ~server_prompt_disk_publish() {
+        if (cache.on_disk_stats && cache.disk_enabled()) {
+            cache.on_disk_stats(cache.disk_stats());
+        }
+    }
+};
+
 bool server_prompt_cache::save(
         const server_prompt & prompt,
               llama_context * ctx_tgt,
               llama_context * ctx_dft,
                llama_seq_id   id_slot,
         const std::vector<uint8_t> & state_spec) {
+    const server_prompt_disk_publish publish { *this }; // [TAG_REQUEST_HISTORY]
+
     if (prompt.tokens.size() == 0) {
         return false;
     }
@@ -2987,6 +2999,8 @@ bool server_prompt_cache::save_prefix(
               llama_context * ctx_dft,
                llama_seq_id   id_slot,
         const std::vector<uint8_t> & state_spec) {
+    const server_prompt_disk_publish publish { *this }; // [TAG_REQUEST_HISTORY]
+
     if (!disk_enabled() || tokens_prefix.empty()) {
         return false;
     }
@@ -3128,6 +3142,8 @@ bool server_prompt_cache::load_disk(
     disk_states.splice(disk_states.end(), disk_states, it);
 
     const double t_ms = (ggml_time_us() - t_start)/1000.0;
+    disk_restore_ms_total += t_ms; // [TAG_REQUEST_HISTORY]
+    disk_restores_timed++;
     SRV_INF("prompt cache disk load: entry=%" PRIu64 " lcp=%zu tokens=%zu checkpoints=%zu/%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu read_bytes=%zu load_ms=%.2f path=%s\n",
             entry_id, lcp, n_tokens_expected, n_ckpt_restored, n_checkpoints, target_bytes, draft_bytes, spec_bytes, total_bytes,
             nread_main + nread_drft + nread_ckpt, t_ms, disk_owned_path.c_str());
@@ -3204,6 +3220,57 @@ void server_prompt_cache::update_disk() {
     }
 }
 
+// [TAG_REQUEST_HISTORY]
+server_prompt_disk_stats server_prompt_cache::disk_stats() const {
+    server_prompt_disk_stats s;
+    if (disk_owned_path.empty()) {
+        return s;
+    }
+    s.enabled          = true;
+    s.entries          = disk_states.size();
+    s.unusable         = std::count_if(disk_states.begin(), disk_states.end(),
+                            [](const server_prompt_disk_state & state) { return !state.usable; });
+    s.bytes            = disk_size_total;
+    s.limit_bytes      = disk_limit_size;
+    s.tokens           = disk_n_tokens();
+    s.saves            = disk_saves;
+    s.loads            = disk_loads;
+    s.evictions        = disk_evictions;
+    s.save_failures    = disk_save_failures;
+    s.save_disabled    = disk_save_disabled;
+    s.bytes_written    = disk_bytes_written;
+    s.bytes_read       = disk_bytes_read;
+    s.bytes_evicted    = disk_bytes_evicted;
+    s.restore_ms_total = disk_restore_ms_total;
+    s.restores_timed   = disk_restores_timed;
+    return s;
+}
+
+json server_prompt_disk_stats::to_json() const {
+    if (!enabled) {
+        return { {"enabled", false} };
+    }
+    return {
+        {"enabled",          true},
+        {"entries",          entries},
+        {"unusable",         unusable},
+        {"bytes",            bytes},
+        {"limit_bytes",      limit_bytes},
+        {"over_limit",       bytes > limit_bytes},
+        {"tokens",           tokens},
+        {"saves",            saves},
+        {"loads",            loads},
+        {"evictions",        evictions},
+        {"save_failures",    save_failures},
+        {"save_disabled",    save_disabled},
+        {"bytes_written",    bytes_written},
+        {"bytes_read",       bytes_read},
+        {"bytes_evicted",    bytes_evicted},
+        {"restore_ms_total", restore_ms_total},
+        {"restores_timed",   restores_timed},
+    };
+}
+
 void server_prompt_cache::log_disk_state() const {
     if (disk_owned_path.empty()) {
         return;
@@ -3227,6 +3294,8 @@ bool server_prompt_cache::load(
                     int32_t   id_slot,
        std::vector<uint8_t> * state_spec,
                        bool   probe) {
+    const server_prompt_disk_publish publish { *this }; // [TAG_REQUEST_HISTORY]
+
     if (state_spec != nullptr) {
         state_spec->clear();
     }
@@ -3415,6 +3484,8 @@ bool server_prompt_cache::load(
 }
 
 void server_prompt_cache::update() {
+    const server_prompt_disk_publish publish { *this }; // [TAG_REQUEST_HISTORY]
+
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
