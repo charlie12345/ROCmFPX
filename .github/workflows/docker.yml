@@ -89,17 +89,9 @@ jobs:
           [
             { "tag": "cpu", "dockerfile": ".devops/cpu.Dockerfile", "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": false, "runs_on": "ubuntu-24.04" },
             { "tag": "cpu", "dockerfile": ".devops/cpu.Dockerfile", "platforms": "linux/arm64", "full": true, "light": true, "server": true, "free_disk_space": false, "runs_on": "ubuntu-24.04-arm" },
-            { "tag": "cpu", "dockerfile": ".devops/s390x.Dockerfile", "platforms": "linux/s390x", "full": true, "light": true, "server": true, "free_disk_space": false, "runs_on": "ubuntu-24.04-s390x", "prebuilt_ui": true },
-            { "tag": "cuda cuda12", "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
-            { "tag": "cuda cuda12", "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "12.8.1", "platforms": "linux/arm64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04-arm" },
-            { "tag": "cuda13", "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "13.4.1", "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
-            { "tag": "cuda13", "dockerfile": ".devops/cuda.Dockerfile", "cuda_version": "13.4.1", "platforms": "linux/arm64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04-arm" },
-            { "tag": "musa", "dockerfile": ".devops/musa.Dockerfile", "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
-            { "tag": "intel", "dockerfile": ".devops/intel.Dockerfile", "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
             { "tag": "vulkan", "dockerfile": ".devops/vulkan.Dockerfile", "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": false, "runs_on": "ubuntu-24.04" },
             { "tag": "vulkan", "dockerfile": ".devops/vulkan.Dockerfile", "platforms": "linux/arm64", "full": true, "light": true, "server": true, "free_disk_space": false, "runs_on": "ubuntu-24.04-arm" },
-            { "tag": "rocm", "dockerfile": ".devops/rocm.Dockerfile", "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" },
-            { "tag": "openvino", "dockerfile": ".devops/openvino.Dockerfile", "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": false, "runs_on": "ubuntu-24.04" }
+            { "tag": "rocm", "dockerfile": ".devops/rocm.Dockerfile", "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" }
           ]
           JSON
 
@@ -196,6 +188,7 @@ jobs:
 
           REPO_OWNER="${GITHUB_REPOSITORY_OWNER@L}"  # to lower case
           REPO_NAME="${{ github.event.repository.name }}"
+          REPO_NAME="${REPO_NAME@L}"  # image names must be lower case (RDNA-FAST)
           IMAGE_REPO="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
           PREFIX="${IMAGE_REPO}:"
           PLATFORM="${{ matrix.config.platforms }}"
@@ -447,6 +440,7 @@ jobs:
 
           REPO_OWNER="${GITHUB_REPOSITORY_OWNER@L}"  # to lower case
           REPO_NAME="${{ github.event.repository.name }}"
+          REPO_NAME="${REPO_NAME@L}"  # image names must be lower case (RDNA-FAST)
           IMAGE_REPO="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
           PREFIX="${IMAGE_REPO}:"
           SRC_TAG="${{ needs.create_tag.outputs.source_tag }}"

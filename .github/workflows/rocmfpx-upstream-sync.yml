@@ -53,7 +53,32 @@ jobs:
         env:
           SYNC_BRANCH: automation/upstream-sync
         run: |
-          scripts/rocmfpx/sync-upstream.sh
+          # RDNA-FAST takes llama.cpp changes by hand (curated picks), so a merge that conflicts is a weekly report in
+          # the job summary, not a failure; only a clean merge publishes a branch and opens a pull request
+          err="$RUNNER_TEMP/sync-stderr.txt"
+          set +e
+          scripts/rocmfpx/sync-upstream.sh 2> "$err"
+          rc=$?
+          set -e
+          cat "$err" >&2
+          if [[ $rc -eq 2 ]]; then
+            {
+              echo "### llama.cpp master does not merge cleanly"
+              echo
+              echo "Commits on llama.cpp master that this branch does not have: $(git rev-list --count HEAD..upstream/master)"
+              echo
+              echo "Conflicted paths:"
+              echo '```'
+              sed -n '/^Conflicted paths:/,$p' "$err" | tail -n +2
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            git merge --abort
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ $rc -ne 0 ]]; then
+            exit $rc
+          fi
           if [[ "$(git branch --show-current)" == "$SYNC_BRANCH" ]]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
