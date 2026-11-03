@@ -1,7 +1,8 @@
 <script lang="ts">
 	/**
-	 * Chat sidebar: a live server-status card (busy slots, decode t/s now against the model's decode
-	 * peak from the status page) linking to the status page, and "RDNA-FAST on GitHub". It polls
+	 * Chat sidebar: a live server-status card (busy slots, decode t/s now; its bar against the model's
+	 * decode peak from the status page, the peak itself not shown, owner 2026-11-03) linking to the
+	 * status page, and "RDNA-FAST on GitHub". It polls
 	 * /slots of the chat's model once a second while it is shown, and only when that model is loaded.
 	 */
 	import '$lib/rdna/rdna.css';
@@ -112,7 +113,7 @@
 
 		<span class:rf-side-none={decodeNow === null} class="rf-side-num rf-num"
 			>{decodeNow !== null ? fmtRate(decodeNow, 1) : '–'}<span class="rf-side-unit"
-				>&nbsp;t/s now{peak !== null ? ` · peak ${fmtRate(peak, 1)}` : ''}</span
+				>&nbsp;t/s now</span
 			></span
 		>
 
