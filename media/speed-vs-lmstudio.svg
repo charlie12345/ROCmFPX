@@ -51,29 +51,29 @@
 <text x="170" y="597" fill="#9A9FA8" font-size="14">prompt tokens per second, higher is better</text>
 <text x="64" y="639" fill="#F4F4F5" font-size="17">cold 4k prompt</text>
 <rect x="420" y="616" width="470.0" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
-<text x="900.0" y="630" fill="#F4F4F5" font-size="17" font-weight="800">995 t/s</text>
-<rect x="420" y="638" width="343.9" height="17" rx="4" fill="#5B6068"/>
-<text x="773.9" y="652" fill="#9A9FA8" font-size="15">728 t/s</text>
-<text x="1136" y="645" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+37%</text>
+<text x="900.0" y="630" fill="#F4F4F5" font-size="17" font-weight="800">1002 t/s</text>
+<rect x="420" y="638" width="341.5" height="17" rx="4" fill="#5B6068"/>
+<text x="771.5" y="652" fill="#9A9FA8" font-size="15">728 t/s</text>
+<text x="1136" y="645" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+38%</text>
 <text x="64" y="703" fill="#F4F4F5" font-size="17">4.3k new tokens at 17k depth</text>
-<rect x="420" y="680" width="409.1" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
-<text x="839.1" y="694" fill="#F4F4F5" font-size="17" font-weight="800">866 t/s</text>
-<rect x="420" y="702" width="320.3" height="17" rx="4" fill="#5B6068"/>
-<text x="750.3" y="716" fill="#9A9FA8" font-size="15">678 t/s</text>
+<rect x="420" y="680" width="406.2" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
+<text x="836.2" y="694" fill="#F4F4F5" font-size="17" font-weight="800">866 t/s</text>
+<rect x="420" y="702" width="318.0" height="17" rx="4" fill="#5B6068"/>
+<text x="748.0" y="716" fill="#9A9FA8" font-size="15">678 t/s</text>
 <text x="1136" y="709" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+28%</text>
 <text x="64" y="767" fill="#F4F4F5" font-size="17">4.0k new tokens at 41k depth</text>
-<rect x="420" y="744" width="324.0" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
-<text x="754.0" y="758" fill="#F4F4F5" font-size="17" font-weight="800">686 t/s</text>
-<rect x="420" y="766" width="245.2" height="17" rx="4" fill="#5B6068"/>
-<text x="675.2" y="780" fill="#9A9FA8" font-size="15">519 t/s</text>
+<rect x="420" y="744" width="321.8" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
+<text x="751.8" y="758" fill="#F4F4F5" font-size="17" font-weight="800">686 t/s</text>
+<rect x="420" y="766" width="243.4" height="17" rx="4" fill="#5B6068"/>
+<text x="673.4" y="780" fill="#9A9FA8" font-size="15">519 t/s</text>
 <text x="1136" y="773" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+32%</text>
 <rect x="40" y="820" width="1120" height="110" rx="14" fill="#141417" stroke="#26262B"/>
 <text x="64" y="851" fill="#ED1C24" font-size="17" font-weight="800" letter-spacing="2">TEXT COPY BOOST</text>
 <text x="276" y="851" fill="#9A9FA8" font-size="14">decode t/s when the answer copies the prompt (n-gram drafting)</text>
 <text x="64" y="893" fill="#F4F4F5" font-size="17">return a file with one small change</text>
 <rect x="420" y="870" width="470.0" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
-<text x="900.0" y="884" fill="#F4F4F5" font-size="17" font-weight="800">308 t/s</text>
+<text x="900.0" y="884" fill="#F4F4F5" font-size="17" font-weight="800">311 t/s</text>
 <text x="420" y="906" fill="#9A9FA8" font-size="15">unavailable</text>
 <text x="56" y="962" fill="#9A9FA8" font-size="13">RX 7900 XT 20 GB, October and November 2026. Both: Swift 1.5 (Qwen3.8-27B) IQ4_XS, -c 98304, MTP draft, q4_0 KV cache, two sessions.</text>
-<text x="56" y="982" fill="#9A9FA8" font-size="13">This runtime: -ub 2048, WMMA GEMM for prompts, best of twenty runs. LM Studio: ROCm llama.cpp runtime 2.64.0, batch 2048 / 1024, best of two.</text>
+<text x="56" y="982" fill="#9A9FA8" font-size="13">This runtime: -ub 2048, WMMA GEMM for prompts, best of twenty-two runs. LM Studio: ROCm llama.cpp runtime 2.64.0, batch 2048 / 1024, best of two.</text>
 </svg>

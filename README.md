@@ -18,8 +18,8 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
   132 s. [Numbers](#speed)
 
 - **Multi-token prediction.** The model's own MTP head drafts tokens ahead: up
-  to 59 t/s on prose and 89 t/s on code. When an answer repeats text from the
-  prompt, as code edits do, n-gram drafting copies it at up to 308 t/s.
+  to 59 t/s on prose and 94 t/s on code. When an answer repeats text from the
+  prompt, as code edits do, n-gram drafting copies it at up to 311 t/s.
 
 - **Prompts on the matrix cores.** Prompt processing runs on RDNA3's WMMA units
   through [rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) by Adel
@@ -67,19 +67,19 @@ grows from 4k to 41k tokens, a 10k-token worker is called twice in between):
 | | LM Studio + MTP draft | this runtime |
 |---|---:|---:|
 | **the session, wall-clock** | **132 s** | **96 s** |
-| prefill t/s, cold 4k prompt | 728 | 995 |
+| prefill t/s, cold 4k prompt | 728 | 1,002 |
 | prefill t/s, 4.3k new tokens at 17k depth | 678 | 866 |
 | prefill t/s, 4.0k new tokens at 41k depth | 519 | 686 |
 | decode t/s at 4k depth | 51.6 | 68.8 |
 | decode t/s at 17k depth | 56.6 | 66.4 |
 | decode t/s at 41k depth | 42.4 | 65.5 |
-| decode t/s, text copy boost: code edit that copies the prompt | unavailable | 308 |
+| decode t/s, text copy boost: code edit that copies the prompt | unavailable | 311 |
 
 <sub>October and November 2026. Both run Swift 1.5 IQ4_XS at `-c 98304` with MTP drafting,
 flash attention, a q4_0 KV cache and two sessions, the best run for each value
-(LM Studio: two runs, this runtime: twenty). LM Studio is its ROCm llama.cpp
+(LM Studio: two runs, this runtime: twenty-two). LM Studio is its ROCm llama.cpp
 runtime 2.64.0 with batch 2048 / 1024; this runtime runs the quick start below.
-The edit row is the text copy boost, n-gram drafting, the best of 27 edits;
+The edit row is the text copy boost, n-gram drafting, the best of 33 edits;
 LM Studio cannot run it, as its API does not switch Swift 1.5's thinking
 off.</sub>
 
@@ -89,31 +89,31 @@ The same session with each quant we tested:
 |---|---:|---:|---:|---:|---:|---:|
 | [Q4_K_M](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf)\* | 17.4 GB | 146.8 s | 1,211 s (spill) | 408 / 548 / 431 | 50.6 / 50.8 / 48.2 | 238 |
 | [Q4_K_S](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_S.gguf) | 16.4 GB | 112.6 s | 1,139 s (spill) | 889 / 769 / 616 | 49.2 / 51.7 / 48.8 | 247 |
-| [IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf) | 15.5 GB | 95.9 s | 132.4 s | 995 / 866 / 686 | 68.8 / 66.4 / 65.5 | 308 |
+| [IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf) | 15.5 GB | 95.9 s | 132.4 s | 1,002 / 866 / 686 | 68.8 / 66.4 / 65.5 | 311 |
 | [ROCmFP4-FP6](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md) | 16.1 GB | 104.5 s | | 923 / 798 / 634 | 60.2 / 56.4 / 58.5 | 243 |
 
 <sub>\* At 64k (`-c 65536`) and `-ub 512`: the smaller context and prompt
 batches keep Q4_K_M's spill into system RAM down while staying above Hermes'
 64,000-token minimum. The other quants ran at 96k with `-ub 1024`, IQ4_XS at
 `-ub 2048` since. Prefill and decode are this runtime's, in the session above;
-the better of two runs (IQ4_XS: the best of twenty, Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M sit at the edge of
+the better of two runs (IQ4_XS: the best of twenty-two, Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M sit at the edge of
 the card's memory and read every prompt again in full. ROCmFP4-FP6 is a ROCmFPX
 format, which LM Studio does not load.</sub>
 
-Decode, 450-token answers at temperature 1, the best of 27:
+Decode, 450-token answers at temperature 1, the best of 36:
 
 | decode t/s | peak |
 |---|---:|
 | prose | 59.3 |
-| code | 88.7 |
+| code | 93.6 |
 | without MTP, prose or code | 36.8 |
 
 Cold prompts, each followed by a 300-token answer at that depth:
 
 | | 17k | 41k | 69k |
 |---|---:|---:|---:|
-| prefill t/s, average over the prompt | 953 | 854 | 742 |
-| decode t/s at that depth | 51.3 | 49.6 | 43.7 |
+| prefill t/s, average over the prompt | 955 | 854 | 743 |
+| decode t/s at that depth | 57.5 | 51.4 | 45.9 |
 
 ## Quick start
 
@@ -184,7 +184,7 @@ otherwise.
 | `-b 2048 -ub 2048` | prompts in batches of 2048 tokens | prompts 3-4% faster than at 1024. It fits since [rollback by replay](#rollback-by-replay). 1536 is slower, as the WMMA GEMM is tuned for 1024 and 2048 rows; below 512 the WMMA GEMM never runs |
 | `--no-mmproj-offload` | the 0.9 GB vision projector runs on the CPU | VRAM for context at two slots. Images take 7-12 s to the first token instead of 3-5 s. The BF16 projector encodes 8% faster than f16 on CPUs with AVX-512 BF16 (Ryzen 7000 and newer) |
 | `--spec-type draft-mtp`, `--spec-draft-n-max 4 --spec-draft-p-min 0.60` | the model's own MTP head drafts up to 4 tokens per pass | models that ship an MTP head (Qwen3.5/3.6/3.8): decode +45% on prose, +112% on code, for ~0.7 GB of VRAM and 3% of prefill speed |
-| `--spec-type "...,ngram-map-k4v"` | text copy boost: where the last tokens repeat an earlier place in the context, the continuation found there is drafted, up to 48 tokens once six 4-token probes in a row would have been accepted | answers that copy the prompt, such as code edits and quoted files: up to 308 t/s. On two days of agent traffic it saved 4.6-6.0% of decode time. Quote the value in a .cmd file, as cmd splits arguments at commas |
+| `--spec-type "...,ngram-map-k4v"` | text copy boost: where the last tokens repeat an earlier place in the context, the continuation found there is drafted, up to 48 tokens once six 4-token probes in a row would have been accepted | answers that copy the prompt, such as code edits and quoted files: up to 311 t/s. On two days of agent traffic it saved 4.6-6.0% of decode time. Quote the value in a .cmd file, as cmd splits arguments at commas |
 | `--ctx-checkpoints 8 --checkpoint-min-step 2048` | up to 8 checkpoints of the model state per slot (~200 MiB each, host RAM), at least 2048 tokens apart. When the list is full, the one whose removal leaves the smallest gap goes; the one at the first user message stays | hybrid models such as Qwen3.8, whose recurrent layers cannot roll back: a prompt that changes late resumes from the nearest checkpoint instead of from scratch |
 | `--cache-ram 0 --cache-disk PATH --cache-disk-limit 65536 --cache-disk-checkpoints 4` | conversations and their checkpoints go to SSD (64 GB limit, 4 checkpoints per entry) instead of RAM | more agents than slots, and restarts. [More](#the-ssd-prompt-cache) |
 | `--load-mode dio` | reads the model with direct I/O instead of memory-mapping it | keeps the 15 GB model file out of system RAM |
