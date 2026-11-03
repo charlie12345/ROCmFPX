@@ -7,7 +7,7 @@ dynamic = ["classifiers"]
 readme = "README.md"
 authors = [{name = "GGML", email = "ggml@ggml.ai"}]
 requires-python = '>=3.10'
-dependencies = ['numpy (>=2.2.6)', 'tqdm (>=4.27)', 'pyyaml (>=5.1)', 'requests (>=2.25)']
+dependencies = ['numpy (>=2.2.6)', 'tqdm (>=4.67.1)', 'pyyaml (>=6.0.3)', 'requests (>=2.34.2)']
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -38,7 +38,7 @@ packages = [
 python = ">=3.10"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^5.2"
+pytest = "^9.0.3"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

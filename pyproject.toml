@@ -9,10 +9,10 @@ authors = [{name = "GGML", email = "ggml@ggml.ai"}]
 requires-python = '>=3.10,<3.15'
 dependencies = [
     'numpy (>=2.2.6,<3.0.0)',
-    'sentencepiece (>=0.1.98,<0.3.0)',
-    'transformers (==4.57.6)',
-    'protobuf (>=4.21.0,<5.0.0)',
-    'torch (>=2.6.0,<3.0.0)',
+    'sentencepiece (>=0.2.2,<0.3.0)',
+    'transformers (==5.10.0)',
+    'protobuf (>=5.29.6,<6.0.0)',
+    'torch (>=2.13.0,<3.0.0)',
     'gguf @ ./gguf-py',
 ]
 classifiers = [
@@ -39,13 +39,13 @@ packages = [
 
 [tool.poetry.dependencies]
 torch = [
-    { version = "==2.11.0", source = "pypi", markers = "sys_platform == 'darwin'" },
-    { version = "==2.11.0+cpu", source = "pytorch", markers = "sys_platform == 'linux'" },
-    { version = "==2.11.0", source = "pypi", markers = "sys_platform == 'win32'" },
+    { version = "==2.13.0", source = "pypi", markers = "sys_platform == 'darwin'" },
+    { version = "==2.13.0+cpu", source = "pytorch", markers = "sys_platform == 'linux'" },
+    { version = "==2.13.0", source = "pypi", markers = "sys_platform == 'win32'" },
 ]
 
 [tool.poetry.group.dev.dependencies]
-pytest = "~=8.3.3"
+pytest = "~=9.0.3"
 
 # Force wheel + cpu
 # For discussion and context see https://github.com/python-poetry/poetry#6409
