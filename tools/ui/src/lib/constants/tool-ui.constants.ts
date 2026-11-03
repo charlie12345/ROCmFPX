@@ -15,7 +15,9 @@ import {
 	FilePlus,
 	FileSearch,
 	FileText,
+	Globe,
 	Info,
+	Link,
 	SearchCode,
 	Terminal
 } from '@lucide/svelte';
@@ -32,6 +34,17 @@ export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
 	[BuiltInTool.BROWSER_RUN_JAVASCRIPT]: {
 		icon: Braces,
 		label: 'Run JavaScript',
+		source: ToolSource.BROWSER
+	},
+	// [RDNA-FAST] src/lib/rdna/web-tools.ts
+	[BuiltInTool.BROWSER_WEB_FETCH]: {
+		icon: Link,
+		label: 'Read web page',
+		source: ToolSource.BROWSER
+	},
+	[BuiltInTool.BROWSER_WEB_SEARCH]: {
+		icon: Globe,
+		label: 'Web search',
 		source: ToolSource.BROWSER
 	},
 	[BuiltInTool.SERVER_EDIT_FILE]: { icon: FilePen, label: 'Edit file', source: ToolSource.SERVER },

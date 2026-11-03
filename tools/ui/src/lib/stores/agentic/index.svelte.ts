@@ -28,6 +28,7 @@ import {
 	MimeTypePrefix,
 	ToolCallType
 } from '$lib/enums';
+import { executeWebTool, isWebTool } from '$lib/rdna/web-tools';
 import { ChatService } from '$lib/services';
 import { ReadMediaService } from '$lib/services/read-media.service';
 import { SandboxService } from '$lib/services/sandbox.service';
@@ -844,6 +845,9 @@ class AgenticStore {
 									signal,
 									conversationsStore.activeConversation?.cwd
 								);
+							} else if (isWebTool(toolName)) {
+								// [RDNA-FAST] Keenable web search and page reading
+								executionResult = await executeWebTool(toolName, args, signal);
 							} else {
 								executionResult = await SandboxService.executeTool(toolName, args, signal);
 							}

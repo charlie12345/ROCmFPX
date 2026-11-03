@@ -45,6 +45,9 @@ export enum BuiltInTool {
 	BROWSER_GET_DATETIME = 'get_datetime',
 	BROWSER_READ_MEDIA = 'read_media',
 	BROWSER_RUN_JAVASCRIPT = 'run_javascript',
+	// [RDNA-FAST] Keenable web search and page reading, src/lib/rdna/web-tools.ts
+	BROWSER_WEB_FETCH = 'web_fetch',
+	BROWSER_WEB_SEARCH = 'web_search',
 	SERVER_EDIT_FILE = 'edit_file',
 	SERVER_EXEC_SHELL_COMMAND = 'exec_shell_command',
 	SERVER_FILE_GLOB_SEARCH = 'file_glob_search',

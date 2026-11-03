@@ -26,6 +26,7 @@ import {
 	ToolCallType,
 	ToolSource
 } from '$lib/enums';
+import { buildWebFetchToolDefinition, buildWebSearchToolDefinition } from '$lib/rdna/web-tools';
 import { ToolsService } from '$lib/services/tools.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { mcpStore } from '$lib/stores/mcp/index.svelte';
@@ -112,7 +113,12 @@ class ToolsStore {
 	}
 
 	get browserTools(): OpenAIToolDefinition[] {
-		const tools: OpenAIToolDefinition[] = [buildGetDatetimeToolDefinition()];
+		const tools: OpenAIToolDefinition[] = [
+			buildGetDatetimeToolDefinition(),
+			// [RDNA-FAST] Keenable web search and page reading, keyless, on by default
+			buildWebSearchToolDefinition(),
+			buildWebFetchToolDefinition()
+		];
 
 		if (settingsStore.config.jsSandboxEnabled) {
 			tools.push(buildSandboxToolDefinition(!!settingsStore.config.symbolicMathEnabled));
