@@ -83,13 +83,13 @@ static __global__ void quantize_q8_1(
     ggml_cuda_pdl_sync();
     const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
     float amax = fabsf(xi);
-    float sum = xi;
 
     amax = warp_reduce_max<QK8_1>(amax);
-    sum  = warp_reduce_sum<QK8_1>(sum);
 
     const float  d = amax / 127.0f;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    const int sum = warp_reduce_sum<QK8_1>((int) q);
 
     y[ib].qs[iqs] = q;
 
@@ -97,7 +97,7 @@ static __global__ void quantize_q8_1(
         return;
     }
 
-    y[ib].ds = make_half2(d, sum);
+    y[ib].ds = make_half2(d, d * sum);
 }
 
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
@@ -512,17 +512,6 @@ static __global__ void quantize_mmq_q8_1(
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
     }
 
-    float sum;
-    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
-        sum = xi.x + xi.y + xi.z + xi.w;
-
-        // Calculate sums across vals_per_sum/4 threads.
-#pragma unroll
-        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
-            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
-        }
-    }
-
     const float d_inv = i4_grid
         ? (amax > 0.0f ? 7.0f / amax : 0.0f)
         : 127.0f / amax;
@@ -545,6 +534,21 @@ static __global__ void quantize_mmq_q8_1(
 
     // IU4 accumulators are interpreted in units of 16*c by the W4A4 path.
     const float d = i4_grid ? (amax > 0.0f ? amax / (7.0f * 16.0f) : 0.0f) : 1.0f / d_inv;
+
+    // the sum of the quantized values times d, as the CPU reference has it (upstream #31247); the W4A4 i4 grid only
+    // runs with the D4 layout, which stores no sum
+    float sum = 0.0f;
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        int sum_q = int(q.x) + int(q.y) + int(q.z) + int(q.w);
+
+        // Calculate sums across vals_per_sum/4 threads.
+#pragma unroll
+        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+            sum_q += __shfl_xor_sync(0xFFFFFFFF, sum_q, offset, WARP_SIZE);
+        }
+
+        sum = d * float(sum_q);
+    }
 
     // write the block once (normal) or to each of the token's compact rows (scatter)
     const int nwrite = scatter ? n_expert_used : 1;
