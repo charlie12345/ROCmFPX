@@ -273,7 +273,7 @@ static std::string file_stamp(const std::string & path) {
     std::error_code e1, e2;
     const auto size = std::filesystem::file_size(path, e1);
     const auto time = std::filesystem::last_write_time(path, e2);
-    return path + "|" + (e1 ? "?" : std::to_string(size)) + "|" + (e2 ? "?" : std::to_string(time.time_since_epoch().count()));
+    return path + "|" + (e1 ? "?" : std::to_string(size)) + "|" + (e2 ? "?" : std::to_string((long long) time.time_since_epoch().count()));
 }
 
 void server_classifier::cache_open(const common_params & params) {
