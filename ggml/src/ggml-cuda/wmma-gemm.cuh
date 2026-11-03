@@ -2,7 +2,8 @@
 
 #include "common.cuh"
 
-// ROCmFPX [TAG_WMMA_GEMM]: prompt-sized products of the fork's FP4/FP6 weights through an FP16 WMMA GEMM
+// ROCmFPX [TAG_WMMA_GEMM]: prompt-sized products of quantized weights (the fork's FP4/FP6 types and the stock
+// quants listed in ggml_cuda_should_use_wmma_gemm) through an FP16 WMMA GEMM
 // (rocm_wmma_gemm by Adel Johar, MIT, vendored in vendor/rocm_wmma_gemm and built per architecture by
 // ggml-hip/wmma-gemm.cmake) instead of MMQ. The weight rows are unpacked to f16 into a reused scratch, the activations
 // converted to f16, and the product accumulated in f32. Only on gfx11 GPUs (tuned for gfx1100 and gfx1151, the other

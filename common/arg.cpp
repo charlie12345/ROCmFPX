@@ -4595,9 +4595,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-ngram-map-ramp"},
         {"--no-spec-ngram-map-ramp"},
-        "ngram-map-k and ngram-map-k4v: a draft has 4 tokens until four such drafts in a row were accepted in full,\n"
-        "then up to 24 tokens; a draft that is not accepted in full goes back to 4. Disabled: every draft has the\n"
-        "full m-gram length (default: enabled)",
+        "ngram-map-k and ngram-map-k4v: each match first makes a 4-token\n"
+        "probe, scored against the output instead of sent\n"
+        "(ROCMFPX_NGRAM_SHADOW=0 sends it). Once 6 probes in a row would have\n"
+        "been accepted in full (ROCMFPX_NGRAM_PROBES), drafts of up to 48\n"
+        "tokens are sent until one is not accepted in full. Disabled: every\n"
+        "draft has the full m-gram length (default: enabled)",
         [](common_params & params, bool value) {
             params.speculative.ngram_map_ramp = value;
         }

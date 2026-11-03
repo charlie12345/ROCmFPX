@@ -97,7 +97,7 @@ static wmma_gemm_f32_f16_t wmma_gemm_load(const char * arch) {
     }
 #endif
     GGML_LOG_INFO("%s: %s: %s\n", __func__, path.c_str(),
-        fn ? "loaded, prompt-sized FP4/FP6 products use the WMMA GEMM" : "not available, MMQ as before");
+        fn ? "loaded, prompt-sized quantized products use the WMMA GEMM" : "not available, MMQ as before");
     loaded[arch] = fn;
     return fn;
 }
