@@ -52,7 +52,8 @@ export const APPLE_ASSETS = {
 } as const;
 
 export const PWA_MANIFEST = {
-	background_color: THEME_COLORS.BACKGROUND_LIGHT,
+	// RDNA-FAST: the brand's dark ground
+	background_color: '#0b0b0d',
 	description: 'Local AI chat interface powered by llama.cpp',
 	display: 'standalone' as const,
 	icons: [
@@ -69,7 +70,7 @@ export const PWA_MANIFEST = {
 	name: APP_NAME,
 	short_name: APP_NAME,
 	start_url: './',
-	theme_color: THEME_COLORS.BACKGROUND_LIGHT
+	theme_color: '#0b0b0d'
 };
 
 export const PWA_ICON_PATHS = {
@@ -318,6 +319,8 @@ export const SVELTEKIT_PWA_OPTIONS: SvelteKitPWAOptions = {
 
 	// Workbox configuration for generateSW strategy
 	workbox: {
+		// RDNA-FAST: the bench prompts (~0.2 MB) load only when a bench runs, never precached
+		globIgnores: ['**/rdna/bench/**'],
 		// Match all static assets in the build output.
 		// Uses '**/' because SvelteKit outputs files under _app/immutable/
 		// subdirectories.

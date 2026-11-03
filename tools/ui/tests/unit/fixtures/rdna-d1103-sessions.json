@@ -1,0 +1,294 @@
+{
+	"d1103-chart": [
+		{
+			"session_s": 97.32799999997951,
+			"steps": [
+				{
+					"step": "A1 cold start (4k)",
+					"conv": "A",
+					"kind": "cold",
+					"prompt_tokens": 4025,
+					"ttft_s": 4.468999999924563,
+					"decode_tps": 60.94578067578525,
+					"completion_tokens": 300,
+					"error": null
+				},
+				{
+					"step": "A2 + file",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 8363,
+					"ttft_s": 4.780999999959022,
+					"decode_tps": 76.32999228869396,
+					"completion_tokens": 100,
+					"error": null
+				},
+				{
+					"step": "A3 + file",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 12701,
+					"ttft_s": 4.875,
+					"decode_tps": 65.30343008152262,
+					"completion_tokens": 100,
+					"error": null
+				},
+				{
+					"step": "A4 + file (17k)",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 17039,
+					"ttft_s": 5.125,
+					"decode_tps": 58.17120622552283,
+					"completion_tokens": 300,
+					"error": null
+				},
+				{
+					"step": "B1 worker, cold (10k)",
+					"conv": "B",
+					"kind": "cold",
+					"prompt_tokens": 9975,
+					"ttft_s": 10.094000000040978,
+					"decode_tps": 74.9246987963367,
+					"completion_tokens": 200,
+					"error": null
+				},
+				{
+					"step": "A6 back at 17k",
+					"conv": "A",
+					"kind": "return",
+					"prompt_tokens": 17096,
+					"ttft_s": 0.4220000000204891,
+					"decode_tps": 76.88338493428758,
+					"completion_tokens": 150,
+					"error": null
+				},
+				{
+					"step": "A7 + file",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 21089,
+					"ttft_s": 4.937000000034459,
+					"decode_tps": 66.0,
+					"completion_tokens": 100,
+					"error": null
+				},
+				{
+					"step": "A8 + file",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 25082,
+					"ttft_s": 5.125,
+					"decode_tps": 68.1348933251177,
+					"completion_tokens": 100,
+					"error": null
+				},
+				{
+					"step": "A9 + file",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 29075,
+					"ttft_s": 5.344000000040978,
+					"decode_tps": 63.99482869986348,
+					"completion_tokens": 100,
+					"error": null
+				},
+				{
+					"step": "A10 + file",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 33067,
+					"ttft_s": 5.546999999904074,
+					"decode_tps": 72.84768211625988,
+					"completion_tokens": 100,
+					"error": null
+				},
+				{
+					"step": "A11 + file",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 37060,
+					"ttft_s": 5.702999999979511,
+					"decode_tps": 72.0,
+					"completion_tokens": 100,
+					"error": null
+				},
+				{
+					"step": "A12 + file (41k)",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 41053,
+					"ttft_s": 5.937999999965541,
+					"decode_tps": 61.145194273853946,
+					"completion_tokens": 300,
+					"error": null
+				},
+				{
+					"step": "B2 worker again (10k)",
+					"conv": "B",
+					"kind": "return",
+					"prompt_tokens": 9973,
+					"ttft_s": 0.2970000000204891,
+					"decode_tps": 84.32203389880422,
+					"completion_tokens": 200,
+					"error": null
+				},
+				{
+					"step": "A14 back at 41k",
+					"conv": "A",
+					"kind": "return",
+					"prompt_tokens": 41107,
+					"ttft_s": 0.5,
+					"decode_tps": 66.69650850328343,
+					"completion_tokens": 150,
+					"error": null
+				}
+			]
+		},
+		{
+			"session_s": 97.60999999998603,
+			"steps": [
+				{
+					"step": "A1 cold start (4k)",
+					"conv": "A",
+					"kind": "cold",
+					"prompt_tokens": 4025,
+					"ttft_s": 4.016000000061467,
+					"decode_tps": 59.24311472274281,
+					"completion_tokens": 300,
+					"error": null
+				},
+				{
+					"step": "A2 + file",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 8363,
+					"ttft_s": 4.547000000020489,
+					"decode_tps": 72.84768211625988,
+					"completion_tokens": 100,
+					"error": null
+				},
+				{
+					"step": "A3 + file",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 12701,
+					"ttft_s": 4.827999999979511,
+					"decode_tps": 66.66666666729382,
+					"completion_tokens": 100,
+					"error": null
+				},
+				{
+					"step": "A4 + file (17k)",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 17039,
+					"ttft_s": 5.062000000034459,
+					"decode_tps": 60.36745406849119,
+					"completion_tokens": 300,
+					"error": null
+				},
+				{
+					"step": "B1 worker, cold (10k)",
+					"conv": "B",
+					"kind": "cold",
+					"prompt_tokens": 9975,
+					"ttft_s": 10.030999999959022,
+					"decode_tps": 78.13113466760862,
+					"completion_tokens": 200,
+					"error": null
+				},
+				{
+					"step": "A6 back at 17k",
+					"conv": "A",
+					"kind": "return",
+					"prompt_tokens": 17096,
+					"ttft_s": 0.3440000000409782,
+					"decode_tps": 69.5936478299038,
+					"completion_tokens": 150,
+					"error": null
+				},
+				{
+					"step": "A7 + file",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 21089,
+					"ttft_s": 4.875,
+					"decode_tps": 65.34653465286279,
+					"completion_tokens": 100,
+					"error": null
+				},
+				{
+					"step": "A8 + file",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 25082,
+					"ttft_s": 5.077999999979511,
+					"decode_tps": 60.32906763942214,
+					"completion_tokens": 100,
+					"error": null
+				},
+				{
+					"step": "A9 + file",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 29075,
+					"ttft_s": 5.280999999959022,
+					"decode_tps": 57.59162303527632,
+					"completion_tokens": 100,
+					"error": null
+				},
+				{
+					"step": "A10 + file",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 33067,
+					"ttft_s": 5.5,
+					"decode_tps": 72.0,
+					"completion_tokens": 100,
+					"error": null
+				},
+				{
+					"step": "A11 + file",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 37060,
+					"ttft_s": 5.718999999924563,
+					"decode_tps": 60.365853658022374,
+					"completion_tokens": 100,
+					"error": null
+				},
+				{
+					"step": "A12 + file (41k)",
+					"conv": "A",
+					"kind": "append",
+					"prompt_tokens": 41053,
+					"ttft_s": 5.891000000061467,
+					"decode_tps": 58.52417302869394,
+					"completion_tokens": 300,
+					"error": null
+				},
+				{
+					"step": "B2 worker again (10k)",
+					"conv": "B",
+					"kind": "return",
+					"prompt_tokens": 9973,
+					"ttft_s": 0.2660000000614673,
+					"decode_tps": 81.12515287470941,
+					"completion_tokens": 200,
+					"error": null
+				},
+				{
+					"step": "A14 back at 41k",
+					"conv": "A",
+					"kind": "return",
+					"prompt_tokens": 41107,
+					"ttft_s": 0.4690000000409782,
+					"decode_tps": 54.79955866279291,
+					"completion_tokens": 150,
+					"error": null
+				}
+			]
+		}
+	]
+}

@@ -9,10 +9,11 @@
 		DialogMcpServers,
 		DialogModelInformation,
 		DialogSettingsChat,
-		Logo,
 		SidebarNavigationActions,
 		SidebarNavigationConversationList
 	} from '$lib/components/app';
+	import RdnaSidebarBrand from '$lib/components/app/rdna/RdnaSidebarBrand.svelte';
+	import RdnaSidebarStatus from '$lib/components/app/rdna/RdnaSidebarStatus.svelte';
 	import { ROUTES } from '$lib/constants';
 	import { TooltipSide } from '$lib/enums';
 	import { useKeyboardShortcuts } from '$lib/hooks/use-keyboard-shortcuts.svelte';
@@ -36,7 +37,6 @@
 	});
 
 	let hoveredTooltip = $state<string | null>(null);
-	let logoHovered = $state(false);
 
 	const isStripExpanded = $derived(uiStore.isSidebarExpanded || hoveredTooltip !== null);
 	const isOnMobile = $derived(deviceStore.isMobile);
@@ -343,29 +343,24 @@
 		]}
 	>
 		<div class="px-2 flex items-center justify-between">
-			<div
-				class="relative"
-				onmouseenter={() => (logoHovered = true)}
-				onmouseleave={() => (logoHovered = false)}
-				role="button"
-				tabindex="0"
-			>
+			<!-- [RDNA-FAST] no llama.cpp logo (owner, 2026-11-03): the expanded sidebar starts with the
+			     wordmark, which links to the start; the collapsed one keeps the button that opens it -->
+			{#if !uiStore.isSidebarExpanded}
 				<ActionIcon
-					ariaLabel={uiStore.isSidebarExpanded ? 'Go to start' : 'Expand navigation'}
-					class="{uiStore.isSidebarExpanded
-						? 'bg-muted! md:bg-foreground/5!'
-						: 'bg-transparent!'} md:h-9 md:w-9 h-10 w-10 rounded-full md:hover:bg-foreground/10! pointer-events-auto"
-					href={uiStore.isSidebarExpanded ? ROUTES.START : undefined}
-					icon={!uiStore.isSidebarExpanded && logoHovered && innerWidth > 768
-						? PanelLeftOpen
-						: Logo}
+					ariaLabel="Expand navigation"
+					class="bg-transparent! md:h-9 md:w-9 h-10 w-10 rounded-full md:hover:bg-foreground/10! pointer-events-auto"
+					icon={PanelLeftOpen}
 					iconSize="h-4.5 w-4.5 md:h-4 md:w-4"
-					onclick={uiStore.isSidebarExpanded ? undefined : toggleExpandedMode}
+					onclick={toggleExpandedMode}
 					size="lg"
-					tooltip={uiStore.isSidebarExpanded ? undefined : 'Open Sidebar'}
+					tooltip="Open Sidebar"
 					tooltipSide={TooltipSide.RIGHT}
 				/>
-			</div>
+			{/if}
+
+			{#if uiStore.isSidebarExpanded}
+				<RdnaSidebarBrand />
+			{/if}
 
 			{#if isOnMobile || (uiStore.isSidebarExpanded && !alwaysShowOnDesktop)}
 				<div
@@ -452,6 +447,10 @@
 						visibleCount={visibleSelectionStats.visibleCount}
 					/>
 				</div>
+
+				{#if uiStore.isSidebarExpanded}
+					<div class="px-2 pb-2"><RdnaSidebarStatus /></div>
+				{/if}
 			{/if}
 		</div>
 	</aside>

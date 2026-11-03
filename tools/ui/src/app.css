@@ -35,39 +35,40 @@
 
 :root {
 	--radius: 0.625rem;
-	--background: oklch(1 0 0);
-	--foreground: oklch(0.145 0 0);
-	--card: oklch(1 0 0);
-	--card-foreground: oklch(0.145 0 0);
-	--popover: oklch(1 0 0);
-	--popover-foreground: oklch(0.145 0 0);
-	--primary: oklch(0.205 0 0);
-	--primary-foreground: oklch(0.985 0 0);
-	--secondary: oklch(0.95 0 0);
-	--secondary-foreground: oklch(0.205 0 0);
-	--muted: oklch(0.97 0 0);
-	--muted-foreground: oklch(0.556 0 0);
-	--accent: oklch(0.95 0 0);
-	--accent-foreground: oklch(0.205 0 0);
+	/* RDNA-FAST brand light theme: #F6F6F7 ground, white panels, #E4E4E7 lines, red accents */
+	--background: #f6f6f7;
+	--foreground: #18181b;
+	--card: #ffffff;
+	--card-foreground: #18181b;
+	--popover: #ffffff;
+	--popover-foreground: #18181b;
+	--primary: #c8102e;
+	--primary-foreground: #ffffff;
+	--secondary: #ececef;
+	--secondary-foreground: #18181b;
+	--muted: #ececef;
+	--muted-foreground: #52525b;
+	--accent: #fdecec;
+	--accent-foreground: #18181b;
 	--destructive: oklch(0.577 0.245 27.325);
-	--border: oklch(0.875 0 0);
-	--input: oklch(0.92 0 0);
-	--ring: oklch(0.708 0 0);
+	--border: #e4e4e7;
+	--input: #d4d4d8;
+	--ring: #b93c0a;
 	--chart-1: oklch(0.646 0.222 41.116);
 	--chart-2: oklch(0.6 0.118 184.704);
 	--chart-3: oklch(0.398 0.07 227.392);
 	--chart-4: oklch(0.828 0.189 84.429);
 	--chart-5: oklch(0.769 0.188 70.08);
-	--sidebar: oklch(0.985 0 0);
-	--sidebar-foreground: oklch(0.145 0 0);
-	--sidebar-primary: oklch(0.205 0 0);
-	--sidebar-primary-foreground: oklch(0.985 0 0);
-	--sidebar-accent: oklch(0.97 0 0);
-	--sidebar-accent-foreground: oklch(0.205 0 0);
-	--sidebar-border: oklch(0.922 0 0);
-	--sidebar-ring: oklch(0.708 0 0);
-	--code-background: oklch(0.985 0 0);
-	--code-foreground: oklch(0.145 0 0);
+	--sidebar: #ffffff;
+	--sidebar-foreground: #18181b;
+	--sidebar-primary: #c8102e;
+	--sidebar-primary-foreground: #ffffff;
+	--sidebar-accent: #fdecec;
+	--sidebar-accent-foreground: #18181b;
+	--sidebar-border: #e4e4e7;
+	--sidebar-ring: #b93c0a;
+	--code-background: #f4f4f5;
+	--code-foreground: #18181b;
 	--font-mono:
 		ui-monospace, SFMono-Regular, 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas,
 		'Liberation Mono', Menlo, monospace;
@@ -88,39 +89,40 @@
 }
 
 .dark {
-	--background: oklch(0.16 0 0);
-	--foreground: oklch(0.985 0 0);
-	--card: oklch(0.205 0 0);
-	--card-foreground: oklch(0.985 0 0);
-	--popover: oklch(0.205 0 0);
-	--popover-foreground: oklch(0.985 0 0);
-	--primary: oklch(0.922 0 0);
-	--primary-foreground: oklch(0.205 0 0);
-	--secondary: oklch(0.29 0 0);
-	--secondary-foreground: oklch(0.985 0 0);
-	--muted: oklch(0.269 0 0);
-	--muted-foreground: oklch(0.708 0 0);
-	--accent: oklch(0.269 0 0);
-	--accent-foreground: oklch(0.985 0 0);
+	/* RDNA-FAST brand dark theme: #0B0B0D ground, #141417 panels, #26262B lines, red-orange accents */
+	--background: #0b0b0d;
+	--foreground: #f4f4f5;
+	--card: #141417;
+	--card-foreground: #f4f4f5;
+	--popover: #141417;
+	--popover-foreground: #f4f4f5;
+	--primary: #ed1c24;
+	--primary-foreground: #ffffff;
+	--secondary: #1d1d22;
+	--secondary-foreground: #f4f4f5;
+	--muted: #1d1d22;
+	--muted-foreground: #9a9fa8;
+	--accent: #2c2a2d;
+	--accent-foreground: #ffffff;
 	--destructive: oklch(0.704 0.191 22.216);
-	--border: oklch(1 0 0 / 30%);
-	--input: oklch(1 0 0 / 30%);
-	--ring: oklch(0.556 0 0);
+	--border: #26262b;
+	--input: #2e2e35;
+	--ring: #ff6a3d;
 	--chart-1: oklch(0.488 0.243 264.376);
 	--chart-2: oklch(0.696 0.17 162.48);
 	--chart-3: oklch(0.769 0.188 70.08);
 	--chart-4: oklch(0.627 0.265 303.9);
 	--chart-5: oklch(0.645 0.246 16.439);
-	--sidebar: oklch(0.2 0 0);
-	--sidebar-foreground: oklch(0.985 0 0);
-	--sidebar-primary: oklch(0.488 0.243 264.376);
-	--sidebar-primary-foreground: oklch(0.985 0 0);
-	--sidebar-accent: oklch(0.269 0 0);
-	--sidebar-accent-foreground: oklch(0.985 0 0);
-	--sidebar-border: oklch(1 0 0 / 10%);
-	--sidebar-ring: oklch(0.556 0 0);
-	--code-background: oklch(0.225 0 0);
-	--code-foreground: oklch(0.875 0 0);
+	--sidebar: #111114;
+	--sidebar-foreground: #f4f4f5;
+	--sidebar-primary: #ed1c24;
+	--sidebar-primary-foreground: #ffffff;
+	--sidebar-accent: #2c2a2d;
+	--sidebar-accent-foreground: #ffffff;
+	--sidebar-border: #26262b;
+	--sidebar-ring: #ff6a3d;
+	--code-background: #111114;
+	--code-foreground: #e4e6ea;
 }
 
 @theme inline {
@@ -251,4 +253,19 @@
 
 .mermaidTooltip {
 	display: none !important;
+}
+
+/* RDNA-FAST: the brand line along the top of the Models, MCP and Settings dialogs (as on the speed card) */
+.rf-dialog-brand {
+	background-image: linear-gradient(90deg, #ed1c24, #ff6a3d);
+	background-size: 100% 3px;
+	background-repeat: no-repeat;
+}
+
+/* RDNA-FAST: the chat's "Hello there" in the brand's display font (Exo 2 heavy italic, rdna/fonts.ts) */
+.rf-greeting {
+	font-family: 'Exo 2', 'Segoe UI', system-ui, sans-serif;
+	font-style: italic;
+	font-weight: 800;
+	letter-spacing: 0;
 }

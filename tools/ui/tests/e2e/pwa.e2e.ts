@@ -94,8 +94,9 @@ test.describe('PWA Service Worker', () => {
 
 		const manifest = await response.json();
 
-		expect(manifest).toHaveProperty('name', 'llama-ui');
-		expect(manifest).toHaveProperty('short_name', 'llama-ui');
+		// RDNA-FAST: the app's name
+		expect(manifest).toHaveProperty('name', 'RDNA-FAST');
+		expect(manifest).toHaveProperty('short_name', 'RDNA-FAST');
 		expect(manifest).toHaveProperty('start_url', './');
 		expect(manifest).toHaveProperty('display', 'standalone');
 		expect(manifest.icons).toBeTruthy();

@@ -1,0 +1,6 @@
+RDNA-FAST browser bench fixtures
+
+agentic.json and edit.json hold slices of this repository's own source (tools/server/server-context.cpp,
+src/llama-context.cpp, tools/server/README.md at commit 3e500ba13), MIT licensed like the rest of llama.cpp.
+
+Regenerate with: node scripts/rdna-bench-fixtures.mjs --scenario <scenario.json>

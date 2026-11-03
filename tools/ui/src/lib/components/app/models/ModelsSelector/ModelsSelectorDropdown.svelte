@@ -8,6 +8,7 @@
 		ModelsSelectorOption,
 		ModelsSelectorTriggerIcon
 	} from '$lib/components/app';
+	import RdnaRuntimeTag from '$lib/components/app/rdna/RdnaRuntimeTag.svelte';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
 	import * as Tooltip from '$lib/components/ui/tooltip';
 	import { MODEL_ICON } from '$lib/constants';
@@ -107,6 +108,8 @@
 				hideQuantization
 				modelId={selectedOption.model}
 			/>
+
+			<RdnaRuntimeTag model={selectedOption.model} />
 		{:else}
 			<span class="min-w-0 font-medium">Select model</span>
 		{/if}

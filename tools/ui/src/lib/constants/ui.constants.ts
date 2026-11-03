@@ -2,6 +2,7 @@ import { MODEL_ICON } from './icons.constants';
 import { Search, Settings, SquarePen } from '@lucide/svelte';
 import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
 import { SidebarAction, ToolSource } from '$lib/enums';
+import { RDNA_SIDEBAR_STATUS_ITEM } from '$lib/rdna/sidebar';
 import type { DesktopIconStripItem } from '$lib/types';
 
 /** Delay before a copied affordance resets from its check to the copy icon. */
@@ -91,6 +92,8 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 		icon: McpLogo,
 		tooltip: 'MCP'
 	},
+	// RDNA-FAST: the live status page
+	RDNA_SIDEBAR_STATUS_ITEM,
 	{
 		action: SidebarAction.SETTINGS,
 		icon: Settings,

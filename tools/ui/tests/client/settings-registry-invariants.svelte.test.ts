@@ -56,6 +56,11 @@ describe('registry-wide invariants', () => {
 			setUser(key, userValues[key]);
 		}
 
+		// RDNA-FAST: the hub API is on by default and Discover Models (flipped on above) locks it on,
+		// so the consistent user value is on
+		userValues.useHuggingFaceHub = true;
+		setUser('useHuggingFaceHub', true);
+
 		// simulated F5 + adverse admin baseline on every key, synced twice
 		settingsStore.initialize();
 		const adverse: Record<string, Primitive> = {};

@@ -1,0 +1,448 @@
+/*
+ * RDNA-FAST brand tokens and shared classes for the status page and the chat additions. They
+ * follow the UI's theme setting (System / Light / Dark, mode-watcher's `.dark` on <html>; dark is
+ * the default): light values on :root, dark values under `.dark`. Components use these tokens
+ * only, no colours of their own. Two scope classes pin a subtree to one theme whatever the
+ * setting: `rf-theme-dark` (the speed card and the bench chart, which are exported as images and
+ * stay dark, so the PNG is the same in both themes) and `rf-theme-light` (stories, tests).
+ * Exo 2 (OFL, static/fonts/exo2) is registered at runtime by fonts.ts, with URLs that work under
+ * any base path.
+ */
+
+/* light */
+:root,
+.rf-theme-light {
+	--rf-bg: #f6f6f7;
+	--rf-bg-deep: #f4eeee;
+	--rf-panel: #ffffff;
+	--rf-panel-deep: #f4f4f5;
+	--rf-border: #e4e4e7;
+	--rf-border-strong: #d4d4d8;
+	--rf-track: #ececef;
+	--rf-text: #18181b;
+	--rf-text-soft: #27272a;
+	--rf-text-dim: #3f3f46;
+	--rf-muted: #52525b;
+	--rf-faint: #62626c;
+	--rf-red: #ed1c24;
+	--rf-orange: #b93c0a;
+	--rf-orange-hover: #9a3412;
+	--rf-label: #c8102e;
+	--rf-tag-bg: #fde4e3;
+	--rf-tag-fg: #b8121a;
+	--rf-green: #16733a;
+	--rf-amber: #a64b07;
+	--rf-grey-bar: #7c7c86;
+	/* red-tinted surfaces: the bench progress bar, the sidebar status card; warm-fg = the active tab */
+	--rf-warm-bg: #fff5f4;
+	--rf-warm-card: linear-gradient(160deg, #fff1f0, #ffffff);
+	--rf-warm-border: #f3cfcc;
+	--rf-warm-border-strong: #e59c97;
+	--rf-warm-track: #fbe1df;
+	--rf-warm-fg: #b8121a;
+	/* form fields */
+	--rf-input-bg: #ffffff;
+	--rf-input-border: #8e8e98;
+	/* text on the red-orange gradient, behind avatars */
+	--rf-on-grad: #ffffff;
+	--rf-avatar-bg: #ffffff;
+	/* the Decode / Prefill rows: the live line and its number, the peak bar's shadow */
+	--rf-live-line: rgba(24, 24, 27, 0.6);
+	--rf-live-line-glow: rgba(24, 24, 27, 0.2);
+	--rf-live-num: #18181b;
+	--rf-live-num-glow: rgba(255, 255, 255, 0);
+	--rf-bar-shadow: rgba(237, 28, 36, 0.28);
+	/* the record glow (rfRecord on numbers, rfRecordBar on bars) */
+	--rf-glow-soft: rgba(237, 28, 36, 0.3);
+	--rf-glow-core: rgba(237, 28, 36, 0.75);
+	--rf-glow-hot: rgba(255, 106, 61, 0.75);
+	--rf-glow-bar-rest: rgba(237, 28, 36, 0.3);
+	--rf-glow-bar-hot: rgba(255, 106, 61, 0.95);
+	--rf-glow-bar-core: rgba(237, 28, 36, 0.6);
+	--rf-glow-bright: 1.12;
+	/* the wordmark's "RDNA-": graphite with a dark outline on light grounds */
+	--rf-wm-silver-0: #80858e;
+	--rf-wm-silver-1: #5c616a;
+	--rf-wm-silver-2: #33363c;
+	--rf-wm-silver-3: #50555d;
+	--rf-wm-silver-stroke: #18181b;
+	--rf-wm-red-0: #ff4a3d;
+	--rf-wm-red-1: #ed1c24;
+	--rf-wm-red-2: #b8121a;
+	--rf-wm-red-stroke: #7a0a10;
+	/* the tiles' entrance: the top-edge light, the border flash and its glow (softer on light) */
+	--rf-enter-sweep: linear-gradient(
+		90deg,
+		transparent,
+		rgba(237, 28, 36, 0.7) 35%,
+		rgba(255, 106, 61, 0.7) 65%,
+		transparent
+	);
+	--rf-enter-border: rgba(237, 28, 36, 0.45);
+	--rf-enter-glow: rgba(237, 28, 36, 0.18);
+	--rf-enter-sweep-glow: rgba(237, 28, 36, 0.35);
+	--rf-enter-bracket: rgba(237, 28, 36, 0.75);
+	--rf-enter-bright: 1.15;
+	--rf-grad: linear-gradient(90deg, #ed1c24, #ff6a3d);
+	--rf-font-display: 'Exo 2', 'Segoe UI', system-ui, sans-serif;
+}
+
+/* dark (the default theme) */
+.dark,
+.rf-theme-dark {
+	--rf-bg: #0b0b0d;
+	--rf-bg-deep: #120709;
+	--rf-panel: #141417;
+	--rf-panel-deep: #0e0e11;
+	--rf-border: #26262b;
+	--rf-border-strong: #3a3a42;
+	--rf-track: #1d1d22;
+	--rf-text: #f4f4f5;
+	--rf-text-soft: #e4e6ea;
+	--rf-text-dim: #c9ccd2;
+	--rf-muted: #9a9fa8;
+	--rf-faint: #8a8f98;
+	--rf-red: #ed1c24;
+	--rf-orange: #ff6a3d;
+	--rf-orange-hover: #ff8a66;
+	--rf-label: #ff5148;
+	--rf-tag-bg: #2a0f11;
+	--rf-tag-fg: #ff7a70;
+	--rf-green: #3ddc84;
+	--rf-amber: #ffb020;
+	--rf-grey-bar: #5b6068;
+	--rf-warm-bg: #170a0c;
+	--rf-warm-card: linear-gradient(160deg, #1a0b0d, #141417);
+	--rf-warm-border: #3a1114;
+	--rf-warm-border-strong: #5a1a1e;
+	--rf-warm-track: #2a1416;
+	--rf-warm-fg: #ffb3ac;
+	--rf-input-bg: #17171b;
+	--rf-input-border: #2e2e35;
+	--rf-on-grad: #ffffff;
+	--rf-avatar-bg: #ffffff;
+	--rf-live-line: rgba(255, 255, 255, 0.62);
+	--rf-live-line-glow: rgba(255, 255, 255, 0.5);
+	--rf-live-num: #ffffff;
+	--rf-live-num-glow: rgba(255, 255, 255, 0.35);
+	--rf-bar-shadow: rgba(237, 28, 36, 0.45);
+	--rf-glow-soft: rgba(255, 255, 255, 0.45);
+	--rf-glow-core: rgba(255, 255, 255, 0.95);
+	--rf-glow-hot: rgba(255, 106, 61, 0.85);
+	--rf-glow-bar-rest: rgba(237, 28, 36, 0.45);
+	--rf-glow-bar-hot: rgba(255, 106, 61, 0.95);
+	--rf-glow-bar-core: rgba(255, 255, 255, 0.55);
+	--rf-glow-bright: 1.3;
+	--rf-wm-silver-0: #ffffff;
+	--rf-wm-silver-1: #e4e6ea;
+	--rf-wm-silver-2: #a7acb4;
+	--rf-wm-silver-3: #dadde2;
+	--rf-wm-silver-stroke: #6b7079;
+	--rf-wm-red-0: #ff4a3d;
+	--rf-wm-red-1: #ed1c24;
+	--rf-wm-red-2: #b8121a;
+	--rf-wm-red-stroke: #7a0a10;
+	--rf-enter-sweep: linear-gradient(90deg, transparent, #ed1c24 35%, #ff6a3d 65%, transparent);
+	--rf-enter-border: rgba(237, 28, 36, 0.9);
+	--rf-enter-glow: rgba(237, 28, 36, 0.4);
+	--rf-enter-sweep-glow: rgba(255, 106, 61, 0.85);
+	--rf-enter-bracket: #ff6a3d;
+	--rf-enter-bright: 1.7;
+}
+
+/* a pinned subtree also takes the theme's text colour and native control colours */
+.rf-theme-light {
+	color-scheme: light;
+	color: var(--rf-text);
+}
+
+.rf-theme-dark {
+	color-scheme: dark;
+	color: var(--rf-text);
+}
+
+.rf-num {
+	font-family: var(--rf-font-display);
+	font-style: italic;
+	font-weight: 900;
+}
+
+.rf-reset {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	padding: 5px 9px;
+	border-radius: 7px;
+	border: none;
+	background: transparent;
+	color: var(--rf-faint);
+	font-size: 12px;
+	font-weight: 600;
+	font-family: inherit;
+	cursor: pointer;
+}
+
+.rf-reset:hover {
+	color: var(--rf-text);
+	background: var(--rf-track);
+}
+
+.rf-reset:focus-visible,
+.rf-btn:focus-visible,
+.rf-link:focus-visible {
+	outline: 2px solid var(--rf-orange);
+	outline-offset: 2px;
+}
+
+.rf-link {
+	color: var(--rf-orange);
+}
+
+.rf-link:hover {
+	color: var(--rf-orange-hover);
+}
+
+@keyframes rfRecord {
+	0%,
+	100% {
+		filter: drop-shadow(0 0 2px var(--rf-glow-soft));
+	}
+
+	50% {
+		filter: drop-shadow(0 0 9px var(--rf-glow-core)) drop-shadow(0 0 18px var(--rf-glow-hot));
+	}
+}
+
+@keyframes rfRecordBar {
+	0%,
+	100% {
+		box-shadow: 0 0 14px var(--rf-glow-bar-rest);
+		filter: brightness(1);
+	}
+
+	50% {
+		box-shadow:
+			0 0 24px var(--rf-glow-bar-hot),
+			0 0 8px var(--rf-glow-bar-core);
+		filter: brightness(var(--rf-glow-bright));
+	}
+}
+
+/*
+ * The record glow (record-glow.svelte.ts): a new best of a speed figure glows for about five
+ * seconds. rf-record-bar on the figure's bar (the bar pulses), rf-record on a figure without a bar
+ * (its number).
+ */
+.rf-record {
+	animation: rfRecord 1.6s ease-in-out infinite;
+}
+
+.rf-record-bar {
+	animation: rfRecordBar 1.6s ease-in-out infinite;
+}
+
+/* no motion: a static highlight instead of the pulse */
+@media (prefers-reduced-motion: reduce) {
+	.rf-record {
+		animation: none;
+		filter: drop-shadow(0 0 6px var(--rf-glow-core)) drop-shadow(0 0 12px var(--rf-glow-hot));
+	}
+
+	.rf-record-bar {
+		animation: none;
+		box-shadow:
+			0 0 22px var(--rf-glow-bar-hot),
+			0 0 6px var(--rf-glow-bar-core);
+		filter: brightness(var(--rf-glow-bright));
+	}
+}
+
+/*
+ * The status page's entrance (entrance.ts), once per page view: each tile powers on, staggered by
+ * --rf-enter-delay (owner, 2026-11-03: "a little more futuristic"):
+ * - it is scanned in from top to bottom (clip-path) behind a glowing brand scanline, flickering on
+ *   like a hologram and settling from an overexposed glow (480 ms);
+ * - HUD corner brackets lock onto it: they close in, blink once and fade (700 ms, from 80 ms);
+ * - its border flashes red and settles as it locks in (440 ms, from 440 ms).
+ * The model header has no border: no brackets, no flash. Clip-path, transform, opacity and filter
+ * only, so nothing moves the layout. Keep the timings in step with entrance.ts.
+ */
+.rf-enter {
+	position: relative;
+	animation:
+		rfEnterScan 480ms cubic-bezier(0.55, 0, 0.25, 1) var(--rf-enter-delay, 0ms) backwards,
+		rfEnterPower 480ms linear var(--rf-enter-delay, 0ms) backwards,
+		rfEnterBorder 440ms ease-out calc(var(--rf-enter-delay, 0ms) + 440ms) backwards;
+}
+
+/* the scanline: rides the scan's edge, synced by the same timing */
+.rf-enter::after {
+	content: '';
+	position: absolute;
+	left: 0;
+	right: 0;
+	top: 0;
+	height: 2px;
+	margin-top: -2px;
+	background: var(--rf-enter-sweep);
+	box-shadow: 0 0 14px 2px var(--rf-enter-sweep-glow);
+	opacity: 0;
+	pointer-events: none;
+	animation: rfEnterScanline 480ms cubic-bezier(0.55, 0, 0.25, 1) var(--rf-enter-delay, 0ms) both;
+}
+
+/* the HUD corner brackets, just inside the tile's corners */
+.rf-enter::before {
+	--rf-b: var(--rf-enter-bracket);
+
+	content: '';
+	position: absolute;
+	inset: 6px;
+	background:
+		linear-gradient(var(--rf-b), var(--rf-b)) top left / 18px 2px,
+		linear-gradient(var(--rf-b), var(--rf-b)) top left / 2px 18px,
+		linear-gradient(var(--rf-b), var(--rf-b)) top right / 18px 2px,
+		linear-gradient(var(--rf-b), var(--rf-b)) top right / 2px 18px,
+		linear-gradient(var(--rf-b), var(--rf-b)) bottom left / 18px 2px,
+		linear-gradient(var(--rf-b), var(--rf-b)) bottom left / 2px 18px,
+		linear-gradient(var(--rf-b), var(--rf-b)) bottom right / 18px 2px,
+		linear-gradient(var(--rf-b), var(--rf-b)) bottom right / 2px 18px;
+	background-repeat: no-repeat;
+	filter: drop-shadow(0 0 4px var(--rf-enter-sweep-glow));
+	opacity: 0;
+	pointer-events: none;
+	animation: rfEnterLock 700ms cubic-bezier(0.2, 0.8, 0.2, 1)
+		calc(var(--rf-enter-delay, 0ms) + 80ms) both;
+}
+
+.rf-enter.rf-model {
+	animation:
+		rfEnterScan 480ms cubic-bezier(0.55, 0, 0.25, 1) var(--rf-enter-delay, 0ms) backwards,
+		rfEnterPower 480ms linear var(--rf-enter-delay, 0ms) backwards;
+}
+
+.rf-enter.rf-model::before {
+	content: none;
+}
+
+@keyframes rfEnterScan {
+	from {
+		clip-path: inset(0 0 100% 0);
+	}
+
+	to {
+		clip-path: inset(0 0 0 0);
+	}
+}
+
+/* the hologram flicker, a small rise and the overexposed glow settling */
+@keyframes rfEnterPower {
+	0% {
+		opacity: 0;
+		transform: translateY(8px);
+		filter: brightness(var(--rf-enter-bright)) saturate(1.3);
+	}
+
+	12% {
+		opacity: 0.85;
+	}
+
+	20% {
+		opacity: 0.3;
+	}
+
+	32% {
+		opacity: 1;
+	}
+
+	40% {
+		opacity: 0.55;
+	}
+
+	52% {
+		opacity: 1;
+		transform: none;
+	}
+
+	100% {
+		opacity: 1;
+		transform: none;
+		filter: none;
+	}
+}
+
+@keyframes rfEnterScanline {
+	0% {
+		top: 0;
+		opacity: 0;
+	}
+
+	8% {
+		opacity: 1;
+	}
+
+	85% {
+		opacity: 1;
+	}
+
+	100% {
+		top: 100%;
+		opacity: 0;
+	}
+}
+
+@keyframes rfEnterLock {
+	0% {
+		opacity: 0;
+		transform: scale(1.06);
+	}
+
+	35% {
+		opacity: 1;
+		transform: none;
+	}
+
+	50% {
+		opacity: 0.3;
+	}
+
+	62% {
+		opacity: 1;
+	}
+
+	100% {
+		opacity: 0;
+		transform: none;
+	}
+}
+
+@keyframes rfEnterBorder {
+	from {
+		border-color: var(--rf-enter-border);
+		box-shadow: 0 0 18px var(--rf-enter-glow);
+	}
+
+	to {
+		border-color: var(--rf-border);
+		box-shadow: 0 0 0 transparent;
+	}
+}
+
+/* no motion: a quick fade, no scan, flicker, brackets or scanline */
+@media (prefers-reduced-motion: reduce) {
+	.rf-enter,
+	.rf-enter.rf-model {
+		animation: rfEnterFade 200ms ease-out backwards;
+	}
+
+	.rf-enter::before,
+	.rf-enter::after {
+		content: none;
+	}
+}
+
+@keyframes rfEnterFade {
+	from {
+		opacity: 0;
+	}
+}

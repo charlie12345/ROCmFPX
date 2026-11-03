@@ -7,6 +7,7 @@
 		ModelLoadControl,
 		ModelRowActions
 	} from '$lib/components/app';
+	import RdnaRuntimeTag from '$lib/components/app/rdna/RdnaRuntimeTag.svelte';
 	import { SETTINGS_KEYS } from '$lib/constants';
 	import { ServerModelStatus } from '$lib/enums';
 	import { modelsStore, settingsStore } from '$lib/stores';
@@ -88,6 +89,8 @@
 		tags={option.tags}
 		title={option.model}
 	/>
+
+	<RdnaRuntimeTag model={option.model} />
 
 	{#if showCapabilities}
 		<ModelCapabilities {option} />

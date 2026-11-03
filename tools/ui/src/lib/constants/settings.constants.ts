@@ -62,7 +62,8 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 		icon: SlidersVertical,
 		settings: [
 			{
-				defaultValue: ColorMode.SYSTEM,
+				// RDNA-FAST: the brand theme is dark
+				defaultValue: ColorMode.DARK,
 				help: 'Choose the color theme for the interface. You can choose between System (follows your device settings), Light, or Dark.',
 				key: SETTINGS_KEYS.THEME,
 				label: 'Theme',
@@ -133,7 +134,8 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				type: SettingsFieldType.CHECKBOX
 			},
 			{
-				defaultValue: false,
+				// RDNA-FAST: on by default, the status page and model picker show Hugging Face avatars and repos
+				defaultValue: true,
 				help: 'Fetch model display data (avatars, context length, chat template) and everything in the Discover Models view from the Hugging Face Hub API. Locked on while Discover Models is enabled; can be turned on alone for just the display data.',
 				key: SETTINGS_KEYS.USE_HUGGING_FACE_HUB,
 				label: 'Use the Hugging Face Hub API',
@@ -262,7 +264,8 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				type: SettingsFieldType.CHECKBOX
 			},
 			{
-				defaultValue: false,
+				// RDNA-FAST: the sidebar (wordmark, live server status) stays open on desktop
+				defaultValue: true,
 				help: 'Always keep the sidebar visible on desktop instead of auto-hiding it.',
 				key: SETTINGS_KEYS.ALWAYS_SHOW_SIDEBAR_ON_DESKTOP,
 				label: 'Always show sidebar on desktop',

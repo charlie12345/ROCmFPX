@@ -79,10 +79,12 @@
 			}, 0)
 		);
 
-		// Expand sidebar first, then click Search in the expanded button list
-		const logoTrigger = screen.getByRole('button', { name: /expand navigation/i });
+		// Expand sidebar first (RDNA-FAST keeps it open on desktop by default), then click Search
+		// in the expanded button list
+		const logoTrigger = screen.queryByRole('button', { name: /expand navigation/i });
 
-		await userEvent.click(logoTrigger);
+		if (logoTrigger) await userEvent.click(logoTrigger);
+
 		const searchTrigger = screen.getByText('Search');
 
 		userEvent.click(searchTrigger);

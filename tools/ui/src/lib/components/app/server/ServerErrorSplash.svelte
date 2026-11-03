@@ -79,8 +79,10 @@
 				apiKeyState = 'success';
 
 				// Show success state briefly, then navigate to home
+				// [RDNA-FAST] or let the page go on (the status page stays where it is)
 				setTimeout(() => {
-					goto(ROUTES.START);
+					if (onRetry) onRetry();
+					else goto(ROUTES.START);
 				}, 1000);
 			} else {
 				// API key is invalid - User Story A
