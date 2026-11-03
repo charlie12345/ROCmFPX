@@ -1957,8 +1957,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
 
+    // upstream #30141: a checkpoint / disk-cache entry carries the MTP head's pending hidden row, so the first draft
+    // after a restore starts from the real hidden state instead of a zero row
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        data.resize(row_bytes);
+        std::memcpy(data.data(), pending_h[seq_id].data(), row_bytes);
+        return true;
+    }
+
+    // the sequence was restored: the per-pass bookkeeping is stale either way; the hidden row comes from the saved
+    // state when it has one of the right size (entries saved before this carry none: zero row, as before)
     void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || !data.empty()) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
 
@@ -1966,12 +1981,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (candidate_vocabulary) {
             candidate_vocabulary->reset(seq_id);
         }
-        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
         verify_h[seq_id].clear();
         verify_h_rows[seq_id] = 0;
         i_last[seq_id] = -1;
         if (chain_heads) {
             chain_h[seq_id].clear();
+        }
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (data.size() == row_bytes && pending_h[seq_id].size() * sizeof(float) >= row_bytes) {
+            std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
+        } else {
+            std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
         }
     }
 };
