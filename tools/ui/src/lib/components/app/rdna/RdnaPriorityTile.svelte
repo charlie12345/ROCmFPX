@@ -1,5 +1,5 @@
 <script lang="ts">
-	/** Priority tile: requests per priority and their average time to the first token, waiting included. */
+	/** Priority tile: requests per priority and their average time to the first token (waiting included). */
 	import RdnaPill from './RdnaPill.svelte';
 	import RdnaTile from './RdnaTile.svelte';
 	import { PRIORITIES } from '$lib/rdna/constants';
@@ -37,7 +37,7 @@
 	label="Request priority"
 	{onReset}
 	resetLabel="Reset priority figures"
-	sub="requests and average time to first token, waiting included"
+	sub="requests and average time to first token"
 	title="PRIORITY"
 >
 	<div class="rf-prio-grid rf-prio-head">

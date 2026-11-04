@@ -63,7 +63,7 @@
 		label="SSD prompt cache"
 		{onReset}
 		resetLabel="Reset SSD cache figures"
-		sub="conversations kept on disk · since {since}"
+		sub="since {since}"
 		title="SSD CACHE"
 	>
 		<div class="rf-cache-big">
