@@ -184,36 +184,13 @@
 			autoScroll.enable();
 		}
 
+		// [RDNA-FAST] go to the bottom, where the answer starts, on every device and whatever the auto-scroll
+		// setting. Vanilla placed the user's message near the top (above the input on mobile), which left a long
+		// prompt on its first lines.
 		setTimeout(() => {
 			const container = scroll.chatScrollContainer;
 
-			if (!container) return;
-
-			const lastUserBubble = container.querySelector(
-				'.chat-message:nth-last-child(2) .chat-message-user .chat-message-user-bubble'
-			) as HTMLElement | null;
-
-			if (deviceStore.isMobile) {
-				// Keep the last user message bubble just above the input on mobile
-				const bubbleHeight = lastUserBubble?.scrollHeight ?? 0;
-				const baseHeight = container.scrollHeight - innerHeight;
-
-				container.scrollTo({
-					behavior: 'smooth',
-					top: bubbleHeight > 0 ? baseHeight - bubbleHeight : baseHeight
-				});
-			} else if (lastUserBubble) {
-				// On desktop, place the last user message near the top of the viewport
-				const topPadding = 24;
-				const bubbleRect = lastUserBubble.getBoundingClientRect();
-
-				container.scrollTo({
-					behavior: 'smooth',
-					top: Math.max(0, container.scrollTop + bubbleRect.top - topPadding)
-				});
-			} else {
-				autoScroll.scrollToBottom();
-			}
+			if (container) container.scrollTop = container.scrollHeight;
 		}, 100);
 
 		if (deviceStore.isMobile) {
