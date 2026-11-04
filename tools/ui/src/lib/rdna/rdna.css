@@ -325,6 +325,11 @@
 	content: none;
 }
 
+/* the new chat page's input box (entrance.ts): rounded, so the brackets sit clear of its curve */
+.rf-enter[data-slot='input-area']::before {
+	inset: 12px;
+}
+
 @keyframes rfEnterScan {
 	from {
 		clip-path: inset(0 0 100% 0);
@@ -416,15 +421,11 @@
 	}
 }
 
+/* no `to`: it settles on the element's own border and shadow (a tile's, the chat input box's) */
 @keyframes rfEnterBorder {
 	from {
 		border-color: var(--rf-enter-border);
 		box-shadow: 0 0 18px var(--rf-enter-glow);
-	}
-
-	to {
-		border-color: var(--rf-border);
-		box-shadow: 0 0 0 transparent;
 	}
 }
 

@@ -26,6 +26,7 @@
 		settingsStore
 	} from '$lib/stores';
 	import { parseFilesToMessageExtras } from '$lib/utils/browser-only';
+	import { ENTRANCE_CHAT_INPUT, playEntrance } from '$lib/rdna/entrance';
 	import { onDestroy, onMount, tick } from 'svelte';
 
 	let { showCenteredEmpty = false } = $props();
@@ -248,7 +249,20 @@
 		handleMobileScroll();
 	});
 
-	onDestroy(() => autoScroll.destroy());
+	// [RDNA-FAST] the new chat page's input box powers on like the status page's tiles, once each
+	// time the page opens (rdna/entrance.ts)
+	let endInputEntrance: (() => void) | null = null;
+
+	$effect(() => {
+		if (endInputEntrance || !isEmpty || isServerLoading) return;
+
+		endInputEntrance = playEntrance(document.body, ENTRANCE_CHAT_INPUT);
+	});
+
+	onDestroy(() => {
+		autoScroll.destroy();
+		endInputEntrance?.();
+	});
 </script>
 
 {#if dragAndDrop.isDragOver}

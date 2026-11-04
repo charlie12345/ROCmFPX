@@ -4,11 +4,16 @@
  * by row, left to right): scanned in from the top behind a glowing scanline with a hologram
  * flicker, HUD corner brackets locking on, then a red border flash as it settles. The motion is CSS
  * (`rf-enter` in rdna.css); this file only orders the tiles, sets each one's delay and takes the
- * class off again when the last one is done. Polling and data are never held up by it.
+ * class off again when the last one is done. Polling and data are never held up by it. The new
+ * chat page plays the same entrance on its prompt input box, once each time the page opens (owner,
+ * 2026-11-04).
  */
 
 /** The status page's tiles (the model header, Speed, Slots, every RdnaTile, the request lists). */
 export const ENTRANCE_TILES = '.rf-model, .rf-speed, .rf-slots, .rf-tile, .rf-req, .rf-cls-req';
+
+/** The chat page's prompt input box. */
+export const ENTRANCE_CHAT_INPUT = 'form.conversation-chat-form [data-slot="input-area"]';
 
 /** Keep these in step with `.rf-enter` in rdna.css. */
 export const ENTER_STAGGER_MS = 70;
