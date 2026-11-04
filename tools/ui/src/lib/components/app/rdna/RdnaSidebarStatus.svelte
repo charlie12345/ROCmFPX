@@ -1,22 +1,36 @@
 <script lang="ts">
 	/**
-	 * Chat sidebar: a live server-status card (busy slots, decode t/s now; its bar against the model's
-	 * decode peak from the status page, the peak itself not shown, owner 2026-11-03) linking to the
-	 * status page, and "RDNA-FAST on GitHub". It polls
-	 * /slots of the chat's model once a second while it is shown, and only when that model is loaded.
+	 * Chat sidebar: a live server-status card linking to the status page, and "RDNA-FAST on GitHub".
+	 * The card (owner, 2026-11-04): busy slots, then prefill t/s now (big red, left) and decode t/s now
+	 * (right), and one bar for whatever runs, against the peaks the status page recorded: decode
+	 * alone against the decode peak without fast text copies, prefill alone against the prefill peak,
+	 * both together against the two peaks added up. A decode reading above that decode peak (a text
+	 * copy) makes the bar glow for a few seconds, like the status page's records. It polls /slots of
+	 * the chat's model once a second while it is shown, and only when that model is loaded.
 	 */
 	import '$lib/rdna/rdna.css';
 	import { modelQuery, rdnaGet } from '$lib/rdna/api';
-	import { POLL_SLOTS_MS, RDNA_GITHUB_URL, RDNA_ROUTE_STATUS } from '$lib/rdna/constants';
+	import {
+		POLL_SLOTS_MS,
+		RDNA_GITHUB_URL,
+		RDNA_ROUTE_STATUS,
+		RECORD_PULSE_MS
+	} from '$lib/rdna/constants';
 	import { fmtRate } from '$lib/rdna/format';
 	import { LiveRates, type SlotLive } from '$lib/rdna/live';
-	import { loadCopyBoost, loadPeaks } from '$lib/rdna/storage';
-	import type { RdnaSlot } from '$lib/rdna/types';
+	import { loadPeaks } from '$lib/rdna/storage';
+	import type { PeakMap, RdnaSlot } from '$lib/rdna/types';
 	import { modelsStore, serverStore } from '$lib/stores';
 	import { onDestroy, onMount } from 'svelte';
 
 	let live = $state.raw<SlotLive[]>([]);
 	let reachable = $state(true);
+	let peaks = $state.raw<{ decode: number | null; prefill: number | null }>({
+		decode: null,
+		prefill: null
+	});
+	let glowUntil = $state(0);
+	let now = $state(Date.now());
 	let timer: ReturnType<typeof setTimeout> | null = null;
 	let alive = false;
 	const rates = new LiveRates();
@@ -32,23 +46,36 @@
 
 		return modelsStore.routerModels.find((m) => m.status?.value === 'loaded')?.id ?? null;
 	});
-	let peak = $derived.by(() => {
-		if (!modelId) return null;
+	let busy = $derived(live.filter((l) => l.phase !== 'idle').length);
+	let prefillNow = $derived(sumOf(live.map((l) => l.prefillTps)));
+	let decodeNow = $derived(sumOf(live.map((l) => l.decodeTps)));
+	let pct = $derived.by(() => {
+		const parts: [number | null, number | null][] = [
+			[prefillNow, peaks.prefill],
+			[decodeNow, peaks.decode]
+		];
+		const running = parts.filter(([v]) => v !== null);
 
-		const peaks = loadPeaks(modelId);
-		// the set the Decode tile shows: with fast text copies only when its toggle is on
-		const set = loadCopyBoost(modelId) ? peaks.decode : peaks.decodeNoCopy;
+		if (running.length === 0 || running.some(([, p]) => !p)) return 0;
+
+		const v = running.reduce((a, [x]) => a + (x ?? 0), 0);
+		const p = running.reduce((a, [, x]) => a + (x ?? 0), 0);
+
+		return Math.min(100, (100 * v) / p);
+	});
+	let glowing = $derived(now < glowUntil);
+
+	function sumOf(values: (number | null)[]): number | null {
+		const v = values.filter((x): x is number => x !== null);
+
+		return v.length > 0 ? v.reduce((a, b) => a + b, 0) : null;
+	}
+
+	function peakOf(set: PeakMap): number | null {
 		const p = Object.values(set).map((x) => x.v);
 
 		return p.length > 0 ? Math.max(...p) : null;
-	});
-	let busy = $derived(live.filter((l) => l.phase !== 'idle').length);
-	let decodeNow = $derived.by(() => {
-		const v = live.map((l) => l.decodeTps).filter((x): x is number => x !== null);
-
-		return v.length > 0 ? v.reduce((a, b) => a + b, 0) : null;
-	});
-	let pct = $derived(decodeNow !== null && peak ? Math.min(100, (100 * decodeNow) / peak) : 0);
+	}
 
 	async function poll(): Promise<void> {
 		timer = null;
@@ -60,6 +87,7 @@
 		if (id !== lastModel) {
 			rates.reset();
 			live = [];
+			glowUntil = 0;
 			lastModel = id;
 		}
 
@@ -69,9 +97,20 @@
 			reachable = res.status !== 0;
 
 			if (res.ok && Array.isArray(res.data) && id === modelId) {
-				live = rates.update(res.data, Date.now());
+				const t = Date.now();
+				// the status page may have recorded new peaks since the last poll
+				const stored = loadPeaks(id);
+
+				live = rates.update(res.data, t);
+				peaks = { decode: peakOf(stored.decodeNoCopy), prefill: peakOf(stored.prefill) };
+
+				if (decodeNow !== null && peaks.decode && decodeNow > peaks.decode) {
+					glowUntil = t + RECORD_PULSE_MS;
+				}
 			}
 		}
+
+		now = Date.now();
 
 		if (alive) timer = setTimeout(poll, POLL_SLOTS_MS);
 	}
@@ -111,14 +150,24 @@
 			</span>
 		</span>
 
-		<span class:rf-side-none={decodeNow === null} class="rf-side-num rf-num"
-			>{decodeNow !== null ? fmtRate(decodeNow, 1) : '–'}<span class="rf-side-unit"
-				>&nbsp;t/s now</span
-			></span
-		>
+		<span class="rf-side-row rf-side-figures">
+			<span class="rf-side-figure">
+				<span class:rf-side-none={prefillNow === null} class="rf-side-num rf-num"
+					>{prefillNow !== null ? fmtRate(prefillNow, 0) : '–'}</span
+				>
+				<span class="rf-side-unit">prefill t/s</span>
+			</span>
+
+			<span class="rf-side-figure">
+				<span class="rf-side-unit">decode t/s</span>
+				<span class:rf-side-none={decodeNow === null} class="rf-side-num rf-num"
+					>{decodeNow !== null ? fmtRate(decodeNow, 1) : '–'}</span
+				>
+			</span>
+		</span>
 
 		<span aria-hidden="true" class="rf-side-track"
-			><span class="rf-side-fill" style="width: {pct}%;"></span></span
+			><span class:rf-record-bar={glowing} class="rf-side-fill" style="width: {pct}%;"></span></span
 		>
 	</a>
 
@@ -196,8 +245,20 @@
 		border-radius: 50%;
 	}
 
+	/* prefill on the left, decode on the right, each number with its unit on the inner side */
+	.rf-side-figures {
+		align-items: baseline;
+	}
+
+	.rf-side-figure {
+		display: inline-flex;
+		align-items: baseline;
+		gap: 5px;
+		white-space: nowrap;
+	}
+
 	.rf-side-num {
-		font-size: 26px;
+		font-size: 24px;
 		color: var(--rf-red);
 		line-height: 1;
 	}
@@ -209,7 +270,7 @@
 	.rf-side-unit {
 		font-family: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
 		font-style: normal;
-		font-size: 13px;
+		font-size: 11px;
 		font-weight: 600;
 		color: var(--rf-text-dim);
 	}
