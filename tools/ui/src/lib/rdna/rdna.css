@@ -266,9 +266,16 @@
  * - its border flashes red and settles as it locks in (440 ms, from 440 ms).
  * The model header has no border: no brackets, no flash. Clip-path, transform, opacity and filter
  * only, so nothing moves the layout. Keep the timings in step with entrance.ts.
+ * The Models, MCP and Settings dialogs (.rf-dialog-brand, app.css) play it each time they open
+ * (owner, 2026-11-04), by CSS alone. They are fixed and centred by `translate`, so they keep their
+ * own position and the entrance's transform adds to the centring.
  */
 .rf-enter {
 	position: relative;
+}
+
+.rf-enter,
+.rf-dialog-brand[data-state='open'] {
 	animation:
 		rfEnterScan 480ms cubic-bezier(0.55, 0, 0.25, 1) var(--rf-enter-delay, 0ms) backwards,
 		rfEnterPower 480ms linear var(--rf-enter-delay, 0ms) backwards,
@@ -276,7 +283,8 @@
 }
 
 /* the scanline: rides the scan's edge, synced by the same timing */
-.rf-enter::after {
+.rf-enter::after,
+.rf-dialog-brand[data-state='open']::after {
 	content: '';
 	position: absolute;
 	left: 0;
@@ -292,7 +300,8 @@
 }
 
 /* the HUD corner brackets, just inside the tile's corners */
-.rf-enter::before {
+.rf-enter::before,
+.rf-dialog-brand[data-state='open']::before {
 	--rf-b: var(--rf-enter-bracket);
 
 	content: '';
@@ -432,12 +441,15 @@
 /* no motion: a quick fade, no scan, flicker, brackets or scanline */
 @media (prefers-reduced-motion: reduce) {
 	.rf-enter,
-	.rf-enter.rf-model {
+	.rf-enter.rf-model,
+	.rf-dialog-brand[data-state='open'] {
 		animation: rfEnterFade 200ms ease-out backwards;
 	}
 
 	.rf-enter::before,
-	.rf-enter::after {
+	.rf-enter::after,
+	.rf-dialog-brand[data-state='open']::before,
+	.rf-dialog-brand[data-state='open']::after {
 		content: none;
 	}
 }
