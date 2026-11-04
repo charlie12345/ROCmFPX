@@ -255,11 +255,14 @@
 	display: none !important;
 }
 
-/* RDNA-FAST: the brand line along the top of the Models, MCP and Settings dialogs (as on the speed card) */
+/* RDNA-FAST: the brand line along the top of the Models, MCP and Settings dialogs (as on the speed card),
+   from the outer edge: the top border is transparent, so no line of it shows above the red */
 .rf-dialog-brand {
 	background-image: linear-gradient(90deg, #ed1c24, #ff6a3d);
 	background-size: 100% 3px;
 	background-repeat: no-repeat;
+	background-origin: border-box;
+	border-top-color: transparent;
 }
 
 /* RDNA-FAST: the chat's "Hello there" in the brand's display font (Exo 2 heavy italic, rdna/fonts.ts) */
