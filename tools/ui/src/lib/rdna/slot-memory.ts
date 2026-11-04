@@ -51,7 +51,10 @@ export function updateSlotMemory(
 		const cur = out[s.id];
 
 		if (l.phase === 'idle') {
-			if (cur && cur.endedAt === null) out[s.id] = { ...cur, endedAt: t };
+			// a newer request ran on the slot between two polls (or while the page was hidden, or
+			// the model was loaded again): the remembered one is not the slot's latest, drop it
+			if (cur && cur.task !== s.id_task) delete out[s.id];
+			else if (cur && cur.endedAt === null) out[s.id] = { ...cur, endedAt: t };
 
 			return;
 		}

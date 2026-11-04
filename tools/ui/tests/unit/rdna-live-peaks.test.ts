@@ -464,6 +464,22 @@ describe('slots keep their finished request', () => {
 		expect(next[1]).toMatchObject({ endedAt: null, lastRate: 950, priority: 'low', task: 10 });
 	});
 
+	it('drops the reading when a newer request ran on the slot unseen', () => {
+		let m = updateSlotMemory(
+			{},
+			[slot(9, true)],
+			[live({ decoded: 120, decodeTps: 88.1, phase: 'decode' })],
+			1000
+		);
+
+		m = updateSlotMemory(m, [slot(9, false)], [live({ phase: 'idle' })], 2000);
+		expect(slotLastRateText(m[1])).toBe('88.1 t/s');
+
+		// task 12 started and finished between two polls: the slot reports idle with it
+		m = updateSlotMemory(m, [slot(12, false)], [live({ phase: 'idle', task: 12 })], 3000);
+		expect(m[1]).toBeUndefined();
+	});
+
 	it('keeps the last prefill reading for a request that generated nothing', () => {
 		let m = updateSlotMemory({}, [slot(9, true)], [live({ prefillTps: 940 })], 1000);
 

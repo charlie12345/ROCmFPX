@@ -5,7 +5,8 @@
 	 * and the memory of the model's devices. Each slot is a title row, a detail line and the context
 	 * bar: a running request's activity on the detail line, an idle slot's context size instead. A
 	 * finished request stays on its slot (priority, context, its last t/s reading) until the next
-	 * one starts; only the dot turns grey. The tile is narrow next to the speed card, so lines wrap
+	 * one starts; only the dot turns grey. A newer request that came and went between two polls
+	 * clears it (no reading of its own). The tile is narrow next to the speed card, so lines wrap
 	 * between words only: a number stays with its unit (a no-break space). The memory line has the
 	 * device name on the left and "used/total GB" on the right; when both do not fit, the figure
 	 * moves whole to the next line, still on the right. While the model loads, its slots show their
