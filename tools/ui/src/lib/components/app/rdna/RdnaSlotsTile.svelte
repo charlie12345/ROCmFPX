@@ -4,9 +4,9 @@
 	 * "Slot N", its priority, what it does, the live rate and its context; then the shared KV pool
 	 * and the memory of the model's devices. Each slot is a title row, a detail line and the context
 	 * bar: a running request's activity on the detail line, an idle slot's context size instead. A
-	 * finished request stays on its slot (priority, context, its last t/s reading) until the next
-	 * one starts; only the dot turns grey. A newer request that came and went between two polls
-	 * clears it (no reading of its own). The tile is narrow next to the speed card, so lines wrap
+	 * finished request stays on its slot (priority, context) until the next one starts; the dot
+	 * turns grey and an idle slot shows no rate. A newer request that came and went between two
+	 * polls clears it. The tile is narrow next to the speed card, so lines wrap
 	 * between words only: a number stays with its unit (a no-break space). The memory line has the
 	 * device name on the left and "used/total GB" on the right; when both do not fit, the figure
 	 * moves whole to the next line, still on the right. While the model loads, its slots show their
@@ -17,7 +17,7 @@
 	import { fmtClock, fmtCtx, fmtInt, fmtRate, fmtTokens } from '$lib/rdna/format';
 	import type { MemorySummary } from '$lib/rdna/hardware';
 	import type { SlotLive, SlotPhase } from '$lib/rdna/live';
-	import { slotLastRateText, type SlotMemory } from '$lib/rdna/slot-memory';
+	import type { SlotMemory } from '$lib/rdna/slot-memory';
 	import type { RdnaSlot } from '$lib/rdna/types';
 
 	interface Props {
@@ -65,7 +65,7 @@
 				ctx: last.ctx,
 				detail: `${fmtInt(last.ctx)}\u00a0tokens in context`,
 				priority: last.priority,
-				rate: slotLastRateText(last),
+				rate: '–',
 				state: { color: 'var(--rf-grey-bar)', text: `Idle · finished ${fmtClock(last.endedAt)}` }
 			};
 		}

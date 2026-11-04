@@ -5,7 +5,7 @@ import { depthBuckets } from '$lib/rdna/depth';
 import { peakCandidates } from '$lib/rdna/history';
 import type { SlotLive } from '$lib/rdna/live';
 import { isBetter, RecordBook, RecordGlow } from '$lib/rdna/record-glow.svelte';
-import { slotLastRateText, updateSlotMemory } from '$lib/rdna/slot-memory';
+import { updateSlotMemory } from '$lib/rdna/slot-memory';
 import { StatusStore } from '$lib/rdna/status-store.svelte';
 import { loadCopyBoost } from '$lib/rdna/storage';
 import type { CompletionRecord, RdnaSlot } from '$lib/rdna/types';
@@ -413,7 +413,7 @@ describe('slots keep their finished request', () => {
 		...over
 	});
 
-	it('keeps the last reading, the pill and the context after the request', () => {
+	it('keeps the pill and the context after the request', () => {
 		let m = updateSlotMemory({}, [slot(9, true)], [live({})], 1000);
 
 		m = updateSlotMemory(
@@ -445,8 +445,6 @@ describe('slots keep their finished request', () => {
 			phase: 'decode',
 			priority: 'xhigh'
 		});
-		// the last reading it showed, not the fastest one, and no "peak" label
-		expect(slotLastRateText(m[1])).toBe('80.2 t/s');
 
 		// still idle: nothing changes
 		expect(updateSlotMemory(m, [slot(9, false)], [live({ phase: 'idle' })], 6000)[1].endedAt).toBe(
@@ -461,10 +459,10 @@ describe('slots keep their finished request', () => {
 			7000
 		);
 
-		expect(next[1]).toMatchObject({ endedAt: null, lastRate: 950, priority: 'low', task: 10 });
+		expect(next[1]).toMatchObject({ endedAt: null, priority: 'low', task: 10 });
 	});
 
-	it('drops the reading when a newer request ran on the slot unseen', () => {
+	it('forgets the request when a newer one ran on the slot unseen', () => {
 		let m = updateSlotMemory(
 			{},
 			[slot(9, true)],
@@ -473,19 +471,11 @@ describe('slots keep their finished request', () => {
 		);
 
 		m = updateSlotMemory(m, [slot(9, false)], [live({ phase: 'idle' })], 2000);
-		expect(slotLastRateText(m[1])).toBe('88.1 t/s');
+		expect(m[1]).toMatchObject({ endedAt: 2000, task: 9 });
 
 		// task 12 started and finished between two polls: the slot reports idle with it
 		m = updateSlotMemory(m, [slot(12, false)], [live({ phase: 'idle', task: 12 })], 3000);
 		expect(m[1]).toBeUndefined();
-	});
-
-	it('keeps the last prefill reading for a request that generated nothing', () => {
-		let m = updateSlotMemory({}, [slot(9, true)], [live({ prefillTps: 940 })], 1000);
-
-		m = updateSlotMemory(m, [slot(9, true)], [live({ prefillTps: 1012.4 })], 2000);
-		m = updateSlotMemory(m, [slot(9, false)], [live({ phase: 'idle' })], 3000);
-		expect(slotLastRateText(m[1])).toBe('1012 t/s');
 	});
 });
 

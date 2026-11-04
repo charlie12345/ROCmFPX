@@ -359,7 +359,7 @@ describe('SSD cache tile', () => {
 describe('slots tile', () => {
 	const base = { hardware: null, loaded: true, memory: null, pool: null, status: 'loaded' };
 
-	it('keeps a finished request on its slot with its last reading, only the dot turns grey', async () => {
+	it('keeps a finished request on its slot without a rate, the dot turns grey', async () => {
 		const endedAt = new Date(2026, 10, 3, 12, 3, 41).getTime();
 		const { container } = await render(RdnaSlotsTile, {
 			...base,
@@ -369,8 +369,6 @@ describe('slots tile', () => {
 					ctx: 23441,
 					decoded: 412,
 					endedAt,
-					lastRate: 61.8,
-					lastRateKind: 'decode',
 					phase: 'decode',
 					priority: 'xhigh',
 					processed: 6397,
@@ -396,7 +394,7 @@ describe('slots tile', () => {
 		expect(dot.title).toBe('Idle · finished 12:03:41');
 		expect(dot.style.background).toContain('--rf-grey-bar');
 		expect(container.querySelector('.rf-pill')?.textContent).toBe('xhigh');
-		expect(container.querySelector('.rf-slot-rate')?.textContent).toBe('61.8 t/s');
+		expect(container.querySelector('.rf-slot-rate')?.textContent).toBe('–');
 		// idle: the detail line shows the context (the number stays with its unit); no separate
 		// token line under the bar
 		expect(container.querySelector('.rf-slot-line span')?.textContent).toBe(
