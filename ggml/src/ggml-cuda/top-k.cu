@@ -121,8 +121,12 @@ static __global__ void top_k_nary_search_cuda(
             constexpr int radix_size = 1 << radix_bits;
             int shift = 32 - radix_bits;
             uint32_t mask = ((1U << radix_bits) - 1) << shift;
-            uint32_t range_min = 0;
-            uint32_t range_max = 0xff800000U;
+            // ROCmFPX [TAG_TOPK_INF_RANGE]: the key range is 64-bit and starts at the whole 32-bit key space. With a 32-bit
+            // range_max of 0xff800000 (the ordered key of +inf) every +inf (and NaN) fell outside the range, and once the
+            // top bucket was chosen range_min + ((bucket + 1) << shift) wrapped to 0: rows like log-probabilities with a
+            // few +inf and masked -inf returned wrong indices (test-backend-ops TOP_K inf=1, ROCm 10.1, 2026-11-05)
+            uint64_t range_min = 0;
+            uint64_t range_max = 1ULL << 32;
             uint32_t total = 0;
 
             while (mask != 0) {
@@ -171,8 +175,8 @@ static __global__ void top_k_nary_search_cuda(
 
                 const uint32_t bucket = selected_bucket;
                 total = selected_total;
-                range_max = range_min + ((bucket + 1) << shift);
-                range_min = range_min + (bucket << shift);
+                range_max = range_min + ((uint64_t) (bucket + 1) << shift);
+                range_min = range_min + ((uint64_t) bucket << shift);
                 if (total == (uint32_t) limit) {
                     break;
                 }
@@ -972,10 +976,6 @@ static bool top_k_use_small_kernel(int ncols, int nrows, int k) {
         return true;
     }
 #if HIP_VERSION >= 71500000
-    if (ncols <= 1024) {
-        return true;
-    }
-    const uint64_t elements = (uint64_t) ncols * nrows;
     // ROCmFPX [TAG_TOPK_SMALL_RDNA]: measured against the radix select / bitonic paths on an RX 7900 XT with ROCm 10.1
     // (2026-11-05), the small kernel wins 118 of the 141 shapes it takes (up to 17x on single long rows) but loses two:
     // thousands of 2-column rows (8192 x 2, k = 2: 11.6 vs 3.6 us with the bitonic sort) and one very long row with a
@@ -983,16 +983,20 @@ static bool top_k_use_small_kernel(int ncols, int nrows, int k) {
     if (ncols <= 2 && nrows > 16) {
         return false;
     }
+    if (ncols <= 1024) {
+        return true;
+    }
+    const uint64_t elements = (uint64_t) ncols * nrows;
     if (k <= 32) {
         return elements <= (1U << 20);
+    }
+    if (k >= 1024 && ncols > (1 << 16)) {
+        return false;
     }
     return nrows == 1 && ncols <= (1U << 17);
 #else
     GGML_UNUSED(ncols);
     GGML_UNUSED(nrows);
-    if (k >= 1024 && ncols > (1 << 16)) {
-        return false;
-    }
     return false;
 #endif
 }
