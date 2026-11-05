@@ -12890,6 +12890,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
         }
     }
+    // ROCmFPX: the MMQ "fallback" kernels (weight rows not a multiple of the 64-row tile: 17400 rows) of the types whose
+    // 16- / 32-column tiles spill under clang 24 at occupancy 2, and Q2_K's wider tiles (2026-11-05)
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_MXFP4, GGML_TYPE_Q2_K, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_XXS}) {
+        for (int64_t n : {16, 32}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17400, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+    for (int64_t n : {16, 32, 48, 64, 80, 128}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+    }
 
     // ROCmFPX: decode-sized attention at depth: 1 and 4 queries (a draft step, a verify batch) over 16k and 41k cells,
     // head 256, 4 KV heads with GQA 6, the production q4_0 KV cache against f16
