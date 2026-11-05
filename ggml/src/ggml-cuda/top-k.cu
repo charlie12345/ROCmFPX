@@ -976,6 +976,13 @@ static bool top_k_use_small_kernel(int ncols, int nrows, int k) {
         return true;
     }
     const uint64_t elements = (uint64_t) ncols * nrows;
+    // ROCmFPX [TAG_TOPK_SMALL_RDNA]: measured against the radix select / bitonic paths on an RX 7900 XT with ROCm 10.1
+    // (2026-11-05), the small kernel wins 118 of the 141 shapes it takes (up to 17x on single long rows) but loses two:
+    // thousands of 2-column rows (8192 x 2, k = 2: 11.6 vs 3.6 us with the bitonic sort) and one very long row with a
+    // very large k (131072 columns, k = 2048: 212 vs 146 us; 32768 / 8192 columns at k = 2048 still win).
+    if (ncols <= 2 && nrows > 16) {
+        return false;
+    }
     if (k <= 32) {
         return elements <= (1U << 20);
     }
@@ -983,6 +990,9 @@ static bool top_k_use_small_kernel(int ncols, int nrows, int k) {
 #else
     GGML_UNUSED(ncols);
     GGML_UNUSED(nrows);
+    if (k >= 1024 && ncols > (1 << 16)) {
+        return false;
+    }
     return false;
 #endif
 }
