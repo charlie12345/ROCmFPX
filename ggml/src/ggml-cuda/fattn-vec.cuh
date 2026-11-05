@@ -105,8 +105,17 @@ static __global__ void flash_attn_ext_vec(
     constexpr int nthreads_KQ_q = type_K_rocmfp4 ? GGML_ROCMFP4_FATTN_KQ_NTHREADS :
                                   type_K_rocmfpx ? GGML_ROCMFPX_FATTN_KQ_NTHREADS :
                                   nthreads_KQ_q_default;
+    // ROCmFPX [TAG_FATTN_VEC_LDS_FIT]: without v_dot2_f32_f16 (RDNA1 gfx1010) KQ below is float, and 2 threads per V row
+    // at D = 256 make its combine part 4 warps x 16 columns x 256 x 4 B = 64 KiB: past the 64 KiB LDS limit with the rest,
+    // so the ROCmFP4 instances did not compile for gfx1010 (65792 / 66048 B). 4 threads per row (as at D = 128) halve it.
+#ifdef V_DOT2_F32_F16_AVAILABLE
+    constexpr bool KQ_is_half = true;
+#else
+    constexpr bool KQ_is_half = false;
+#endif // V_DOT2_F32_F16_AVAILABLE
     constexpr int nthreads_V_q_rocmfp4 =
         type_V == GGML_TYPE_Q4_0_ROCMFP4 && D == 128 ? GGML_ROCMFP4_FATTN_V_NTHREADS_D128_DUAL :
+        !KQ_is_half && D == 256 ? 4 :
         GGML_ROCMFP4_FATTN_V_NTHREADS;
     constexpr int nthreads_V_q  = type_V_rocmfp4 ? nthreads_V_q_rocmfp4 : (D/4 < 32 ? D/4 : 32);
     constexpr int V_rows_per_thread_q = type_V_rocmfp4 ? GGML_ROCMFP4_FATTN_V_ROWS_PER_THREAD : 4;
