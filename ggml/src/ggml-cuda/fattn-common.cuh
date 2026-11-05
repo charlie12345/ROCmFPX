@@ -529,16 +529,13 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
     }
 
     float amax = fabsf(vals[0]);
-    float sum  = vals[0];
 #pragma unroll
     for (int l = 1; l < int(sizeof(int)); ++l) {
         amax = fmaxf(amax, fabsf(vals[l]));
-        sum += vals[l];
     }
 #pragma unroll
     for (int mask = QI8_1/2; mask > 0; mask >>= 1) {
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, 32));
-        sum +=             __shfl_xor_sync(0xFFFFFFFF, sum,  mask, 32);
     }
 
     const float d = amax / 127;
@@ -551,6 +548,20 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
             q8[l] = roundf(vals[l] / d);
         }
     }
+
+    // [TAG_FA_Q8_1_SUM] the block sum the q4_0 / q4_1 / q5_0 / q5_1 K dot products correct with is d * sum(q),
+    // the quantized values the integer dot product saw, as the CPU reference has it (the same fix as upstream
+    // #31247 for the MMQ / MMVQ quantizer): the rounding error of Q then meets the centred K value (q - 8), not q
+    int sumq = 0;
+#pragma unroll
+    for (int l = 0; l < int(sizeof(int)); ++l) {
+        sumq += q8[l];
+    }
+#pragma unroll
+    for (int mask = QI8_1/2; mask > 0; mask >>= 1) {
+        sumq += __shfl_xor_sync(0xFFFFFFFF, sumq, mask, 32);
+    }
+    const float sum = d * sumq;
 
     yq32[threadIdx.x] = q32;
     if (threadIdx.x % QI8_1 == 0 && (ni == WARP_SIZE || threadIdx.x < ni)) {
