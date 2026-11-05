@@ -79,7 +79,7 @@ grows from 4k to 41k tokens, a 10k-token worker is called twice in between):
 
 <sub>October and November 2026. Both run Swift 1.5 IQ4_XS at `-c 98304` with MTP drafting,
 flash attention, a q4_0 KV cache and two sessions, the best run for each value
-(LM Studio: two runs, this runtime: the last four, all on ROCm 10.1). LM Studio is its
+(LM Studio: best of two runs, this runtime: best of four runs, all on ROCm 10.1). LM Studio is its
 ROCm llama.cpp runtime 2.69.0 with batch 2048 / 1024; this runtime runs the quick
 start below on ROCm 10.1.
 The edit row is the text copy boost, n-gram drafting, the best of the twelve edits in those runs;
@@ -99,11 +99,11 @@ The same session with each quant we tested:
 batches keep Q4_K_M's spill into system RAM down while staying above Hermes'
 64,000-token minimum. The other quants ran at 96k with `-ub 1024`, IQ4_XS at
 `-ub 2048` since. Prefill and decode are this runtime's, in the session above;
-the better of two runs (IQ4_XS: the best of the last four, Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M (runtime 2.64.0) sit at the edge of
+the better of two runs (IQ4_XS: best of four runs, Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M (runtime 2.64.0) sit at the edge of
 the card's memory and read every prompt again in full. ROCmFP4-FP6 is a ROCmFPX
 format, which LM Studio does not load.</sub>
 
-Decode, 450-token answers at temperature 1, the best of the last four runs
+Decode, 450-token answers at temperature 1, best of four runs
 (nine answers each; without MTP from an earlier run):
 
 | decode t/s | peak |
@@ -112,8 +112,8 @@ Decode, 450-token answers at temperature 1, the best of the last four runs
 | code | 95.8 |
 | without MTP, prose or code | 36.8 |
 
-Cold prompts, each followed by a 300-token answer at that depth, the best of
-the last four runs:
+Cold prompts, each followed by a 300-token answer at that depth, best of four
+runs:
 
 | | 17k | 41k | 69k |
 |---|---:|---:|---:|

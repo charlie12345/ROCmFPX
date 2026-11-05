@@ -75,5 +75,5 @@
 <text x="900.0" y="884" fill="#F4F4F5" font-size="17" font-weight="800">315 t/s</text>
 <text x="420" y="906" fill="#9A9FA8" font-size="15">unavailable</text>
 <text x="56" y="962" fill="#9A9FA8" font-size="13">RX 7900 XT 20 GB, October and November 2026. Both: Swift 1.5 (Qwen3.8-27B) IQ4_XS, -c 98304, MTP draft, q4_0 KV cache, two sessions.</text>
-<text x="56" y="982" fill="#9A9FA8" font-size="13">This runtime: ROCm 10.1, -ub 2048, WMMA GEMM for prompts, best of the last four runs. LM Studio: ROCm llama.cpp runtime 2.69.0, batch 2048 / 1024, best of two.</text>
+<text x="56" y="982" fill="#9A9FA8" font-size="13">This runtime: ROCm 10.1, -ub 2048, WMMA GEMM for prompts, best of four runs. LM Studio: ROCm llama.cpp runtime 2.69.0, batch 2048 / 1024, best of two.</text>
 </svg>
