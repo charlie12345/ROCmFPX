@@ -12882,6 +12882,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,  48, n, 5120, {1, 1}, {1, 1}));
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1024, 2816, {1, 1}, {1, 1}));
+    // ROCmFPX: the MMQ batch sizes between decode and a full ubatch (9-511 tokens: MTP verify passes of a second slot,
+    // short prompts, prompt tails), where ROCm 10.1's clang 24 gave some MMQ kernels fewer waves than ROCm 7.2's clang 21
+    // (Q8_0 among them, 2026-11-05)
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
+        for (int64_t n : {9, 16, 32, 64, 128, 256}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
 
     // ROCmFPX: decode-sized attention at depth: 1 and 4 queries (a draft step, a verify batch) over 16k and 41k cells,
     // head 256, 4 KV heads with GQA 6, the production q4_0 KV cache against f16
