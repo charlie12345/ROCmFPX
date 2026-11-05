@@ -1672,6 +1672,14 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
 #define VDR_IQ2_S_Q8_1_MMVQ 2
 #define VDR_IQ2_S_Q8_1_MMQ  2
 
+// ROCmFPX [TAG_IQ_SIGN_EXPAND]: 4 sign bits -> 4 byte masks (0xFF where the bit is set), as __vcmpne4 of the shifted bits
+// computed: bit i of s is copied to bit 8*i by the multiply (no carries: the copies sit 7 bits apart), the AND keeps it and
+// the second multiply fills its byte. Three simple instructions under any compiler; ROCm 10.1's clang 24 no longer fused
+// the shift/or form (IQ2_S / IQ3_S decode 4-7% slower than on ROCm 7.2, RX 7900 XT 2026-11-05).
+static __device__ __forceinline__ int iq_sign_bytes4(const int s) {
+    return (int) ((((uint32_t) (s & 0x0F) * 0x00204081u) & 0x01010101u) * 0xFFu);
+}
+
 static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -1692,10 +1700,11 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     int sumi1 = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
+        // [TAG_IQ_SIGN_EXPAND] the high grid-index bits as a bit-field extract, the signs as iq_sign_bytes4
+        const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | (((qh >> l0) & 0x3) << 8)));
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+        const int signs0 = iq_sign_bytes4(signs_packed_8[l0/2]);
+        const int signs1 = iq_sign_bytes4(signs_packed_8[l0/2] >> 4);
 
         const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
@@ -1775,12 +1784,13 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
+        // [TAG_IQ_SIGN_EXPAND] as IQ2_S
         const int2 grid_pos = make_int2(
-            iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
-            iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+            iq3s_grid[qs[l0 + 0] | (((qh >> (l0 + 0)) & 0x1) << 8)],
+            iq3s_grid[qs[l0 + 1] | (((qh >> (l0 + 1)) & 0x1) << 8)]);
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+        const int signs0 = iq_sign_bytes4(signs_packed_8[l0/2]);
+        const int signs1 = iq_sign_bytes4(signs_packed_8[l0/2] >> 4);
 
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
