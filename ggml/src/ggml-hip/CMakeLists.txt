@@ -179,6 +179,34 @@ endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
 
+# ROCmFPX [TAG_BUNDLE_HIP_RUNTIME]: on Windows the loader takes the AMD driver's amdhip64_7.dll from System32 before PATH,
+# and ROCm 10.1's rocBLAS cannot run on the driver's older runtime: every SGEMM / BF16 GEMM it is asked for fails with
+# hipErrorInvalidDeviceFunction and the process aborts (RX 7900 XT, PRO driver 31036.15, runtime 10.0.3679 vs ROCm 10.1's
+# 10.0.3684, 2026-11-05). The HIP runtime of the ROCm this build uses goes next to the binaries, as in llama.cpp's
+# Windows ROCm releases, so the runtime always matches the ROCm libraries. With the 7.2 HIP SDK that is the driver's own
+# runtime build. GGML_HIP_BUNDLE_RUNTIME=OFF leaves it to the system.
+option(GGML_HIP_BUNDLE_RUNTIME "ggml: copy the HIP runtime DLLs next to the binaries (Windows)" ON)
+if (WIN32 AND GGML_HIP_BUNDLE_RUNTIME)
+    set(HIP_RUNTIME_DIR "")
+    foreach (root "$ENV{HIP_PATH}" "${ROCM_PATH}" "$ENV{ROCM_PATH}")
+        if (root AND EXISTS "${root}/bin")
+            file(GLOB HIP_RUNTIME_DLLS "${root}/bin/amdhip64_*.dll" "${root}/bin/amd_comgr*.dll" "${root}/bin/rocm_kpack.dll")
+            if (HIP_RUNTIME_DLLS)
+                set(HIP_RUNTIME_DIR "${root}/bin")
+                break()
+            endif()
+        endif()
+    endforeach()
+    if (HIP_RUNTIME_DLLS)
+        add_custom_command(TARGET ggml-hip POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${HIP_RUNTIME_DLLS} $<TARGET_FILE_DIR:ggml-hip>
+            COMMENT "Bundling the HIP runtime from ${HIP_RUNTIME_DIR}")
+        message(STATUS "HIP runtime bundled next to the binaries from ${HIP_RUNTIME_DIR}")
+    else()
+        message(WARNING "GGML_HIP_BUNDLE_RUNTIME: no amdhip64_*.dll under HIP_PATH / ROCM_PATH; the system's (driver's) HIP runtime is used")
+    endif()
+endif()
+
 # ROCmFPX [TAG_WMMA_GEMM]: prompt-sized FP4/FP6 products through the vendored rocm_wmma_gemm on the gfx11 targets
 option(GGML_HIP_WMMA_GEMM "ggml: build rocm_wmma_gemm (vendor/) for prompt-sized FP4/FP6 products on the gfx11 targets" ON)
 if (GGML_HIP_WMMA_GEMM)
