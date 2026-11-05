@@ -693,7 +693,23 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
+    // [TAG_Q2K_K01_SPLIT] the k01 loop split at the 3/4 point: the head (6 steps) has no min term, the tail (2 steps)
+    // has it, neither has a run-time branch, so each half gets its own unroll. Fully unrolled (clang's default for the
+    // single loop) the wide tiles spill under clang 24: 3.9 KB per lane for the 64-column fallback tile on RDNA3 (8x
+    // slower than ROCm 7.2), 4.7 KB at 80 columns on RDNA3.5, 1.8 KB at 64 on RDNA4; fully rolled, the narrow tiles lose
+    // their overlap. Measured on the 7900 XT (test-backend-ops, ROCm 10.1 and 7.2, every Q2_K tile against the single
+    // loop): the head unrolled 2x up to 64 columns (up to 2x faster, the fallback tiles 16x on 10.1), rolled above
+    // (1.3-1.9x faster, the 2x head spills at 128 columns), the tail unrolled; the 16-column tile stays fully unrolled
+    // where the compiler keeps it in registers (clang 22+, equal speed), clang 21 spills it there and runs 2x 35% faster.
+#if defined(__clang_major__) && __clang_major__ >= 22
+    constexpr bool full_j16 = true;
+#else
+    constexpr bool full_j16 = false;
+#endif
+    constexpr int head_unroll = J <= 16 && full_j16 ? MMQ_TILE_NE_K*3/16 : (J <= 64 ? 2 : 1);
+
+    auto step = [&](const int k01, auto tail_c) {
+        constexpr bool tail = decltype(tail_c)::value;
         const int k0 = k00 + k01;
 
         tile_A A[ntx];
@@ -709,12 +725,12 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
             const int j = j0 + tile_C::get_j(0);
             const float dB = (k01 < MMQ_TILE_NE_K/2) ? __half22float2(y_ds[j*MMQ_TILE_Y_K]).x : __half22float2(y_ds[j*MMQ_TILE_Y_K]).y;
-            const float sB = (k01 >= MMQ_TILE_NE_K * 3/4) ? 0
+            const float sB = tail ? 0
                                               : (((k01/4)%2) ? __half22float2(y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]).y
                                                              : __half22float2(y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]).x);
 
             tile_C Cm;
-            if (k01 >= MMQ_TILE_NE_K * 3/4) {
+            if constexpr (tail) {
                 tile_A A1;
 #pragma unroll
                 for (int l = 0; l < tile_A::ne; ++l) {
@@ -733,7 +749,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                     const int i = i0 + n*tile_C::I + tile_C::get_i(l);
                     const float2 dm = __half22float2(x_dm[i*sram_stride + k0/4]);
                     float tmp = Cd.x[l]*dm.x;
-                    if (k01 >= MMQ_TILE_NE_K * 3/4) {
+                    if constexpr (tail) {
                         tmp -= Cm.x[l]*dm.y;
                     }
                     sum[(j0/tile_C::J + n)*tile_C::ne + l] += tmp*dB;
@@ -741,6 +757,14 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                 }
             }
         }
+    };
+#pragma unroll head_unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K*3/4; k01 += 4) {
+        step(k01, std::integral_constant<bool, false>{});
+    }
+#pragma unroll
+    for (int k01 = MMQ_TILE_NE_K*3/4; k01 < MMQ_TILE_NE_K; k01 += 4) {
+        step(k01, std::integral_constant<bool, true>{});
     }
 #elif defined(TURING_MMA_AVAILABLE)
 

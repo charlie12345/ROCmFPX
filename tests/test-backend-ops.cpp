@@ -12897,8 +12897,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17400, n, 5120, {1, 1}, {1, 1}));
         }
     }
-    for (int64_t n : {16, 32, 48, 64, 80, 128}) {
+    for (int64_t n : {16, 32, 48, 64, 80, 96, 128, 256}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+    }
+    // ROCmFPX: Q2_K's wider fallback tiles too (the 64-column one spilled 3.9 KB per lane on RDNA3 under clang 24)
+    for (int64_t n : {48, 64, 80, 96, 128}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, 17400, n, 5120, {1, 1}, {1, 1}));
     }
 
     // ROCmFPX: decode-sized attention at depth: 1 and 4 queries (a draft step, a verify batch) over 16k and 41k cells,
