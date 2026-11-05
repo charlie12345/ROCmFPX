@@ -53,8 +53,8 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
   a client can fall back to another server.
 
 Measured on one machine: RX 7900 XT 20 GB, Ryzen 9 7900, 32 GB RAM,
-Windows 11, ROCm 7.2 HIP SDK, one NVMe for models and cache. Nothing here has
-been measured on an XTX.
+Windows 11, ROCm 10.1, one NVMe for models and cache. Nothing here has
+been measured on an XTX. The tables below were measured with ROCm 7.2.
 
 ## Speed
 
@@ -134,12 +134,27 @@ same top token (KL divergence 0.026). The
 [recipe and its tensor policy file](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md)
 are in this repository.
 
-**2. Build** (ROCm 7.2 clang, Ninja; about 3 minutes):
+**2. Build** with ROCm 10.1 (Ninja; about 6 minutes). AMD ships ROCm 10 for
+Windows as a tarball, without an installer:
+`therock-dist-windows-gfx110X-all-10.1.0.tar.gz` for RDNA3, `gfx120X-all` for
+RDNA4, `gfx1151` for Strix Halo ([AMD's install guide](https://rocm.docs.amd.com/en/latest/install/rocm.html)).
+Unpack it anywhere; nothing is set system-wide, and the HIP runtime itself comes
+with the AMD driver.
 
 ```
+curl -L -o therock.tar.gz https://stable.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx110X-all-10.1.0.tar.gz
+mkdir C:\TheRock\rocm-10.1
+tar -xzf therock.tar.gz -C C:\TheRock\rocm-10.1 --strip-components=1
+
+set "ROCM=C:\TheRock\rocm-10.1"
+set "HIP_PATH=%ROCM%"
+set "ROCM_PATH=%ROCM%"
+set "HIP_PLATFORM=amd"
+set "HIP_DEVICE_LIB_PATH=%ROCM%\lib\llvm\amdgcn\bitcode"
 cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release ^
-  -DCMAKE_C_COMPILER="%HIP_PATH%bin\clang.exe" -DCMAKE_CXX_COMPILER="%HIP_PATH%bin\clang++.exe" ^
-  -DCMAKE_PREFIX_PATH="%HIP_PATH%" -DGGML_HIP=ON -DGPU_TARGETS=gfx1100 -DCMAKE_HIP_ARCHITECTURES=gfx1100 ^
+  -DCMAKE_C_COMPILER="%ROCM%\lib\llvm\bin\clang.exe" -DCMAKE_CXX_COMPILER="%ROCM%\lib\llvm\bin\clang++.exe" ^
+  -DCMAKE_RC_COMPILER="C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64/rc.exe" ^
+  -DCMAKE_PREFIX_PATH="%ROCM%" -DGGML_HIP=ON -DGPU_TARGETS=gfx1100 -DCMAKE_HIP_ARCHITECTURES=gfx1100 ^
   -DGGML_HIP_GRAPHS=ON -DGGML_HIP_NO_VMM=ON -DGGML_HIP_FORCE_MMQ=ON -DGGML_CUDA_FA_ALL_QUANTS=ON ^
   -DGGML_CUDA_GRAPHS=ON -DGGML_NATIVE=ON -DGGML_OPENMP=ON -DGGML_SCHED_MAX_COPIES=4 ^
   -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF ^
@@ -147,14 +162,16 @@ cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release ^
 cmake --build build-hip --target llama-server -j 12
 ```
 
-The UI build needs Node.js (npm); it embeds the RDNA-FAST web UI with its live
+ROCm 10.1 brings no resource compiler, so CMake takes the Windows SDK's
+`rc.exe` (use the SDK version folder you have, with forward slashes). The UI
+build needs Node.js (npm); it embeds the RDNA-FAST web UI with its live
 status page at `http://127.0.0.1:<port>/#/status`. Without Node.js, use
 `-DLLAMA_BUILD_UI=OFF`.
 
 **3. Run:**
 
 ```
-set "PATH=%HIP_PATH%bin;%PATH%"
+set "PATH=C:\TheRock\rocm-10.1\bin;%PATH%"
 set GGML_CUDA_NO_PINNED=1
 set LLAMA_MAX_QUEUED=3
 set ROCMFPX_DRAFT_VOCAB=24576
