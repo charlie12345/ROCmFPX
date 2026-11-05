@@ -17,6 +17,21 @@ struct mmb_quant_slice {
     __device__ element operator[](int64_t n) const { return {dst, offset + (int) n - begin}; }
 };
 
+// ROCmFPX [TAG_WIDE_UNPACK_STORES]: n BF16 values (n = 4 or 8) into the LDS tile in one store of 2n bytes. ROCm 10.1's clang 24
+// no longer merges the per-value 2-byte stores (MoE prompts on MMB: MXFP4 +39%, IQ2_XS +32% against ROCm 7.2, RX 7900 XT
+// 2026-11-05). The tile rows are MMB_LDS_STRIDE = 72 values (144 B) apart in an __align__(16) array and the decode window
+// starts at a multiple of 64 values, so a run that starts at a multiple of n values is 2n-byte aligned. Same rounding as
+// mmb_f2bf (mmb_pack2 is two of it).
+template <int n>
+static __device__ __forceinline__ void mmb_store_bf16_run(uint16_t * dst, const float * v) {
+    uint32_t packed[n/2];
+#pragma unroll
+    for (int i = 0; i < n/2; ++i) {
+        packed[i] = mmb_pack2(v[2*i], v[2*i + 1]);
+    }
+    ggml_cuda_memcpy_1<2*n>(dst, packed);
+}
+
 template <ggml_type TYPE>
 __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0, uint16_t * dst, const int lane) {
     constexpr int QK = ggml_cuda_type_traits<TYPE>::qk;
@@ -141,66 +156,117 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
 #pragma unroll
         for (int tid = lane; tid < 64; tid += 8) dequantize_q6_K<float>(row, k0 / QK, out, tid);
     }
-    else if constexpr (TYPE == GGML_TYPE_IQ1_S) {
-        const mmb_quant_slice out{dst, k0 % QK};
+    else if constexpr (TYPE == GGML_TYPE_IQ1_S) {   // [TAG_WIDE_UNPACK_STORES] 8-value runs
 #pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq1_s<float>(row, k0 / QK, out, tid);
+        for (int tid = lane; tid < 32; tid += 8) {
+            const int o = 32*(tid%8) + 8*(tid/8) - k0 % QK;
+            if (o < 0 || o >= 64) continue;
+            float v[8];
+            dequantize_iq1_s<float, wide_unpack_row<float>>(row, k0 / QK, wide_unpack_row<float>{v}, tid);
+            mmb_store_bf16_run<8>(dst + o, v);
+        }
     }
-    else if constexpr (TYPE == GGML_TYPE_IQ1_M) {
-        const mmb_quant_slice out{dst, k0 % QK};
+    else if constexpr (TYPE == GGML_TYPE_IQ1_M) {   // [TAG_WIDE_UNPACK_STORES] 8-value runs
 #pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq1_m<float>(row, k0 / QK, out, tid);
+        for (int tid = lane; tid < 32; tid += 8) {
+            const int o = 32*(tid%8) + 8*(tid/8) - k0 % QK;
+            if (o < 0 || o >= 64) continue;
+            float v[8];
+            dequantize_iq1_m<float, wide_unpack_row<float>>(row, k0 / QK, wide_unpack_row<float>{v}, tid);
+            mmb_store_bf16_run<8>(dst + o, v);
+        }
     }
-    else if constexpr (TYPE == GGML_TYPE_IQ2_XXS) {
-        const mmb_quant_slice out{dst, k0 % QK};
+    else if constexpr (TYPE == GGML_TYPE_IQ2_XXS) {   // [TAG_WIDE_UNPACK_STORES] 8-value runs
 #pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq2_xxs<float>(row, k0 / QK, out, tid);
+        for (int tid = lane; tid < 32; tid += 8) {
+            const int o = 32*(tid%8) + 8*(tid/8) - k0 % QK;
+            if (o < 0 || o >= 64) continue;
+            float v[8];
+            dequantize_iq2_xxs<float, wide_unpack_row<float>>(row, k0 / QK, wide_unpack_row<float>{v}, tid);
+            mmb_store_bf16_run<8>(dst + o, v);
+        }
     }
-    else if constexpr (TYPE == GGML_TYPE_IQ2_XS) {
-        const mmb_quant_slice out{dst, k0 % QK};
+    else if constexpr (TYPE == GGML_TYPE_IQ2_XS) {   // [TAG_WIDE_UNPACK_STORES] 8-value runs
 #pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq2_xs<float>(row, k0 / QK, out, tid);
+        for (int tid = lane; tid < 32; tid += 8) {
+            const int o = 32*(tid%8) + 8*(tid/8) - k0 % QK;
+            if (o < 0 || o >= 64) continue;
+            float v[8];
+            dequantize_iq2_xs<float, wide_unpack_row<float>>(row, k0 / QK, wide_unpack_row<float>{v}, tid);
+            mmb_store_bf16_run<8>(dst + o, v);
+        }
     }
-    else if constexpr (TYPE == GGML_TYPE_IQ2_S) {
-        const mmb_quant_slice out{dst, k0 % QK};
+    else if constexpr (TYPE == GGML_TYPE_IQ2_S) {   // [TAG_WIDE_UNPACK_STORES] 8-value runs
 #pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq2_s<float>(row, k0 / QK, out, tid);
+        for (int tid = lane; tid < 32; tid += 8) {
+            const int o = 32*(tid%8) + 8*(tid/8) - k0 % QK;
+            if (o < 0 || o >= 64) continue;
+            float v[8];
+            dequantize_iq2_s<float, wide_unpack_row<float>>(row, k0 / QK, wide_unpack_row<float>{v}, tid);
+            mmb_store_bf16_run<8>(dst + o, v);
+        }
     }
-    else if constexpr (TYPE == GGML_TYPE_IQ3_XXS) {
-        const mmb_quant_slice out{dst, k0 % QK};
+    else if constexpr (TYPE == GGML_TYPE_IQ3_XXS) {   // [TAG_WIDE_UNPACK_STORES] 8-value runs
 #pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq3_xxs<float>(row, k0 / QK, out, tid);
+        for (int tid = lane; tid < 32; tid += 8) {
+            const int o = 32*(tid%8) + 8*(tid/8) - k0 % QK;
+            if (o < 0 || o >= 64) continue;
+            float v[8];
+            dequantize_iq3_xxs<float, wide_unpack_row<float>>(row, k0 / QK, wide_unpack_row<float>{v}, tid);
+            mmb_store_bf16_run<8>(dst + o, v);
+        }
     }
-    else if constexpr (TYPE == GGML_TYPE_IQ3_S) {
-        const mmb_quant_slice out{dst, k0 % QK};
+    else if constexpr (TYPE == GGML_TYPE_IQ3_S) {   // [TAG_WIDE_UNPACK_STORES] 8-value runs
 #pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq3_s<float>(row, k0 / QK, out, tid);
+        for (int tid = lane; tid < 32; tid += 8) {
+            const int o = 32*(tid%8) + 8*(tid/8) - k0 % QK;
+            if (o < 0 || o >= 64) continue;
+            float v[8];
+            dequantize_iq3_s<float, wide_unpack_row<float>>(row, k0 / QK, wide_unpack_row<float>{v}, tid);
+            mmb_store_bf16_run<8>(dst + o, v);
+        }
     }
-    else if constexpr (TYPE == GGML_TYPE_IQ4_XS) {
-        const mmb_quant_slice out{dst, k0 % QK};
+    else if constexpr (TYPE == GGML_TYPE_IQ4_XS) {   // [TAG_WIDE_UNPACK_STORES] 4 + 4-value runs
 #pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq4_xs<float>(row, k0 / QK, out, tid);
+        for (int tid = lane; tid < 32; tid += 8) {
+            const int o = 32*(tid%8) + 4*(tid/8) - k0 % QK;
+            if (o < 0 || o >= 64) continue;
+            float v[20];
+            dequantize_iq4_xs<float, wide_unpack_row<float>>(row, k0 / QK, wide_unpack_row<float>{v}, tid);
+            mmb_store_bf16_run<4>(dst + o,      v);
+            mmb_store_bf16_run<4>(dst + o + 16, v + 16);
+        }
     }
     else if constexpr (TYPE == GGML_TYPE_IQ4_NL) {
+        // [TAG_WIDE_UNPACK_STORES] 4 quant bytes per lane, their low and high values as two 4-value runs
+        const int ib = k0 / 32 + lane / 4, q = 4 * (lane % 4);
+        const block_iq4_nl & b = ((const block_iq4_nl *) row)[ib];
+        const float d = (float) b.d;
+        float lo[4], hi[4];
 #pragma unroll
-        for (int p = lane; p < 32; p += 8) {
-            const int pos = k0 + 2 * p, ib = pos / 32, q = (pos % 32) / 2;
-            const block_iq4_nl & b = ((const block_iq4_nl *) row)[ib];
-            const int o = ib * 32 + q - k0;
-            dst[o] = mmb_f2bf((float)b.d * kvalues_iq4nl[b.qs[q] & 15]);
-            dst[o + 16] = mmb_f2bf((float)b.d * kvalues_iq4nl[b.qs[q] >> 4]);
+        for (int j = 0; j < 4; ++j) {
+            lo[j] = d * kvalues_iq4nl[b.qs[q + j] & 15];
+            hi[j] = d * kvalues_iq4nl[b.qs[q + j] >> 4];
         }
+        const int o = ib * 32 + q - k0;
+        mmb_store_bf16_run<4>(dst + o,      lo);
+        mmb_store_bf16_run<4>(dst + o + 16, hi);
     }
     else if constexpr (TYPE == GGML_TYPE_MXFP4) {
+        // [TAG_WIDE_UNPACK_STORES] as IQ4_NL: 4 quant bytes per lane, two 4-value runs
+        static_assert(QK == 32, "MXFP4 blocks are 32 values");
+        const int ib = k0 / QK + lane / 4, q = 4 * (lane % 4);
+        const block_mxfp4 & b = ((const block_mxfp4 *) row)[ib];
+        const float d = ggml_cuda_e8m0_to_fp32(b.e);
+        float lo[4], hi[4];
 #pragma unroll
-        for (int p = lane; p < 32; p += 8) {
-            const int pos = k0 + 2 * p, ib = pos / QK, q = (pos % QK) / 2;
-            const block_mxfp4 & b = ((const block_mxfp4 *) row)[ib];
-            const float d = ggml_cuda_e8m0_to_fp32(b.e);
-            const int o = ib * QK + q - k0;
-            dst[o] = mmb_f2bf(d * kvalues_mxfp4[b.qs[q] & 15] * 0.5f);
-            dst[o + QK / 2] = mmb_f2bf(d * kvalues_mxfp4[b.qs[q] >> 4] * 0.5f);
+        for (int j = 0; j < 4; ++j) {
+            lo[j] = d * kvalues_mxfp4[b.qs[q + j] & 15] * 0.5f;
+            hi[j] = d * kvalues_mxfp4[b.qs[q + j] >> 4] * 0.5f;
         }
+        const int o = ib * QK + q - k0;
+        mmb_store_bf16_run<4>(dst + o,          lo);
+        mmb_store_bf16_run<4>(dst + o + QK / 2, hi);
     }
     else if constexpr (TYPE == GGML_TYPE_NVFP4) {
 #pragma unroll

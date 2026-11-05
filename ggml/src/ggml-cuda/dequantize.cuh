@@ -759,3 +759,90 @@ template<typename dst_t>
 static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
     dequantize_mxfp4<dst_t, dst_t *>(vx, ib, yy, tid);
 }
+
+// ROCmFPX [TAG_WIDE_UNPACK_STORES]: ROCm 7.2's clang 21 merged a thread's adjacent 2- or 4-byte stores of these unpacks into
+// 8- or 16-byte ones by itself; ROCm 10.1's clang 24 emits them one by one (it does not move them past the byte loads in
+// between; unaligned-access mode does not help). IQ4_XS to f16: 2 x 8-byte stores became 8 x 2-byte ones, and the
+// prompt GEMM path (TAG_WMMA_GEMM) unpacks a whole weight matrix per product: RX 7900 XT 2026-11-05, 4096 x 14336 at 512
+// rows 1267 us on ROCm 7.2, 1527 us on ROCm 10.1, 1243 us with this. The *_wide versions below keep the upstream math
+// unchanged: it writes into a row of registers (wide_unpack_row stands in for the output pointer, indexed at compile
+// time once unrolled) that then leaves in explicit stores of up to 16 bytes. Same values; same signature as the dst_t *
+// overloads above. yy must be aligned like a QK_K block of dst_t (whole rows of 256 values are).
+template <typename dst_t>
+struct wide_unpack_row {
+    dst_t * v;
+    __device__ __forceinline__ wide_unpack_row operator+(const int64_t) const { return *this; }
+    __device__ __forceinline__ dst_t & operator[](const int j) const { return v[j]; }
+};
+
+template <int n, typename dst_t>
+static __device__ __forceinline__ void wide_unpack_store(dst_t * __restrict__ dst, const dst_t * src) {
+    constexpr int nbytes = n*sizeof(dst_t);
+    constexpr int chunk  = nbytes < 16 ? nbytes : 16;
+#pragma unroll
+    for (int o = 0; o < nbytes; o += chunk) {
+        ggml_cuda_memcpy_1<chunk>((char *) dst + o, (const char *) src + o);
+    }
+}
+
+// a thread's 8 consecutive values at 32*ib + 8*il (ib = tid%8, il = tid/8): the IQ1 / IQ2 / IQ3 types
+#define DEQUANTIZE_WIDE_8(name)                                                                                      \
+template<typename dst_t>                                                                                             \
+static __device__ __forceinline__ void dequantize_##name##_wide(const void * vx, const int64_t ib, dst_t * yy, const int tid) { \
+    dst_t v[8];                                                                                                      \
+    dequantize_##name<dst_t, wide_unpack_row<dst_t>>(vx, ib, wide_unpack_row<dst_t>{v}, tid);                        \
+    wide_unpack_store<8>(yy + 32*(tid%8) + 8*(tid/8), v);                                                            \
+}
+DEQUANTIZE_WIDE_8(iq2_xxs)
+DEQUANTIZE_WIDE_8(iq2_xs)
+DEQUANTIZE_WIDE_8(iq2_s)
+DEQUANTIZE_WIDE_8(iq3_xxs)
+DEQUANTIZE_WIDE_8(iq3_s)
+DEQUANTIZE_WIDE_8(iq1_s)
+DEQUANTIZE_WIDE_8(iq1_m)
+#undef DEQUANTIZE_WIDE_8
+
+// 4 values at 32*ib + 4*il and 4 more 16 past them (the low and high nibbles): the 4-bit table types
+#define DEQUANTIZE_WIDE_4_4(name)                                                                                    \
+template<typename dst_t>                                                                                             \
+static __device__ __forceinline__ void dequantize_##name##_wide(const void * vx, const int64_t ib, dst_t * yy, const int tid) { \
+    dst_t v[20];                                                                                                     \
+    dequantize_##name<dst_t, wide_unpack_row<dst_t>>(vx, ib, wide_unpack_row<dst_t>{v}, tid);                        \
+    dst_t * y = yy + 32*(tid%8) + 4*(tid/8);                                                                         \
+    wide_unpack_store<4>(y +  0, v +  0);                                                                            \
+    wide_unpack_store<4>(y + 16, v + 16);                                                                            \
+}
+DEQUANTIZE_WIDE_4_4(iq4_nl)
+DEQUANTIZE_WIDE_4_4(iq4_xs)
+DEQUANTIZE_WIDE_4_4(mxfp4)
+#undef DEQUANTIZE_WIDE_4_4
+
+// Q3_K: dequantize_q3_K's math, its 4 values in one store (the write offset depends on the thread, so wide_unpack_row
+// cannot stand in here). 64 threads per block.
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_q3_K_wide(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+    const block_q3_K * x = (const block_q3_K *) vx + ib;
+    const int r   = tid/4;
+    const int t   = r/2;
+    const int is0 = r%2;
+    const int l0  = 16*is0 + 4*(tid%4);
+    const int n   = t / 4;
+    const int j   = t - 4*n;
+    const uint8_t m = 1 << (4*n + j);
+    const int is    = 8*n + 2*j + is0;
+    const int shift = 2*j;
+    const int8_t us = is <  4 ? (x->scales[is-0] & 0xF) | (((x->scales[is+8] >> 0) & 3) << 4) :
+                      is <  8 ? (x->scales[is-0] & 0xF) | (((x->scales[is+4] >> 2) & 3) << 4) :
+                      is < 12 ? (x->scales[is-8] >>  4) | (((x->scales[is+0] >> 4) & 3) << 4) :
+                                (x->scales[is-8] >>  4) | (((x->scales[is-4] >> 6) & 3) << 4);
+    const float dl = (float) x->d * (us - 32);
+    const uint8_t * q  = x->qs + 32*n;
+    const uint8_t * hm = x->hmask;
+    dst_t v[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int l = l0 + k;
+        v[k] = ggml_cuda_cast<dst_t>(dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)));
+    }
+    wide_unpack_store<4>(yy + 128*n + 32*j + l0, v);
+}

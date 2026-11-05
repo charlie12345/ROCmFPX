@@ -262,6 +262,26 @@ static void get_rows_cuda_kq(
         s10, s11, s12/*, s13*/);
 }
 
+// ROCmFPX [TAG_WIDE_UNPACK_STORES]: the *_wide unpack (dequantize.cuh: the same values in stores of up to 16 bytes, which
+// ROCm 10.1's clang 24 no longer merges by itself) when the destination and every row stride are 16-byte aligned, as
+// whole rows of QK_K-block types in a ggml buffer are; the plain one otherwise (strided views).
+template<int block_dim, typename dst_t, dequantize_kq_t<dst_t> plain, dequantize_kq_t<dst_t> wide>
+static void get_rows_cuda_kq_wide(
+        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+    const bool aligned = (uintptr_t) dst_d % 16 == 0 && nb1 % 16 == 0 && nb2 % 16 == 0 && nb3 % 16 == 0;
+    if (aligned) {
+        get_rows_cuda_kq<block_dim, dst_t, wide>(src0_d, src1_d, dst_d,
+            ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+    } else {
+        get_rows_cuda_kq<block_dim, dst_t, plain>(src0_d, src1_d, dst_d,
+            ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+    }
+}
+
 template<typename src0_t, typename dst_t>
 static void get_rows_cuda_float(
         const src0_t * src0_d, const int32_t * src1_d, dst_t * dst_d,
@@ -415,7 +435,7 @@ static void ggml_cuda_get_rows_switch_src0_type(
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q3_K:
-            get_rows_cuda_kq<64, dst_t, dequantize_q3_K<dst_t, dst_t *>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq_wide<64, dst_t, dequantize_q3_K<dst_t, dst_t *>, dequantize_q3_K_wide<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q4_K:
@@ -431,43 +451,43 @@ static void ggml_cuda_get_rows_switch_src0_type(
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ2_XXS:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq2_xxs<dst_t, dst_t *>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq_wide<32, dst_t, dequantize_iq2_xxs<dst_t, dst_t *>, dequantize_iq2_xxs_wide<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ2_XS:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq2_xs<dst_t, dst_t *>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq_wide<32, dst_t, dequantize_iq2_xs<dst_t, dst_t *>, dequantize_iq2_xs_wide<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ2_S:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq2_s<dst_t, dst_t *>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq_wide<32, dst_t, dequantize_iq2_s<dst_t, dst_t *>, dequantize_iq2_s_wide<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ3_XXS:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq3_xxs<dst_t, dst_t *>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq_wide<32, dst_t, dequantize_iq3_xxs<dst_t, dst_t *>, dequantize_iq3_xxs_wide<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ3_S:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq3_s<dst_t, dst_t *>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq_wide<32, dst_t, dequantize_iq3_s<dst_t, dst_t *>, dequantize_iq3_s_wide<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ1_S:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq1_s<dst_t, dst_t *>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq_wide<32, dst_t, dequantize_iq1_s<dst_t, dst_t *>, dequantize_iq1_s_wide<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ1_M:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq1_m<dst_t, dst_t *>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq_wide<32, dst_t, dequantize_iq1_m<dst_t, dst_t *>, dequantize_iq1_m_wide<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t, dst_t *>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq_wide<32, dst_t, dequantize_iq4_nl<dst_t, dst_t *>, dequantize_iq4_nl_wide<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ4_XS:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq4_xs<dst_t, dst_t *>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq_wide<32, dst_t, dequantize_iq4_xs<dst_t, dst_t *>, dequantize_iq4_xs_wide<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_MXFP4:
-            get_rows_cuda_kq<32, dst_t, dequantize_mxfp4<dst_t, dst_t *>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq_wide<32, dst_t, dequantize_mxfp4<dst_t, dst_t *>, dequantize_mxfp4_wide<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q4_0_ROCMFP4:
