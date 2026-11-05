@@ -1558,6 +1558,41 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+#if defined(GGML_USE_HIP)
+// ROCmFPX [TAG_FATTN_OCC_LDS64]: ROCm 10's HIP runtime reports the LDS of a whole WGP (128 KB on RDNA3/RDNA4) per
+// multiprocessor, the AMD driver's runtime and ROCm 7.2 the 64 KB a workgroup can address. The occupancy query then returns
+// up to three times the blocks for LDS-heavy kernels, and the split heuristics of launch_fattn (parallel_blocks, the GQA6
+// fixed fill, stream-k), tuned on the 64 KB figure, pick other launch shapes. RX 7900 XT, the same binaries on both
+// runtimes (2026-11-05): decode attention D=256 GQA 6 at 16k-41k went from 3 to 6 and 1 to 3 blocks per multiprocessor
+// and from 68 to 78 us and 445 to 504 us; 512-token D=128 prompts were 29% slower. Cap the LDS-bound block count at
+// sharedMemPerBlock per multiprocessor, so every runtime gets the launch shapes the tuning was done on. A no-op on the
+// older runtimes and on CDNA, where both figures are 64 KB. GGML_HIP_FA_OCC_RUNTIME=1 keeps the runtime's count.
+static int ggml_hip_fattn_blocks_per_sm(const void * kernel, const size_t nbytes_shared, const int max_blocks_per_sm) {
+    static const bool keep_runtime = [] { const char * e = getenv("GGML_HIP_FA_OCC_RUNTIME"); return e && atoi(e) != 0; }();
+    if (keep_runtime) {
+        return max_blocks_per_sm;
+    }
+    static std::mutex                                 mutex;
+    static std::unordered_map<const void *, size_t>   static_lds;
+    size_t lds = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = static_lds.find(kernel);
+        if (it == static_lds.end()) {
+            hipFuncAttributes attr = {};
+            CUDA_CHECK(hipFuncGetAttributes(&attr, kernel));
+            it = static_lds.emplace(kernel, attr.sharedSizeBytes).first;
+        }
+        lds = it->second + nbytes_shared;
+    }
+    if (lds == 0) {
+        return max_blocks_per_sm;
+    }
+    const size_t smpb = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
+    return std::max(1, std::min(max_blocks_per_sm, (int) (smpb / lds)));
+}
+#endif // defined(GGML_USE_HIP)
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1718,6 +1753,9 @@ void launch_fattn(
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
+#if defined(GGML_USE_HIP)
+    max_blocks_per_sm = ggml_hip_fattn_blocks_per_sm((const void *) fattn_kernel, nbytes_shared, max_blocks_per_sm); // [TAG_FATTN_OCC_LDS64]
+#endif
     int parallel_blocks = max_blocks_per_sm;
 
     const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
