@@ -6,6 +6,30 @@
 
 #define CUDA_Q8_0_NE_ALIGN 2048
 
+// ROCmFPX [TAG_WIDE_UNPACK_STORES]: the weight unpacks in front of the prompt GEMM (TAG_WMMA_GEMM) write a whole weight
+// matrix as f16, so their stores count. ROCm 7.2's clang 21 merged a thread's adjacent 2-byte stores into 8- or 16-byte
+// ones by itself; ROCm 10.1's clang 24 emits them one by one in 21 of the 50 f16 unpacks (it does not move them past the
+// byte loads in between; unaligned-access mode does not help). IQ4_XS: 2 x 8-byte stores became 8 x 2-byte ones, RX
+// 7900 XT 2026-11-05, 4096 x 14336 at 512 rows 1267 us (ROCm 7.2) vs 1527 us (ROCm 10.1). Fix: the unpack math runs
+// unchanged into a row of registers (wide_unpack_row stands in for the output pointer), which then leaves in explicit
+// stores of up to 16 bytes. Rows are whole QK_K blocks, so each group's offset is a multiple of its size.
+template <typename dst_t>
+struct wide_unpack_row {
+    dst_t * v;   // a local array, indexed at compile time once the helper is unrolled, so it stays in registers
+    __device__ __forceinline__ wide_unpack_row operator+(const int64_t) const { return *this; }
+    __device__ __forceinline__ dst_t & operator[](const int j) const { return v[j]; }
+};
+
+template <int n, typename dst_t>
+static __device__ __forceinline__ void wide_unpack_store(dst_t * __restrict__ dst, const dst_t * src) {
+    constexpr int nbytes = n*sizeof(dst_t);
+    constexpr int chunk  = nbytes < 16 ? nbytes : 16;
+#pragma unroll
+    for (int o = 0; o < nbytes; o += chunk) {
+        ggml_cuda_memcpy_1<chunk>((char *) dst + o, (const char *) src + o);
+    }
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ y,
         const int64_t ne00, const int64_t ne01,
@@ -150,7 +174,33 @@ template<typename dst_t>
 static __global__ void dequantize_block_q3_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
     const int64_t i = blockIdx.x;
 
-    dequantize_q3_K(vx, i, yy + i*QK_K, threadIdx.x);
+    // [TAG_WIDE_UNPACK_STORES] dequantize_q3_K's math, its 4 values in one store (the write offset depends on the
+    // thread, so wide_unpack_row cannot stand in here)
+    const block_q3_K * x = (const block_q3_K *) vx + i;
+    const int tid = threadIdx.x;
+    const int r   = tid/4;
+    const int t   = r/2;
+    const int is0 = r%2;
+    const int l0  = 16*is0 + 4*(tid%4);
+    const int n   = t / 4;
+    const int j   = t - 4*n;
+    const uint8_t m = 1 << (4*n + j);
+    const int is    = 8*n + 2*j + is0;
+    const int shift = 2*j;
+    const int8_t us = is <  4 ? (x->scales[is-0] & 0xF) | (((x->scales[is+8] >> 0) & 3) << 4) :
+                      is <  8 ? (x->scales[is-0] & 0xF) | (((x->scales[is+4] >> 2) & 3) << 4) :
+                      is < 12 ? (x->scales[is-8] >>  4) | (((x->scales[is+0] >> 4) & 3) << 4) :
+                                (x->scales[is-8] >>  4) | (((x->scales[is-4] >> 6) & 3) << 4);
+    const float dl = (float) x->d * (us - 32);
+    const uint8_t * q  = x->qs + 32*n;
+    const uint8_t * hm = x->hmask;
+    dst_t v[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int l = l0 + k;
+        v[k] = ggml_cuda_cast<dst_t>(dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)));
+    }
+    wide_unpack_store<4>(yy + i*QK_K + 128*n + 32*j + l0, v);
 }
 
 template<typename dst_t>
@@ -174,40 +224,23 @@ static __global__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t
     dequantize_q6_K(vx, i, yy + i*QK_K, threadIdx.x);
 }
 
-template<typename dst_t>
-static __global__ void dequantize_block_iq2_xxs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const int64_t i = blockIdx.x;
-
-    dequantize_iq2_xxs(vx, i, yy + i*QK_K, threadIdx.x);
+// [TAG_WIDE_UNPACK_STORES] the IQ2 / IQ3 unpacks: each thread writes the 8 values at 32*ib + 8*il in one row
+#define WIDE_UNPACK_8(name)                                                                              \
+template<typename dst_t>                                                                                 \
+static __global__ void dequantize_block_##name(const void * __restrict__ vx, dst_t * __restrict__ yy) { \
+    const int64_t i = blockIdx.x;                                                                        \
+    const int tid = threadIdx.x;                                                                         \
+    dst_t v[8];                                                                                          \
+    dequantize_##name<dst_t, wide_unpack_row<dst_t>>(vx, i, wide_unpack_row<dst_t>{v}, tid);             \
+    wide_unpack_store<8>(yy + i*QK_K + 32*(tid%8) + 8*(tid/8), v);                                       \
 }
 
-template<typename dst_t>
-static __global__ void dequantize_block_iq2_xs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const int64_t i = blockIdx.x;
-
-    dequantize_iq2_xs(vx, i, yy + i*QK_K, threadIdx.x);
-}
-
-template<typename dst_t>
-static __global__ void dequantize_block_iq2_s(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const int64_t i = blockIdx.x;
-
-    dequantize_iq2_s(vx, i, yy + i*QK_K, threadIdx.x);
-}
-
-template<typename dst_t>
-static __global__ void dequantize_block_iq3_xxs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const int64_t i = blockIdx.x;
-
-    dequantize_iq3_xxs(vx, i, yy + i*QK_K, threadIdx.x);
-}
-
-template<typename dst_t>
-static __global__ void dequantize_block_iq3_s(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const int64_t i = blockIdx.x;
-
-    dequantize_iq3_s(vx, i, yy + i*QK_K, threadIdx.x);
-}
+WIDE_UNPACK_8(iq2_xxs)
+WIDE_UNPACK_8(iq2_xs)
+WIDE_UNPACK_8(iq2_s)
+WIDE_UNPACK_8(iq3_xxs)
+WIDE_UNPACK_8(iq3_s)
+#undef WIDE_UNPACK_8
 
 template<typename dst_t>
 static __global__ void dequantize_block_iq1_s(const void * __restrict__ vx, dst_t * __restrict__ yy) {
@@ -239,14 +272,26 @@ template<typename dst_t>
 static __global__ void dequantize_block_iq4_xs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
     const int64_t i = blockIdx.x;
 
-    dequantize_iq4_xs(vx, i, yy + i*QK_K, threadIdx.x);
+    // [TAG_WIDE_UNPACK_STORES] the thread's 8 values: 4 at 32*ib + 4*il and 4 at 16 past them (the low and high nibbles)
+    const int tid = threadIdx.x;
+    dst_t v[20];
+    dequantize_iq4_xs<dst_t, wide_unpack_row<dst_t>>(vx, i, wide_unpack_row<dst_t>{v}, tid);
+    dst_t * y = yy + i*QK_K + 32*(tid%8) + 4*(tid/8);
+    wide_unpack_store<4>(y +  0, v +  0);
+    wide_unpack_store<4>(y + 16, v + 16);
 }
 
 template<typename dst_t>
 static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
     const int64_t i = blockIdx.x;
 
-    dequantize_mxfp4(vx, i, yy + i*QK_K, threadIdx.x);
+    // [TAG_WIDE_UNPACK_STORES] as IQ4_XS: 4 values at 32*ib + 4*il, 4 at 16 past them
+    const int tid = threadIdx.x;
+    dst_t v[20];
+    dequantize_mxfp4<dst_t, wide_unpack_row<dst_t>>(vx, i, wide_unpack_row<dst_t>{v}, tid);
+    dst_t * y = yy + i*QK_K + 32*(tid%8) + 4*(tid/8);
+    wide_unpack_store<4>(y +  0, v +  0);
+    wide_unpack_store<4>(y + 16, v + 16);
 }
 
 template<typename dst_t>
