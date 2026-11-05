@@ -12904,6 +12904,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t n : {48, 64, 80, 96, 128}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, 17400, n, 5120, {1, 1}, {1, 1}));
     }
+    // ROCmFPX: prompt batches (512 = the default ubatch, 2048) on the weight shapes of other common dense models, for the
+    // WMMA GEMM path's tuned table (2026-11-06): Llama-3.1-8B, Gemma-3-27B, Qwen3-32B, Mistral-Small-24B, as Q4_K
+    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{
+             {14336, 4096}, {4096, 14336}, {4096, 4096}, {1024, 4096},                  // Llama-3.1-8B
+             {21504, 5376}, {5376, 21504}, {4096, 5376}, {2048, 5376}, {5376, 4096},    // Gemma-3-27B
+             {25600, 5120}, {5120, 25600}, {8192, 5120}, {5120, 8192},                  // Qwen3-32B
+             {32768, 5120}, {5120, 32768}, {4096, 5120}, {5120, 4096}}) {               // Mistral-Small-24B
+        for (int64_t n : {512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+        }
+    }
 
     // ROCmFPX: decode-sized attention at depth: 1 and 4 queries (a draft step, a verify batch) over 16k and 41k cells,
     // head 256, 4 KV heads with GQA 6, the production q4_0 KV cache against f16
