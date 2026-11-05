@@ -920,15 +920,18 @@ export class StatusStore {
 	}
 
 	/**
-	 * The simple peak rule (owner, 2026-11-03): on every poll, a row whose live value (the white
-	 * line) is above its peak takes exactly that value as its new peak, and the record glow plays;
-	 * otherwise the bar stays where it is. The bucket is the request's current context depth.
+	 * The simple peak rule (owner, 2026-11-03): on every poll, a Decode row whose live value (the
+	 * white line) is above its peak takes exactly that value as its new peak, and the record glow
+	 * plays; otherwise the bar stays where it is. The bucket is the request's current context depth.
+	 * Prefill peaks come from finished requests only (the server's exact prompt timing, in ingest):
+	 * the live prefill line is a poll estimate that runs up to ~2x high on short prompts, because
+	 * the server counts a prompt batch when it is queued, before the GPU has computed it (owner,
+	 * 2026-11-05, after 1,500+ t/s peaks at 17k depth that the server never measured).
 	 */
 	private raisePeaksFromLive(live: SlotLive[], t: number): void {
 		const buckets = this.buckets;
 
 		let decode = this.peaks.decode;
-		let prefill = this.peaks.prefill;
 
 		for (const l of live) {
 			if (l.phase === 'idle') continue;
@@ -956,14 +959,6 @@ export class StatusStore {
 				p.at = t;
 				this.pendingNoCopy.set(key, p);
 			}
-
-			if (
-				l.prefillTps !== null &&
-				t > this.peaks.prefillResetAt &&
-				l.prefillTps > (prefill[hi]?.v ?? 0)
-			) {
-				prefill = { ...prefill, [hi]: { t, v: l.prefillTps } };
-			}
 		}
 
 		// requests whose record never came (a server without /requests, a restart) are let go
@@ -971,9 +966,9 @@ export class StatusStore {
 			if (t - p.at > PENDING_NO_COPY_MS) this.pendingNoCopy.delete(key);
 		}
 
-		if (decode === this.peaks.decode && prefill === this.peaks.prefill) return;
+		if (decode === this.peaks.decode) return;
 
-		this.peaks = { ...this.peaks, decode, prefill };
+		this.peaks = { ...this.peaks, decode };
 		this.persist('peaks', this.peaks);
 		this.observeRecords();
 	}

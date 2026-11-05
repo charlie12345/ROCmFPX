@@ -202,6 +202,42 @@ describe('status store: the simple peak rule', () => {
 		store.resetDecode();
 		expect(store.decodeRows[0].peak).toBeNull();
 	});
+
+	it('never takes a Prefill peak from the live line, only a finished request’s exact rate', () => {
+		const store = makeStore();
+		const t = Date.now();
+		// a 4k prompt on 17k of context: the poll estimate read 1,700 t/s (a batch counted when queued)
+		const prefilling: SlotLive = {
+			cached: 17000,
+			ctx: 21000,
+			decoded: 0,
+			decodeTps: null,
+			phase: 'prefill',
+			prefillTps: 1700,
+			processed: 3972,
+			task: 11
+		};
+
+		store.live = [prefilling];
+		(store as unknown as Internals).raisePeaksFromLive([prefilling], t + 1);
+		// the white line shows the estimate, the bar does not take it
+		expect(store.prefillRows[1].live).toBe(1700);
+		expect(store.prefillRows[1].peak).toBeNull();
+		expect(store.glow.on('prefill:24576', Date.now())).toBe(false);
+
+		// the finished request: 4,024 tokens in 4,077 ms on top of 17,000 cached = 987 t/s at 21k
+		store.ingest('m', [
+			completion({
+				id: 11,
+				n_cache: 17000,
+				n_processed: 4024,
+				n_prompt: 21024,
+				prompt_ms: 4077,
+				t_end_ms: t + 2
+			})
+		]);
+		expect(store.prefillRows[1].peak).toBeCloseTo(4024 / 4.077, 6);
+	});
 });
 
 describe('status store: Text copy boost off (decode peaks without fast copies)', () => {

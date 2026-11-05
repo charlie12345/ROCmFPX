@@ -1,8 +1,10 @@
 /**
  * RDNA-FAST status page: live rates from /slots polls, what the white line of the Decode and
- * Prefill rows shows (and what raises their peaks): decode over a short sliding window; prefill
- * from the first value seen in this prefill to the last ubatch step (it moves in steps of ~2048
- * tokens).
+ * Prefill rows shows: decode over a short sliding window (it also raises the Decode peaks);
+ * prefill from the first value seen in this prefill to the last ubatch step (it moves in steps
+ * of ~2048 tokens). The prefill figure is an estimate that can run up to ~2x high on short
+ * prompts: the server counts a prompt batch when it is queued, before the GPU computed it, and
+ * 1 s polls time the steps. It never raises a Prefill peak (finished requests do, exactly).
  */
 
 import type { RdnaSlot } from './types';
