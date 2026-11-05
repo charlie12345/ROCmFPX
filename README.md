@@ -13,13 +13,13 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 ## Highlights
 
-- **Faster agent loops than LM Studio on the same card.** With the same model,
-  quant and context, a scripted two-agent session finishes in 97 s instead of
-  130 s. [Numbers](#speed)
+- **Faster agent loops than LM Studio on the same card.** Leveraging ROCm 10
+  for maximum performance. With the same model, quant and context, a scripted
+  two-agent session finishes in 95 s instead of 130 s. [Numbers](#speed)
 
 - **Multi-token prediction.** The model's own MTP head drafts tokens ahead: up
-  to 59 t/s on prose and 94 t/s on code. When an answer repeats text from the
-  prompt, as code edits do, n-gram drafting copies it at up to 311 t/s.
+  to 60 t/s on prose and 96 t/s on code. When an answer repeats text from the
+  prompt, as code edits do, n-gram drafting copies it at up to 315 t/s.
 
 - **Prompts on the matrix cores.** Prompt processing runs on RDNA3's WMMA units
   through [rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) by Adel
@@ -54,7 +54,9 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 Measured on one machine: RX 7900 XT 20 GB, Ryzen 9 7900, 32 GB RAM,
 Windows 11, ROCm 10.1, one NVMe for models and cache. Nothing here has
-been measured on an XTX. The tables below were measured with ROCm 7.2.
+been measured on an XTX. The first speed table, the IQ4_XS row and the decode
+and cold-prompt tables below were measured with ROCm 10.1, the rest with ROCm
+7.2.
 
 ## Speed
 
@@ -66,19 +68,20 @@ grows from 4k to 41k tokens, a 10k-token worker is called twice in between):
 
 | | LM Studio + MTP draft | this runtime |
 |---|---:|---:|
-| **the session, wall-clock** | **130 s** | **97 s** |
-| prefill t/s, cold 4k prompt | 738 | 1,002 |
-| prefill t/s, 4.3k new tokens at 17k depth | 705 | 857 |
-| prefill t/s, 4.0k new tokens at 41k depth | 543 | 680 |
-| decode t/s at 4k depth | 48.6 | 65.8 |
-| decode t/s at 17k depth | 56.1 | 64.0 |
-| decode t/s at 41k depth | 49.2 | 61.1 |
-| decode t/s, text copy boost: code edit that copies the prompt | unavailable | 311 |
+| **the session, wall-clock** | **130 s** | **95 s** |
+| prefill t/s, cold 4k prompt | 738 | 1,003 |
+| prefill t/s, 4.3k new tokens at 17k depth | 705 | 868 |
+| prefill t/s, 4.0k new tokens at 41k depth | 543 | 696 |
+| decode t/s at 4k depth | 48.6 | 70.1 |
+| decode t/s at 17k depth | 56.1 | 66.7 |
+| decode t/s at 41k depth | 49.2 | 65.3 |
+| decode t/s, text copy boost: code edit that copies the prompt | unavailable | 315 |
 
 <sub>October and November 2026. Both run Swift 1.5 IQ4_XS at `-c 98304` with MTP drafting,
 flash attention, a q4_0 KV cache and two sessions, the best run for each value
 (LM Studio: two runs, this runtime: the last two). LM Studio is its ROCm llama.cpp
-runtime 2.69.0 with batch 2048 / 1024; this runtime runs the quick start below.
+runtime 2.69.0 with batch 2048 / 1024; this runtime runs the quick start below
+on ROCm 10.1.
 The edit row is the text copy boost, n-gram drafting, the best of the six edits in those runs;
 LM Studio cannot run it, as its API does not switch Swift 1.5's thinking
 off.</sub>
@@ -89,7 +92,7 @@ The same session with each quant we tested:
 |---|---:|---:|---:|---:|---:|---:|
 | [Q4_K_M](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf)\* | 17.4 GB | 146.8 s | 1,211 s (spill) | 408 / 548 / 431 | 50.6 / 50.8 / 48.2 | 238 |
 | [Q4_K_S](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_S.gguf) | 16.4 GB | 112.6 s | 1,139 s (spill) | 889 / 769 / 616 | 49.2 / 51.7 / 48.8 | 247 |
-| [IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf) | 15.5 GB | 96.7 s | 130.1 s | 1,002 / 857 / 680 | 65.8 / 64.0 / 61.1 | 311 |
+| [IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf) | 15.5 GB | 94.6 s | 130.1 s | 1,003 / 868 / 696 | 70.1 / 66.7 / 65.3 | 315 |
 | [ROCmFP4-FP6](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md) | 16.1 GB | 104.5 s | | 923 / 798 / 634 | 60.2 / 56.4 / 58.5 | 243 |
 
 <sub>\* At 64k (`-c 65536`) and `-ub 512`: the smaller context and prompt
@@ -105,8 +108,8 @@ Decode, 450-token answers at temperature 1, the best of the last two runs
 
 | decode t/s | peak |
 |---|---:|
-| prose | 59.3 |
-| code | 93.6 |
+| prose | 59.8 |
+| code | 95.8 |
 | without MTP, prose or code | 36.8 |
 
 Cold prompts, each followed by a 300-token answer at that depth, the best of
@@ -114,8 +117,8 @@ the last two runs:
 
 | | 17k | 41k | 69k |
 |---|---:|---:|---:|
-| prefill t/s, average over the prompt | 955 | 854 | 743 |
-| decode t/s at that depth | 57.5 | 51.4 | 45.9 |
+| prefill t/s, average over the prompt | 964 | 866 | 760 |
+| decode t/s at that depth | 54.4 | 49.0 | 49.4 |
 
 ## Quick start
 
@@ -138,8 +141,7 @@ are in this repository.
 Windows as a tarball, without an installer:
 `therock-dist-windows-gfx110X-all-10.1.0.tar.gz` for RDNA3, `gfx120X-all` for
 RDNA4, `gfx1151` for Strix Halo ([AMD's install guide](https://rocm.docs.amd.com/en/latest/install/rocm.html)).
-Unpack it anywhere; nothing is set system-wide, and the HIP runtime itself comes
-with the AMD driver.
+Unpack it anywhere; nothing is set system-wide.
 
 ```
 curl -L -o therock.tar.gz https://stable.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx110X-all-10.1.0.tar.gz
@@ -163,10 +165,12 @@ cmake --build build-hip --target llama-server -j 12
 ```
 
 ROCm 10.1 brings no resource compiler, so CMake takes the Windows SDK's
-`rc.exe` (use the SDK version folder you have, with forward slashes). The UI
-build needs Node.js (npm); it embeds the RDNA-FAST web UI with its live
-status page at `http://127.0.0.1:<port>/#/status`. Without Node.js, use
-`-DLLAMA_BUILD_UI=OFF`.
+`rc.exe` (use the SDK version folder you have, with forward slashes). The build
+copies ROCm's HIP runtime (`amdhip64_7.dll`, `amd_comgr.dll`, `rocm_kpack.dll`)
+next to `llama-server.exe`: Windows would otherwise load the AMD driver's older
+runtime, on which ROCm 10.1's rocBLAS fails. The UI build needs Node.js (npm);
+it embeds the RDNA-FAST web UI with its live status page at
+`http://127.0.0.1:<port>/#/status`. Without Node.js, use `-DLLAMA_BUILD_UI=OFF`.
 
 **3. Run:**
 
@@ -207,7 +211,7 @@ otherwise.
 | `-b 2048 -ub 2048` | prompts in batches of 2048 tokens | prompts 3-4% faster than at 1024. It fits since [rollback by replay](#rollback-by-replay). 1536 is slower, as the WMMA GEMM is tuned for 1024 and 2048 rows; below 512 the WMMA GEMM never runs |
 | `--no-mmproj-offload` | the 0.9 GB vision projector runs on the CPU | VRAM for context at two slots. Images take 7-12 s to the first token instead of 3-5 s. The BF16 projector encodes 8% faster than f16 on CPUs with AVX-512 BF16 (Ryzen 7000 and newer) |
 | `--spec-type draft-mtp`, `--spec-draft-n-max 4 --spec-draft-p-min 0.60` | the model's own MTP head drafts up to 4 tokens per pass | models that ship an MTP head (Qwen3.5/3.6/3.8): decode +45% on prose, +112% on code, for ~0.7 GB of VRAM and 3% of prefill speed |
-| `--spec-type "...,ngram-map-k4v"` | text copy boost: where the last tokens repeat an earlier place in the context, the continuation found there is drafted, up to 48 tokens once six 4-token probes in a row would have been accepted | answers that copy the prompt, such as code edits and quoted files: up to 311 t/s. On two days of agent traffic it saved 4.6-6.0% of decode time. Quote the value in a .cmd file, as cmd splits arguments at commas |
+| `--spec-type "...,ngram-map-k4v"` | text copy boost: where the last tokens repeat an earlier place in the context, the continuation found there is drafted, up to 48 tokens once six 4-token probes in a row would have been accepted | answers that copy the prompt, such as code edits and quoted files: up to 315 t/s. On two days of agent traffic it saved 4.6-6.0% of decode time. Quote the value in a .cmd file, as cmd splits arguments at commas |
 | `--ctx-checkpoints 8 --checkpoint-min-step 2048` | up to 8 checkpoints of the model state per slot (~200 MiB each, host RAM), at least 2048 tokens apart. When the list is full, the one whose removal leaves the smallest gap goes; the one at the first user message stays | hybrid models such as Qwen3.8, whose recurrent layers cannot roll back: a prompt that changes late resumes from the nearest checkpoint instead of from scratch |
 | `--cache-ram 0 --cache-disk PATH --cache-disk-limit 65536 --cache-disk-checkpoints 4` | conversations and their checkpoints go to SSD (64 GB limit, 4 checkpoints per entry) instead of RAM | more agents than slots, and restarts. [More](#the-ssd-prompt-cache) |
 | `--load-mode dio` | reads the model with direct I/O instead of memory-mapping it | keeps the 15 GB model file out of system RAM |
