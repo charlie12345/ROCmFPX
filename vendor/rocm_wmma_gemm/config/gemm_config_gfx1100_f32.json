@@ -2476,12 +2476,12 @@
                 "C": "row_major"
             },
             "config": {
-                "warps_m": 2,
-                "warps_n": 2,
+                "warps_m": 1,
+                "warps_n": 4,
                 "warp_tile_m": 4,
-                "warp_tile_n": 4,
-                "k_slices": 2,
-                "single_buffer": 0,
+                "warp_tile_n": 2,
+                "k_slices": 4,
+                "single_buffer": 1,
                 "swizzle": 8,
                 "bits": 256
             }
@@ -2500,10 +2500,10 @@
             "config": {
                 "warps_m": 2,
                 "warps_n": 2,
-                "warp_tile_m": 4,
+                "warp_tile_m": 2,
                 "warp_tile_n": 2,
                 "k_slices": 4,
-                "single_buffer": 0,
+                "single_buffer": 1,
                 "swizzle": 4,
                 "bits": 128
             }
@@ -2586,14 +2586,14 @@
                 "C": "row_major"
             },
             "config": {
-                "warps_m": 2,
+                "warps_m": 1,
                 "warps_n": 4,
                 "warp_tile_m": 4,
-                "warp_tile_n": 4,
-                "k_slices": 2,
-                "single_buffer": 0,
+                "warp_tile_n": 2,
+                "k_slices": 4,
+                "single_buffer": 1,
                 "swizzle": 8,
-                "bits": 128
+                "bits": 256
             }
         },
         {
@@ -2609,8 +2609,8 @@
             },
             "config": {
                 "warps_m": 1,
-                "warps_n": 2,
-                "warp_tile_m": 3,
+                "warps_n": 4,
+                "warp_tile_m": 6,
                 "warp_tile_n": 2,
                 "k_slices": 4,
                 "single_buffer": 1,
@@ -2652,14 +2652,14 @@
                 "C": "row_major"
             },
             "config": {
-                "warps_m": 1,
-                "warps_n": 2,
+                "warps_m": 2,
+                "warps_n": 1,
                 "warp_tile_m": 3,
                 "warp_tile_n": 3,
                 "k_slices": 4,
                 "single_buffer": 1,
-                "swizzle": 4,
-                "bits": 128
+                "swizzle": 8,
+                "bits": 256
             }
         },
         {
@@ -2674,14 +2674,14 @@
                 "C": "row_major"
             },
             "config": {
-                "warps_m": 4,
+                "warps_m": 2,
                 "warps_n": 2,
                 "warp_tile_m": 4,
-                "warp_tile_n": 4,
-                "k_slices": 2,
-                "single_buffer": 0,
-                "swizzle": 4,
-                "bits": 128
+                "warp_tile_n": 3,
+                "k_slices": 4,
+                "single_buffer": 1,
+                "swizzle": 8,
+                "bits": 256
             }
         },
         {
@@ -2696,14 +2696,14 @@
                 "C": "row_major"
             },
             "config": {
-                "warps_m": 4,
-                "warps_n": 2,
-                "warp_tile_m": 2,
-                "warp_tile_n": 4,
-                "k_slices": 2,
+                "warps_m": 2,
+                "warps_n": 4,
+                "warp_tile_m": 4,
+                "warp_tile_n": 2,
+                "k_slices": 4,
                 "single_buffer": 1,
-                "swizzle": 8,
-                "bits": 128
+                "swizzle": 4,
+                "bits": 256
             }
         },
         {
@@ -2784,14 +2784,14 @@
                 "C": "row_major"
             },
             "config": {
-                "warps_m": 2,
-                "warps_n": 2,
+                "warps_m": 1,
+                "warps_n": 4,
                 "warp_tile_m": 4,
-                "warp_tile_n": 4,
-                "k_slices": 2,
+                "warp_tile_n": 2,
+                "k_slices": 4,
                 "single_buffer": 1,
                 "swizzle": 8,
-                "bits": 128
+                "bits": 256
             }
         },
         {
@@ -2806,13 +2806,13 @@
                 "C": "row_major"
             },
             "config": {
-                "warps_m": 4,
-                "warps_n": 1,
-                "warp_tile_m": 2,
-                "warp_tile_n": 8,
+                "warps_m": 1,
+                "warps_n": 2,
+                "warp_tile_m": 3,
+                "warp_tile_n": 2,
                 "k_slices": 4,
                 "single_buffer": 1,
-                "swizzle": 8,
+                "swizzle": 4,
                 "bits": 256
             }
         },
@@ -2857,6 +2857,116 @@
                 "k_slices": 4,
                 "single_buffer": 1,
                 "swizzle": 8,
+                "bits": 256
+            }
+        },
+        {
+            "range": {
+                "M": 512,
+                "N": 1024,
+                "K": 5120
+            },
+            "layout": {
+                "A": "row_major",
+                "B": "col_major",
+                "C": "row_major"
+            },
+            "config": {
+                "warps_m": 2,
+                "warps_n": 2,
+                "warp_tile_m": 2,
+                "warp_tile_n": 2,
+                "k_slices": 4,
+                "single_buffer": 1,
+                "swizzle": 4,
+                "bits": 128
+            }
+        },
+        {
+            "range": {
+                "M": 512,
+                "N": 4608,
+                "K": 5120
+            },
+            "layout": {
+                "A": "row_major",
+                "B": "col_major",
+                "C": "row_major"
+            },
+            "config": {
+                "warps_m": 2,
+                "warps_n": 2,
+                "warp_tile_m": 4,
+                "warp_tile_n": 4,
+                "k_slices": 2,
+                "single_buffer": 1,
+                "swizzle": 8,
+                "bits": 128
+            }
+        },
+        {
+            "range": {
+                "M": 512,
+                "N": 5120,
+                "K": 6144
+            },
+            "layout": {
+                "A": "row_major",
+                "B": "col_major",
+                "C": "row_major"
+            },
+            "config": {
+                "warps_m": 2,
+                "warps_n": 2,
+                "warp_tile_m": 4,
+                "warp_tile_n": 4,
+                "k_slices": 2,
+                "single_buffer": 1,
+                "swizzle": 8,
+                "bits": 128
+            }
+        },
+        {
+            "range": {
+                "M": 512,
+                "N": 6144,
+                "K": 5120
+            },
+            "layout": {
+                "A": "row_major",
+                "B": "col_major",
+                "C": "row_major"
+            },
+            "config": {
+                "warps_m": 2,
+                "warps_n": 4,
+                "warp_tile_m": 2,
+                "warp_tile_n": 2,
+                "k_slices": 4,
+                "single_buffer": 1,
+                "swizzle": 4,
+                "bits": 256
+            }
+        },
+        {
+            "range": {
+                "M": 512,
+                "N": 6400,
+                "K": 5120
+            },
+            "layout": {
+                "A": "row_major",
+                "B": "col_major",
+                "C": "row_major"
+            },
+            "config": {
+                "warps_m": 2,
+                "warps_n": 4,
+                "warp_tile_m": 2,
+                "warp_tile_n": 2,
+                "k_slices": 4,
+                "single_buffer": 1,
+                "swizzle": 4,
                 "bits": 256
             }
         }
