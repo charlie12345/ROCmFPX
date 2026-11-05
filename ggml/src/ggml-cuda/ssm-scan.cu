@@ -70,8 +70,8 @@ __global__ void __launch_bounds__(splitD, 1)
     float regA[N];
     float regs0[N];
 
-    __shared__ float smemB[N];
-    __shared__ float smemC[N];
+    __shared__ __align__(16) float smemB[N];
+    __shared__ __align__(16) float smemC[N];
 
 #ifdef USE_CUB
     using BlockLoad = cub::BlockLoad<float, splitD, N, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
@@ -434,7 +434,7 @@ __global__ void ssm_ssd_prepare_dt_kernel(
     }
 #else
     // Fallback: sequential prefix scan in shared memory, one slab at a time.
-    __shared__ float sdata[BLOCK_SIZE];
+    __shared__ __align__(16) float sdata[BLOCK_SIZE];
     float running = 0.0f;
     for (int i = 0; i < items_per_thread; i++) {
         const int t = i * BLOCK_SIZE + threadIdx.x;

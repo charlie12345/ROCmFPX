@@ -36,8 +36,8 @@ static __global__ __launch_bounds__(128) void qsa_decode_partial(
         sum = sum*alpha + weight;
         mx = next;
     }
-    __shared__ float values[4][256];
-    __shared__ float maxima[4], sums[4];
+    __shared__ __align__(16) float values[4][256];
+    __shared__ __align__(16) float maxima[4], sums[4];
 #pragma unroll
     for (int d = 0; d < 8; ++d) { values[warp][lane + d*32] = acc[d]; }
     if (lane == 0) { maxima[warp] = mx; sums[warp] = sum; }

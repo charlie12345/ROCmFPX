@@ -81,7 +81,7 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
     const int64_t local_n_t = min(split_n_t, n_t - bidz * split_n_t);
     const int     n_cols    = d_conv - 1 + split_n_t;
 
-    extern __shared__ float smem[];
+    extern __shared__ __align__(16) float smem[];
 
     constexpr int load_cols   = d_conv - 1 + split_n_t;
     constexpr int total_elems = split_d_inner * load_cols;

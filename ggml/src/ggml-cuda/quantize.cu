@@ -164,7 +164,7 @@ static __global__ void quantize_mmq_nvfp4(
 
     amax = warp_reduce_max<WARP_SIZE>(amax);
 
-    __shared__ float warp_amax[CUDA_QUANTIZE_BLOCK_SIZE_MMQ / WARP_SIZE];
+    __shared__ __align__(16) float warp_amax[CUDA_QUANTIZE_BLOCK_SIZE_MMQ / WARP_SIZE];
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
 

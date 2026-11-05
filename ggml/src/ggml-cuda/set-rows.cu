@@ -183,8 +183,8 @@ static __global__ void k_set_rows_turbo3(
         const uint3   ne11_fd,
         const uint3   ne12_fd) {
 
-    __shared__ float smem[TURBO_HEAD_DIM_SR];
-    __shared__ float reduction[TURBO_HEAD_DIM_SR];
+    __shared__ __align__(16) float smem[TURBO_HEAD_DIM_SR];
+    __shared__ __align__(16) float reduction[TURBO_HEAD_DIM_SR];
 
     const int64_t chunk_global = blockIdx.x;
     const int tid = threadIdx.x;  // 0..127
@@ -327,8 +327,8 @@ static __global__ void k_set_rows_turbo4(
         const uint3   ne11_fd,
         const uint3   ne12_fd) {
 
-    __shared__ float smem[TURBO_HEAD_DIM_SR];
-    __shared__ float reduction[TURBO_HEAD_DIM_SR];
+    __shared__ __align__(16) float smem[TURBO_HEAD_DIM_SR];
+    __shared__ __align__(16) float reduction[TURBO_HEAD_DIM_SR];
 
     const int64_t chunk_global = blockIdx.x;
     const int tid = threadIdx.x;  // 0..127

@@ -37,7 +37,7 @@ static __global__ void mm_ids_helper(
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
     const int expert = blockIdx.x;
 
-    extern __shared__ char data_mm_ids_helper[];
+    extern __shared__ __align__(16) char data_mm_ids_helper[];
     mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
 
     int nex_prev   = 0; // Number of columns for experts with a lower index.
@@ -219,9 +219,9 @@ static constexpr int MM_IDS_ROUTE_USED = 10;
 static __global__ void mm_ids_route_sort(
         const int32_t * ids, uint32_t * sorted, int32_t * offsets, int32_t * starts,
         int routes, int chunks, int ids_stride) {
-    __shared__ uint32_t keys[MM_IDS_ROUTE_TILE];
-    __shared__ int first[MM_IDS_ROUTE_EXPERTS];
-    __shared__ int counts[MM_IDS_ROUTE_EXPERTS];
+    __shared__ __align__(16) uint32_t keys[MM_IDS_ROUTE_TILE];
+    __shared__ __align__(16) int first[MM_IDS_ROUTE_EXPERTS];
+    __shared__ __align__(16) int counts[MM_IDS_ROUTE_EXPERTS];
     const int chunk=blockIdx.x;
     for (int i=threadIdx.x;i<MM_IDS_ROUTE_EXPERTS;i+=blockDim.x) {
         first[i]=0;counts[i]=0;
@@ -273,7 +273,7 @@ static __global__ void mm_ids_route_sort(
 }
 
 static __global__ void mm_ids_route_prefix(int32_t * offsets, int32_t * bounds, int chunks) {
-    __shared__ int totals[MM_IDS_ROUTE_EXPERTS];
+    __shared__ __align__(16) int totals[MM_IDS_ROUTE_EXPERTS];
     const int expert=threadIdx.x;
     int total=0;
     for (int chunk=0;chunk<chunks;++chunk) total+=offsets[chunk*MM_IDS_ROUTE_EXPERTS+expert];

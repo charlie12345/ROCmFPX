@@ -9,7 +9,7 @@ static __global__ void norm_f32(
     const int row   = blockIdx.x;
     const int tid   = threadIdx.x;
 
-    extern __shared__ float2 s_sum2[];
+    extern __shared__ __align__(16) float2 s_sum2[];
 
     ggml_cuda_pdl_sync();
 
@@ -60,7 +60,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
         tmp += x[j];
     }
 
-    extern __shared__ float s_sum[];
+    extern __shared__ __align__(16) float s_sum[];
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
 
     const float mean = tmp / group_size;
@@ -116,7 +116,7 @@ static __global__ void rms_norm_f32(const float * x,
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
     static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
 
-    extern __shared__ float s_sum[];
+    extern __shared__ __align__(16) float s_sum[];
 
     ggml_cuda_pdl_sync();
 
@@ -254,8 +254,8 @@ static __global__ void rms_norm_back_f32(
     sum_xg = warp_reduce_sum(sum_xg);
     if constexpr (block_size > WARP_SIZE) {
         static_assert(block_size == 1024, "unexpected block_size");
-        __shared__ float s_sum_xx[32];
-        __shared__ float s_sum_xg[32];
+        __shared__ __align__(16) float s_sum_xx[32];
+        __shared__ __align__(16) float s_sum_xg[32];
         const int warp_id = threadIdx.x / WARP_SIZE;
         const int lane_id = threadIdx.x % WARP_SIZE;
         if (lane_id == 0) {
@@ -324,7 +324,7 @@ static __global__ void l2_norm_f32(
     const int row   = blockIdx.x;
     const int tid   = threadIdx.x;
 
-    extern __shared__ float s_sum[];
+    extern __shared__ __align__(16) float s_sum[];
 
     ggml_cuda_pdl_sync();
 

@@ -97,7 +97,7 @@ static __global__ void cumsum_kernel(
     const int warp = tid / warp_size;
     const int warps_per_block = blockDim.x / warp_size;
 
-    extern __shared__ float smem[];
+    extern __shared__ __align__(16) float smem[];
     float *                 s_vals        = smem;
     float *                 s_warp_sums   = smem + blockDim.x;
     float *                 s_carry       = smem + blockDim.x + warps_per_block;

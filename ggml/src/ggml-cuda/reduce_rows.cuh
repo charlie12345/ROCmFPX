@@ -27,7 +27,7 @@ static __device__ __forceinline__ float reduce_row_f32(const float * x, const in
     }
 
     // sum up partial sums
-    __shared__ float shared_vals[32];
+    __shared__ __align__(16) float shared_vals[32];
     sum = block_reduce<block_reduce_method::SUM>(sum, shared_vals);
 
     return sum;

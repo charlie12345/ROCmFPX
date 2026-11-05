@@ -47,8 +47,8 @@ static __global__ void lightning_indexer_kernel_wmma(
 
     // phase 1 - load weights and first Q tile to shared memory
 
-    __shared__ float w_shared[N_HEAD];
-    __shared__ int2  q_shared_h[HEADS_PER_INNER_LOOP][N_EMBD_PADDED / 4];
+    __shared__ __align__(16) float w_shared[N_HEAD];
+    __shared__ __align__(16) int2  q_shared_h[HEADS_PER_INNER_LOOP][N_EMBD_PADDED / 4];
 
     if (tid < N_HEAD) {
         w_shared[tid] = w_base[tid];
@@ -72,7 +72,7 @@ static __global__ void lightning_indexer_kernel_wmma(
 
     // phase 2 - load (and dequantize if needed) K to shared mem
 
-    __shared__ half2 k_shared_h[K_VECS_PER_BLOCK][N_EMBD_PADDED / 4][2];
+    __shared__ __align__(16) half2 k_shared_h[K_VECS_PER_BLOCK][N_EMBD_PADDED / 4][2];
 
     constexpr int n_k = K_VECS_PER_BLOCK * (N_EMBD / 4);
 
@@ -109,7 +109,7 @@ static __global__ void lightning_indexer_kernel_wmma(
 
     // phase 3 - calculate lightning indexer scores
 
-    __shared__ float qk_shared[WARPS_PER_BLOCK][HEADS_PER_INNER_LOOP][K_VECS_PER_BLOCK];
+    __shared__ __align__(16) float qk_shared[WARPS_PER_BLOCK][HEADS_PER_INNER_LOOP][K_VECS_PER_BLOCK];
 
     // load K fragment
     wmma::fragment<wmma::matrix_b, HEADS_PER_INNER_LOOP, K_VECS_PER_BLOCK, K_EMBD_PER_INNER_LOOP, half, wmma::col_major> frag_k;
@@ -319,8 +319,8 @@ static __global__ void lightning_indexer_kernel_vec(
     for (int i_head_0 = 0; i_head_0 < N_HEAD; i_head_0 += N_HEAD_INNER) {
         // phase 2 - load weights and Q to shared memory
 
-        __shared__ float  w_shared[N_HEAD_INNER];
-        __shared__ float4 q_shared_f[N_HEAD_INNER][N_EMBD / 4];
+        __shared__ __align__(16) float  w_shared[N_HEAD_INNER];
+        __shared__ __align__(16) float4 q_shared_f[N_HEAD_INNER][N_EMBD / 4];
 
         if (tid < N_HEAD_INNER) {
             w_shared[tid] = w_base[i_head_0 + tid];
@@ -371,7 +371,7 @@ static __global__ void lightning_indexer_kernel_vec(
 
     // phase 4 - store outputs to shared memory
 
-    __shared__ float dst_shared[K_VECS_PER_BLOCK];
+    __shared__ __align__(16) float dst_shared[K_VECS_PER_BLOCK];
 
     if (i_lane == 0) {
 #pragma unroll
@@ -427,9 +427,9 @@ static __global__ void lightning_indexer_kernel_tile(
     const int i_stream    = blockIdx.z;
 
     // the row padding keeps the keys of consecutive threads in distinct banks
-    __shared__ half2 k_shared[K_VECS_PER_BLOCK][N_EMBD_H2 + 1];
-    __shared__ float2 q_shared[HEADS_PER_PASS][TOKENS_PER_BLOCK][N_EMBD_H2];
-    __shared__ float w_shared[N_HEAD][TOKENS_PER_BLOCK];
+    __shared__ __align__(16) half2 k_shared[K_VECS_PER_BLOCK][N_EMBD_H2 + 1];
+    __shared__ __align__(16) float2 q_shared[HEADS_PER_PASS][TOKENS_PER_BLOCK][N_EMBD_H2];
+    __shared__ __align__(16) float w_shared[N_HEAD][TOKENS_PER_BLOCK];
 
     // phase 1 - stage the key tile four elements at a time, rows past n_kv are zero
 
@@ -810,7 +810,7 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
     using C=tile<16,16,float,DATA_LAYOUT_J_MAJOR>;
     const int warp=threadIdx.y,lane=threadIdx.x,tid=warp*32+lane;
     const int qfirst=int(blockIdx.y)*16,kfirst=int(blockIdx.x)*64,stream=blockIdx.z;
-    __shared__ half2 query_tile[16][260];
+    __shared__ __align__(16) half2 query_tile[16][260];
 #pragma unroll 1
     for(int i=tid;i<16*128;i+=128) {
         const int row=i/128,col=4*(i%128),token=qfirst+row;

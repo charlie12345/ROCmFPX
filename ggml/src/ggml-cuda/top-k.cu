@@ -81,12 +81,12 @@ static __global__ void top_k_nary_search_cuda(
     const int warp = tid / warpSize;
     const int warp_count = BLOCK_SIZE / warpSize;
 
-    __shared__ int2 candidates[BLOCK_SIZE];
-    __shared__ uint32_t counts[64];
+    __shared__ __align__(16) int2 candidates[BLOCK_SIZE];
+    __shared__ __align__(16) uint32_t counts[64];
     __shared__ uint32_t selected_bucket;
     __shared__ uint32_t selected_total;
-    __shared__ uint32_t warp_offsets[32];
-    __shared__ uint32_t warp_equal_offsets[32];
+    __shared__ __align__(16) uint32_t warp_offsets[32];
+    __shared__ __align__(16) uint32_t warp_equal_offsets[32];
 
     for (int row = blockIdx.y; row < nrows; row += gridDim.y) {
         const int col = blockIdx.x * BLOCK_SIZE + tid;
@@ -294,7 +294,7 @@ static __global__ void top_k_one_first_cuda(const float * __restrict__ src,
                                             int ncols_output,
                                             int nrows) {
     const int tid = threadIdx.x;
-    __shared__ int2 candidates[USE_SHUFFLE ? BLOCK_SIZE / 32 : BLOCK_SIZE];
+    __shared__ __align__(16) int2 candidates[USE_SHUFFLE ? BLOCK_SIZE / 32 : BLOCK_SIZE];
 
     for (int row = blockIdx.y; row < nrows; row += gridDim.y) {
         const int col   = blockIdx.x * (ITEMS_PER_THREAD * BLOCK_SIZE) + tid;
@@ -325,7 +325,7 @@ static __global__ void top_k_one_first_last_cuda(const float * __restrict__ src,
                                                  int ncols_input,
                                                  int nrows) {
     const int tid = threadIdx.x;
-    __shared__ int2 candidates[USE_SHUFFLE ? BLOCK_SIZE / 32 : BLOCK_SIZE];
+    __shared__ __align__(16) int2 candidates[USE_SHUFFLE ? BLOCK_SIZE / 32 : BLOCK_SIZE];
 
     for (int row = blockIdx.y; row < nrows; row += gridDim.y) {
         const int col   = blockIdx.x * (ITEMS_PER_THREAD * BLOCK_SIZE) + tid;
@@ -357,7 +357,7 @@ static __global__ void top_k_one_middle_cuda(const int2 * __restrict__ src_pairs
                                              int ncols_output,
                                              int nrows) {
     const int tid = threadIdx.x;
-    __shared__ int2 candidates[USE_SHUFFLE ? BLOCK_SIZE / 32 : BLOCK_SIZE];
+    __shared__ __align__(16) int2 candidates[USE_SHUFFLE ? BLOCK_SIZE / 32 : BLOCK_SIZE];
 
     for (int row = blockIdx.y; row < nrows; row += gridDim.y) {
         const int col   = blockIdx.x * (ITEMS_PER_THREAD * BLOCK_SIZE) + tid;
@@ -388,7 +388,7 @@ static __global__ void top_k_one_last_cuda(const int2 * __restrict__ src_pairs,
                                            int ncols_input,
                                            int nrows) {
     const int tid = threadIdx.x;
-    __shared__ int2 candidates[USE_SHUFFLE ? BLOCK_SIZE / 32 : BLOCK_SIZE];
+    __shared__ __align__(16) int2 candidates[USE_SHUFFLE ? BLOCK_SIZE / 32 : BLOCK_SIZE];
 
     for (int row = blockIdx.y; row < nrows; row += gridDim.y) {
         const int col   = blockIdx.x * (ITEMS_PER_THREAD * BLOCK_SIZE) + tid;
@@ -419,7 +419,7 @@ static __device__ void top_k_gather_equal(
     const int lane = tid % warpSize;
     const int warp = tid / warpSize;
     const int nwarps = BLOCK_SIZE / warpSize;
-    __shared__ int warp_counts[32];
+    __shared__ __align__(16) int warp_counts[32];
     int count = 0;
 
     for (int base = 0; base < ncols && count < limit; base += BLOCK_SIZE) {
@@ -457,7 +457,7 @@ static __global__ void top_k_radix_select_cuda(
     constexpr int RADIX_SIZE = 1 << RADIX_BITS;
 
     const int tid = threadIdx.x;
-    __shared__ uint32_t histogram[RADIX_SIZE];
+    __shared__ __align__(16) uint32_t histogram[RADIX_SIZE];
     __shared__ uint32_t selected_bucket;
     __shared__ uint32_t count_above;
     __shared__ uint32_t output_count;
@@ -831,7 +831,7 @@ static __global__ void top_k_parallel_radix_histogram(
     const int row_block = blockIdx.x % blocks_per_row;
     const int tid = threadIdx.x;
     const float * row_src = src + (size_t) row * ncols;
-    __shared__ int histogram[NBINS];
+    __shared__ __align__(16) int histogram[NBINS];
 
     histogram[tid] = 0;
     __syncthreads();
@@ -862,7 +862,7 @@ static __global__ void top_k_parallel_radix_select(
 
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-    __shared__ int histogram[NBINS];
+    __shared__ __align__(16) int histogram[NBINS];
 
     int count = 0;
     for (int row_block = 0; row_block < blocks_per_row; ++row_block) {

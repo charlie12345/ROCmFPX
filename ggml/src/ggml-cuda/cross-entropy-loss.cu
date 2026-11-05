@@ -8,7 +8,7 @@
 template <bool use_shared>
 static __global__ void cross_entropy_loss_f32(
         const float * __restrict__ logits, const float * __restrict__ labels, float * __restrict__ dst, const int nclasses, const int k) {
-    extern __shared__ float tmp[];
+    extern __shared__ __align__(16) float tmp[];
 
     logits += int64_t(blockIdx.x)*nclasses;
     labels += int64_t(blockIdx.x)*nclasses;
@@ -53,7 +53,7 @@ template <bool use_shared>
 static __global__ void cross_entropy_loss_back_f32(
         const float * __restrict__ grad, const float * __restrict__ logits, const float * __restrict__ labels,
         float * __restrict__ dst, const int nclasses) {
-    extern __shared__ float tmp[];
+    extern __shared__ __align__(16) float tmp[];
 
     logits += int64_t(blockIdx.x)*nclasses;
     labels += int64_t(blockIdx.x)*nclasses;

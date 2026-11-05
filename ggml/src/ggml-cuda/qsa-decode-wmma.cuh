@@ -28,7 +28,7 @@ static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
         float4 scores[8][64];
     } shared;
     __shared__ __align__(16) uint16_t probabilities[16][16];
-    __shared__ float alpha_s[16];
+    __shared__ __align__(16) float alpha_s[16];
     qd_half16 qf[2];
     const _Float16 hs = (_Float16) scale;
     for (int j = lane; j < 16*32; j += 32) {

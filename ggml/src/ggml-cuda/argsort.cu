@@ -203,7 +203,7 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
     const int row = blockIdx.x;
 
     const float * x_row = x + row * ncols;
-    extern __shared__ int dst_row[];
+    extern __shared__ __align__(16) int dst_row[];
 
     // initialize indices
     for (int col = threadIdx.x; col < ncols_pad; col += blockDim.x) {

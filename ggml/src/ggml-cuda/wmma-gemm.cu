@@ -127,7 +127,7 @@ static __global__ void fp8_e4m3_emulate_rows(half * __restrict__ x, const float 
     for (int64_t i = threadIdx.x; i < ncols; i += nthreads) {
         amax = fmaxf(amax, fabsf(rowf ? rowf[i] : __half2float(row[i])));
     }
-    __shared__ float smax[nthreads/WARP_SIZE];
+    __shared__ __align__(16) float smax[nthreads/WARP_SIZE];
     amax = warp_reduce_max(amax);
     if (threadIdx.x % WARP_SIZE == 0) {
         smax[threadIdx.x / WARP_SIZE] = amax;
@@ -209,7 +209,7 @@ static __global__ void fp8_e4m3_quantize_rows(const T * __restrict__ x, uint8_t 
     for (int64_t i = threadIdx.x; i < ncols; i += nthreads) {
         amax = fmaxf(amax, fabsf(fp8_gemm_to_float(row[i])));
     }
-    __shared__ float smax[nthreads/WARP_SIZE];
+    __shared__ __align__(16) float smax[nthreads/WARP_SIZE];
     amax = warp_reduce_max(amax);
     if (threadIdx.x % WARP_SIZE == 0) {
         smax[threadIdx.x / WARP_SIZE] = amax;
@@ -290,8 +290,8 @@ fp8_gemm_tn(const uint8_t * __restrict__ A, const uint8_t * __restrict__ B, cons
     static_assert(BM*KC % NT == 0 && BN*KC % NT == 0, "tile loads must split evenly over the threads");
     static_assert(BK % 32 == 0 && FM > 0 && FN > 0, "bad tile");
 
-    __shared__ __attribute__((aligned(16))) uint8_t As[BM*LDS_K];
-    __shared__ __attribute__((aligned(16))) uint8_t Bs[BN*LDS_K];
+    __shared__ __align__(16) __attribute__((aligned(16))) uint8_t As[BM*LDS_K];
+    __shared__ __align__(16) __attribute__((aligned(16))) uint8_t Bs[BN*LDS_K];
 
     // tiles in bands of GROUP tile rows: blocks that run at the same time read the same strips of A and B
     constexpr int GROUP = 8;

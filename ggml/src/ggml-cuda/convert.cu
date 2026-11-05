@@ -74,7 +74,7 @@ static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, h
     const int * x0 = ((int *) vx) + blockIdx.x * nint;
     half2 * y2 = (half2 *) (y + i0);
 
-    __shared__ int vals[nint];
+    __shared__ __align__(16) int vals[nint];
 
 #pragma unroll
     for (int ix0 = 0; ix0 < nint; ix0 += WARP_SIZE) {
@@ -530,7 +530,7 @@ static void dequantize_row_nvfp4_cuda(
 
 template <typename dst_t>
 static __global__ void dequantize_block_turbo3_0_kernel(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
-    __shared__ float smem[TURBO_HEAD_DIM_GPU];
+    __shared__ __align__(16) float smem[TURBO_HEAD_DIM_GPU];
 
     const int64_t chunk_idx = blockIdx.x;
     const int tid = threadIdx.x;  // 0..127
@@ -593,7 +593,7 @@ static void dequantize_row_turbo3_0_cuda(const void * vx, dst_t * y, const int64
 
 template <typename dst_t>
 static __global__ void dequantize_block_turbo4_0_kernel(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
-    __shared__ float smem[TURBO_HEAD_DIM_GPU];
+    __shared__ __align__(16) float smem[TURBO_HEAD_DIM_GPU];
 
     const int64_t chunk_idx = blockIdx.x;
     const int tid = threadIdx.x;  // 0..127

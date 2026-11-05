@@ -118,7 +118,7 @@ static __global__ void solve_tri_f32_fast(const float * __restrict__ A,
     const float * const B_batch = (const float *) (B + i02 * nb12 + i03 * nb13);
     float *             X_batch = (float *) (X + i02 * nb2 + i03 * nb3);
 
-    __shared__ float sA[MAX_N_FAST * MAX_N_FAST];
+    __shared__ __align__(16) float sA[MAX_N_FAST * MAX_N_FAST];
 
     const int offset = threadIdx.x + threadIdx.y * blockDim.x;
 

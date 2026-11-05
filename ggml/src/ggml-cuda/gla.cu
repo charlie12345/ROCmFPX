@@ -14,7 +14,7 @@ static __global__ void gated_linear_attn_f32(const int B, const int T, const int
     const int n_seq_tokens = T / B;
 
     float state[head_size];
-    __shared__ float _k[head_size], _r[head_size], _td[head_size];
+    __shared__ __align__(16) float _k[head_size], _r[head_size], _td[head_size];
 
     #pragma unroll
     for (int i = 0; i < head_size; i++) {

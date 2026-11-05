@@ -347,11 +347,11 @@ gated_delta_net_tiled_cuda(const float * q,
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of the warp size");
     static_assert(S_v % block_cols == 0, "block columns must divide S_v");
 
-    __shared__ float q_shared[TOKEN_TILE][S_v];
-    __shared__ float k_shared[TOKEN_TILE][S_v];
-    __shared__ float v_shared[TOKEN_TILE][block_cols];
-    __shared__ float g_shared[TOKEN_TILE];
-    __shared__ float beta_shared[TOKEN_TILE];
+    __shared__ __align__(16) float q_shared[TOKEN_TILE][S_v];
+    __shared__ __align__(16) float k_shared[TOKEN_TILE][S_v];
+    __shared__ __align__(16) float v_shared[TOKEN_TILE][block_cols];
+    __shared__ __align__(16) float g_shared[TOKEN_TILE];
+    __shared__ __align__(16) float beta_shared[TOKEN_TILE];
 
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
@@ -531,9 +531,9 @@ __global__ void __launch_bounds__(256, 1) gdn_chunk_fused(const gdn_chunk_args p
     __shared__ __align__(16) float kf[C][DP];
     __shared__ __align__(16) float qf[C][DP];
     __shared__ __align__(16) float vq[C][NP];       // v slice
-    __shared__ float as[C][C + 1], ms[C][C + 1], ts[C][C + 1];
-    __shared__ float uf[C][NC + 1];
-    __shared__ float gcs[C], bts[C], bas[C];
+    __shared__ __align__(16) float as[C][C + 1], ms[C][C + 1], ts[C][C + 1];
+    __shared__ __align__(16) float uf[C][NC + 1];
+    __shared__ __align__(16) float gcs[C], bts[C], bas[C];
     __shared__ __align__(16) _Float16 wh[C][DH];
     __shared__ __align__(16) _Float16 qh[C][DH];
     __shared__ __align__(16) _Float16 kdt[D][CH];

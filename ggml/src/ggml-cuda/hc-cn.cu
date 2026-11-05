@@ -41,7 +41,7 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
         float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32,
         const uint16_t * res_in_bf16, uint16_t * res_out_bf16, const uint16_t * blk_in_bf16,
         const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps) {
-    __shared__ float s_sum[32];
+    __shared__ __align__(16) float s_sum[32];
 
     const int c   = blockIdx.x;   // stream
     const int t   = blockIdx.y;   // token
@@ -109,7 +109,7 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
         const uint16_t * res_in_bf16, uint16_t * res_out_bf16, const uint16_t * blk_in_bf16,
         block_q8_1_mmq * out_xn_q8,
         const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps) {
-    __shared__ float s_sum[32];
+    __shared__ __align__(16) float s_sum[32];
     const int c = blockIdx.x, t = blockIdx.y, hc = gridDim.x, tid = threadIdx.x;
     const float x1 = s1 * inject[(int64_t) t * hc + c] + b1;
     const float x2 = hc_sigmoid(x1);

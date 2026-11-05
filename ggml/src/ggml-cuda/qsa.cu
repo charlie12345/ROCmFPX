@@ -35,7 +35,7 @@ static __device__ __forceinline__ A qsa_wmma_f16(const V a, const V b, const A c
 
 __global__ __launch_bounds__(256) void qsa3_rows_kernel(
         const int * __restrict__ ids, const size_t i1, const int ns, const int nk, int * __restrict__ srow, int * __restrict__ sflag) {
-    extern __shared__ int ent[];
+    extern __shared__ __align__(16) int ent[];
     __shared__ int unsorted;
     const int q = blockIdx.x, tid = threadIdx.x;
     const int * row = reinterpret_cast<const int *>(reinterpret_cast<const char *>(ids) + (size_t) q * i1);
@@ -69,8 +69,8 @@ __global__ __launch_bounds__(QSA3_MERGE_LANES) void qsa3_merge_kernel(
         const int * __restrict__ ids, const size_t i1, const int n_q, const int ns, const int nk,
         const int * __restrict__ srow, const int * __restrict__ sflag,
         uint16_t * __restrict__ ublk, uint16_t * __restrict__ umask, int * __restrict__ ucount, const int cap) {
-    extern __shared__ int rows_s[];
-    __shared__ int scan_s[QSA3_MERGE_LANES];
+    extern __shared__ __align__(16) int rows_s[];
+    __shared__ __align__(16) int scan_s[QSA3_MERGE_LANES];
     const int lane = threadIdx.x;
     const int g = blockIdx.x;
 #pragma unroll
@@ -193,10 +193,10 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         const int * __restrict__ ucount, float * __restrict__ out, const qsa3_layout s) {
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, r = lane & 15, hi = lane >> 4;
     const int g = blockIdx.x, kvh = blockIdx.y;
-    __shared__ float4 part[3][8][64];
-    __shared__ uint4  ptile[3][32];
-    __shared__ float  alpha_s[48];
-    __shared__ float  l_s[48];
+    __shared__ __align__(16) float4 part[3][8][64];
+    __shared__ __align__(16) uint4  ptile[3][32];
+    __shared__ __align__(16) float  alpha_s[48];
+    __shared__ __align__(16) float  l_s[48];
 
     const size_t nblk = (size_t) s.nk / 4;
     const uint16_t * pkg = pk + (size_t) kvh * nblk * 1024;

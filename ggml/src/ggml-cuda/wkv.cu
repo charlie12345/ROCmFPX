@@ -13,7 +13,7 @@ static __global__ void rwkv_wkv_f32(const int B, const int T, const int C, const
     const int n_seq_tokens = T / B;
 
     float state[head_size];
-    __shared__ float _k[head_size], _r[head_size], _tf[head_size], _td[head_size];
+    __shared__ __align__(16) float _k[head_size], _r[head_size], _tf[head_size], _td[head_size];
 
     #pragma unroll
     for (int i = 0; i < head_size; i++) {
@@ -77,7 +77,7 @@ static __global__ void rwkv_wkv7_f32(const int B, const int T, const int C, cons
     const int n_seq_tokens = T / B;
 
     float state[head_size];
-    __shared__ float _r[head_size], _w[head_size], _k[head_size], _a[head_size], _b[head_size];
+    __shared__ __align__(16) float _r[head_size], _w[head_size], _k[head_size], _a[head_size], _b[head_size];
 
     #pragma unroll
     for (int i = 0; i < head_size; i++) {
@@ -155,7 +155,7 @@ rwkv_wkv7_f32_t1_warp_row(const int T, const int C, const int H, const float * r
     const int head_off = head_i * head_size;
     const int t = batch_i * C + head_off + row;
 
-    __shared__ float _r[head_size], _w[head_size], _k[head_size], _a[head_size], _b[head_size];
+    __shared__ __align__(16) float _r[head_size], _w[head_size], _k[head_size], _a[head_size], _b[head_size];
 
     if (threadIdx.y == 0) {
         _r[lane] = r[batch_i * C + head_off + lane];

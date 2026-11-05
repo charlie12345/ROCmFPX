@@ -35,8 +35,8 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
     const int warp_id = threadIdx.x / WARP_SIZE;
     if (n_warps > 1) {
         constexpr int    max_warps = 1024 / WARP_SIZE;
-        __shared__ float shared_maxval[max_warps];
-        __shared__ int   shared_argmax[max_warps];
+        __shared__ __align__(16) float shared_maxval[max_warps];
+        __shared__ __align__(16) int   shared_argmax[max_warps];
         if (lane_id == 0) {
             shared_maxval[warp_id] = maxval;
             shared_argmax[warp_id] = argmax;

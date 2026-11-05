@@ -1066,7 +1066,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr ggml_cuda_mmq_vec_dot_t    vec_dot    = ggml_cuda_mmq_get_vec_dot<type, J, fallback, prec_src1>();
     constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback, prec_src1, has_fusion>();
 
-    extern __shared__ int data_mul_mat_q[];
+    extern __shared__ __align__(16) int data_mul_mat_q[]; // ROCmFPX [TAG_LDS_ALIGN16]: 16-byte LDS loads under clang 24
     int * tile_y = data_mul_mat_q + J;
     int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
 
@@ -1226,7 +1226,7 @@ static __global__ void mul_mat_q(
     // Initialize the ids for writing back data with just the index.
     // For regular matrix multiplications this is never changed.
     // For MoE the correct indices are loaded from ids_dst.
-    extern __shared__ int ids_dst_shared[]; // Stored at beginning of shared memory.
+    extern __shared__ __align__(16) int ids_dst_shared[]; // Stored at beginning of shared memory.
 #pragma unroll
     for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
         const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
@@ -1516,7 +1516,7 @@ static constexpr bool mmq_rdna3_5_id_n_experts_ok(const int64_t n_experts) {
 template <int J>
 static __global__ void build_mmq_routed_descriptors(
         const int32_t * expert_bounds, uint32_t * descriptors, int n_experts, int max_descriptors) {
-    __shared__ int tile_counts[MMQ_ROUTED_MAX_EXPERTS];
+    __shared__ __align__(16) int tile_counts[MMQ_ROUTED_MAX_EXPERTS];
     const int expert = threadIdx.x;
 
     for (int i = expert; i < max_descriptors; i += blockDim.x) {
@@ -1556,7 +1556,7 @@ static __global__ void mul_mat_q_routed_compact(
     const int wt = blockIdx.z;
     const int it = blockIdx.x;
 
-    extern __shared__ int ids_dst_shared[];
+    extern __shared__ __align__(16) int ids_dst_shared[];
     for (int descriptor_idx = blockIdx.y; descriptor_idx < max_descriptors; descriptor_idx += gridDim.y) {
         const uint32_t descriptor = descriptors[descriptor_idx];
         if (descriptor == UINT32_MAX) {
@@ -1703,7 +1703,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
         return;
     }
 
-    __shared__ int ids_dst_shared[J];
+    __shared__ __align__(16) int ids_dst_shared[J];
     const int col_low  = expert_bounds[zt + 0];
     const int col_high = expert_bounds[zt + 1];
     const int col_diff = col_high - col_low;

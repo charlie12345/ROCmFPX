@@ -93,7 +93,7 @@ static __global__ void concat_transposed_src1_dim0(
         uint64_t nb10, uint64_t nb11, uint64_t nb12,
         uint64_t nb0, uint64_t nb1, uint64_t nb2) {
     constexpr int tile = 32;
-    __shared__ T values[tile][tile + 1];
+    __shared__ __align__(16) T values[tile][tile + 1];
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;

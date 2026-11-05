@@ -72,7 +72,7 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
     constexpr int NE        = N / NT;
     static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
 
-    __shared__ float s[N];
+    __shared__ __align__(16) float s[N];
 
     const int64_t r = blockIdx.x;
     if (r >= n_rows) {

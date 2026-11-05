@@ -662,7 +662,7 @@ mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X, 
 // two tile classes: experts with >= thresh rows get BN_BIG-row tiles, the rest BN_SMALL-row tiles (fewer wasted rows on tiny experts)
 __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t * __restrict__ desc_big, uint32_t * __restrict__ desc_small,
         const int E, const int nbig_max, const int nsmall_max, const int BN_BIG, const int BN_SMALL, const int thresh) {
-    __shared__ int sb[1024], ss[1024];
+    __shared__ __align__(16) int sb[1024], ss[1024];
     const int e = threadIdx.x;
     for (int i = e; i < nbig_max;   i += blockDim.x) desc_big[i]   = UINT32_MAX;
     for (int i = e; i < nsmall_max; i += blockDim.x) desc_small[i] = UINT32_MAX;

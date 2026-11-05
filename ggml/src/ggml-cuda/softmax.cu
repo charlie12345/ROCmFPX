@@ -77,7 +77,7 @@ static __global__ void soft_max_f32(
 
     const float slope = get_alibi_slope(p.max_bias, i02, p.n_head_log2, p.m0, p.m1);
 
-    extern __shared__ float data_soft_max_f32[];
+    extern __shared__ __align__(16) float data_soft_max_f32[];
     float * buf_iw = data_soft_max_f32; // shared memory buffer for inter-warp communication
     // shared memory buffer to cache values between iterations:
     float * vals = use_shared ? buf_iw + WARP_SIZE : dst;
@@ -317,7 +317,7 @@ __launch_bounds__(8*WARP_SIZE, 1) static __global__ void soft_max_f32_paralleliz
 // https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/device-callable-apis.html#grid-synchronization
 // https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/device-callable-apis.html#class-cluster-group
 {
-    __shared__ float shared_vals[2][32];
+    __shared__ __align__(16) float shared_vals[2][32];
 
     for (int rowx = 0; rowx < p.ne01 * p.ne02 * p.ne03; rowx++) {
         soft_max_f32_parallelize_cols_single_row(x + int64_t(rowx) * p.ncols, dst + int64_t(rowx) * p.ncols, tmp_maxs,

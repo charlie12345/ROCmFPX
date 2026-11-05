@@ -60,7 +60,7 @@ static __global__ void hc_mix_reduce_f32_hc4_parallel(
     const int stream = threadIdx.x / 32;
     const int64_t index = int64_t(blockIdx.x) * 32 + lane;
     const int64_t count = n_embd * n_tokens;
-    __shared__ float products[4][32];
+    __shared__ __align__(16) float products[4][32];
     float value = 0.0f;
     if (index < count) {
         const int64_t token = index / n_embd;

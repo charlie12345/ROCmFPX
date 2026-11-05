@@ -727,7 +727,7 @@ static __global__ void rms_norm_mul_rope_f32(
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
 
-    extern __shared__ float s_sum[];
+    extern __shared__ __align__(16) float s_sum[];
 
     ggml_cuda_pdl_sync();
 

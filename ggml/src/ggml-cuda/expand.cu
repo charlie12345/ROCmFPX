@@ -14,7 +14,7 @@ __global__ __launch_bounds__(256) void qsa_expand_complete_blocks_512(
         char * output, char * cast_blocks, char * cast_cells, char * expanded, expand_layout layout) {
     const int query = blockIdx.x;
     const int lane = threadIdx.x;
-    __shared__ int ordered[512];
+    __shared__ __align__(16) int ordered[512];
     const int * selected = reinterpret_cast<const int *>(blocks + query*layout.block_row);
     for (int i = lane; i < 512; i += 256) {
         ordered[i] = selected[i];

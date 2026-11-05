@@ -124,7 +124,7 @@ static __global__ void mul_mat_f(
 
     [[maybe_unused]] const float2 * y2 = (const float2 *) y;
 
-    extern __shared__ char data_mmv[];
+    extern __shared__ __align__(16) char data_mmv[];
 
     char * shmem_base = data_mmv;
     [[maybe_unused]] int * slot_map = (int *) shmem_base;
@@ -395,7 +395,7 @@ static __global__ void mul_mat_f_ids(
 
     const int col_base = tile_idx * cols_per_block;
 
-    extern __shared__ char data_mmv[];
+    extern __shared__ __align__(16) char data_mmv[];
     char * compute_base = data_mmv;
 
     //const float2 * y2 = (const float2 *) y;

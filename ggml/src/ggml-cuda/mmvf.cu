@@ -99,7 +99,7 @@ static __global__ void mul_mat_vec_f(
 
     const float2 * y2 = (const float2 *) y;
 
-    extern __shared__ char data_mmv[];
+    extern __shared__ __align__(16) char data_mmv[];
     float * buf_iw = (float *) data_mmv;
     [[maybe_unused]] float * buf_iw_gate = nullptr;
     if constexpr (has_fusion) {
@@ -897,7 +897,7 @@ static __global__ void mul_mat_f_few_rows(
         const int K, const int64_t stride_x, const int64_t stride_y, const int64_t stride_dst) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int n_warps   = 256 / warp_size;
-    __shared__ float partial[n_warps][M];
+    __shared__ __align__(16) float partial[n_warps][M];
 
     const int t    = blockIdx.x;
     const int lane = threadIdx.x;
@@ -959,8 +959,8 @@ static __global__ void __launch_bounds__(256) mul_mat_f_skinny(
         const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ out,
         const int K, const int M, const int n_tokens, const int64_t stride_x, const int64_t stride_y,
         const int64_t stride_out, const int k_slice) {
-    __shared__ float ys[MM_SKINNY_BK][MM_SKINNY_BT + 1];
-    __shared__ float xs[MM_SKINNY_BK][MM_SKINNY_BR + 1];
+    __shared__ __align__(16) float ys[MM_SKINNY_BK][MM_SKINNY_BT + 1];
+    __shared__ __align__(16) float xs[MM_SKINNY_BK][MM_SKINNY_BR + 1];
 
     const int tid = threadIdx.x;
     const int t0  = blockIdx.x*MM_SKINNY_BT;

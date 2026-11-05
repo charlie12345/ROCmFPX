@@ -42,7 +42,7 @@ static __global__ void __launch_bounds__(HCUP_THREADS, 2) hc_up_pre_q8_kernel(
         const float * __restrict__ xn, const int64_t sx1, const int64_t sx2,
         float * __restrict__ dst, const int64_t sd1,
         const int n_embd, const int n_tokens, const int K, const float scale) {
-    extern __shared__ int hcup_smem[];
+    extern __shared__ __align__(16) int hcup_smem[];
     const int nkb = K / QK8_0;
     int8_t * wq = (int8_t *) hcup_smem;                                   // [HC*DT][K]
     float  * wd = (float *) (wq + HCUP_HC * HCUP_DT * K);                 // [HC*DT][nkb]
