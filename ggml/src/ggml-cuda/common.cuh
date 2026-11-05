@@ -1547,6 +1547,7 @@ struct ggml_cuda_stream_context {
 
 struct ggml_cuda_q8_mmq_slot;
 struct ggml_cuda_mmvq_q8_cache;
+struct ggml_cuda_mmb_state;
 
 struct ggml_backend_cuda_context {
     int device;
@@ -1557,6 +1558,13 @@ struct ggml_backend_cuda_context {
     // from different threads, so these must not be per-device globals. Allocated on first use, freed with the context.
     ggml_cuda_q8_mmq_slot *   q8_mmq_slot   = nullptr;
     ggml_cuda_mmvq_q8_cache * mmvq_q8_cache = nullptr;
+    // ROCmFPX [TAG_MMB_CTX_STATE]: MMB's per-graph state (BF16 activation cache, producer slots, BF16-only marks) for the
+    // same reason (mmb.cu); its BF16 weight shadows stay shared between contexts. Freed with the context.
+    ggml_cuda_mmb_state *     mmb_state     = nullptr;
+    // the BF16-only marks live for a whole scheduled graph (all splits): graph_optimize clears them at its first call
+    // after a compute, or when the first split repeats
+    const void *              mmb_marks_first_split   = nullptr;
+    bool                      mmb_marks_after_compute = true;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

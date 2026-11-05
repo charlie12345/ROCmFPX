@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <vector>
 #include <unordered_set>
+#include <mutex>
 
 namespace {
 
@@ -683,23 +684,49 @@ __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t * 
     for (int jt = 0; jt < ts; ++jt) { const int idx = bs + jt; if (idx < nsmall_max) desc_small[idx] = (uint32_t)e | ((uint32_t)jt << 16); }
 }
 
+} // namespace
+
+// ROCmFPX [TAG_MMB_CTX_STATE]: MMB's per-graph state, per backend context (common.cuh). It was process-wide: contexts on
+// one device that compute from different threads (test-backend-ops -j, several llama contexts) read each other's cached
+// BF16 activations through reused data pointers, mutated the same containers at once, and one context's begin_graph
+// cleared entries another was using: MMB_QUANT IQ2_XS / Q6_K / Q2_K wrong now and then under -j 8 (ROCm 7.2 and 10.1,
+// RX 7900 XT, 2026-11-05). Allocated on first use, freed with the context.
 struct mmb_cache_entry { const ggml_tensor * root; const void * data; size_t n; ggml_cuda_pool_alloc<uint16_t> * buf; };
-static std::vector<mmb_cache_entry> g_mmb_cache;
-static mmb_cache_entry g_mmb_slots[4] = {{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr}};
-static std::unordered_set<const ggml_tensor *> g_mmb_bf16_only;
+struct ggml_cuda_mmb_state {
+    std::vector<mmb_cache_entry> cache;                  // BF16 copies of activations for the current graph
+    mmb_cache_entry slots[4] = {};                       // producer slots: 0 = HC normalized stream xn, 1 = HC gate
+    size_t slot_cap[4] = {0, 0, 0, 0};
+    std::unordered_set<const ggml_tensor *> bf16_only;   // tensors whose consumers read only the BF16 copy
+};
+
+namespace {
+
+static std::mutex g_mmb_shadow_mutex;   // the shared BF16 weight shadows below, and the count of contexts using MMB
+static int g_mmb_live_states = 0;
+
+static ggml_cuda_mmb_state & mmb_state(ggml_backend_cuda_context & ctx) {
+    if (!ctx.mmb_state) {
+        ctx.mmb_state = new ggml_cuda_mmb_state();
+        std::lock_guard<std::mutex> lock(g_mmb_shadow_mutex);
+        ++g_mmb_live_states;
+    }
+    return *ctx.mmb_state;
+}
 
 static size_t mmb_cache_max() { return 4; }
 static const ggml_tensor * mmb_root(const ggml_tensor * t) { return t->view_src ? t->view_src : t; }
 static uint16_t * mmb_cache_insert(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const size_t n) {
-    if (g_mmb_cache.size() >= mmb_cache_max()) { delete g_mmb_cache.front().buf; g_mmb_cache.erase(g_mmb_cache.begin()); }
+    auto & cache = mmb_state(ctx).cache;
+    if (cache.size() >= mmb_cache_max()) { delete cache.front().buf; cache.erase(cache.begin()); }
     auto * buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n);
-    g_mmb_cache.push_back({mmb_root(t), t->data, n, buf});
+    cache.push_back({mmb_root(t), t->data, n, buf});
     return buf->get();
 }
 static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream) {
     const ggml_tensor * root = mmb_root(src1);
-    for (auto & e : g_mmb_slots) if (e.buf && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
-    for (auto & e : g_mmb_cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+    auto & st = mmb_state(ctx);
+    for (auto & e : st.slots) if (e.buf && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+    for (auto & e : st.cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
     uint16_t * buf = mmb_cache_insert(ctx, src1, n);
     mmb_cvt_f32_bf16<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, n);
     return buf;
@@ -777,6 +804,7 @@ static bool mmb_is_row_concat(const ggml_tensor * w) {
            w->src[0]->ne[0] == w->src[1]->ne[0] && w->ne[0] == w->src[0]->ne[0] && w->ne[1] == w->src[0]->ne[1] + w->src[1]->ne[1];
 }
 static const uint16_t * mmb_shadow_lookup(const ggml_tensor * w) {
+    std::lock_guard<std::mutex> lock(g_mmb_shadow_mutex);
     if (w->op == GGML_OP_CONCAT) { auto it = g_mmb_shadow_pair.find({w->src[0]->data, w->src[1]->data}); return it == g_mmb_shadow_pair.end() ? nullptr : it->second; }
     auto it = g_mmb_shadow.find(w->data); return it == g_mmb_shadow.end() ? nullptr : it->second;
 }
@@ -806,31 +834,42 @@ bool mmb_glu()     { return true; }
 
 } // namespace
 
-const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t) {
+const uint16_t * ggml_cuda_mmb_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    if (!ctx.mmb_state) return nullptr;
     const ggml_tensor * root = mmb_root(t);
-    for (auto & e : g_mmb_slots) if (e.buf && e.root == root && e.data == t->data) return e.buf->get();
-    for (auto & e : g_mmb_cache) if (e.root == root && e.data == t->data) return e.buf->get();
+    for (auto & e : ctx.mmb_state->slots) if (e.buf && e.root == root && e.data == t->data) return e.buf->get();
+    for (auto & e : ctx.mmb_state->cache) if (e.root == root && e.data == t->data) return e.buf->get();
     return nullptr;
 }
-static size_t g_mmb_slot_cap[4] = {0, 0, 0};
 uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n) {
-    mmb_cache_entry & e = g_mmb_slots[slot];
-    if (e.buf && g_mmb_slot_cap[slot] < n) { delete e.buf; e.buf = nullptr; }
-    if (!e.buf) { e.buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n); g_mmb_slot_cap[slot] = n; }
+    auto & st = mmb_state(ctx);
+    mmb_cache_entry & e = st.slots[slot];
+    if (e.buf && st.slot_cap[slot] < n) { delete e.buf; e.buf = nullptr; }
+    if (!e.buf) { e.buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n); st.slot_cap[slot] = n; }
     e.root = mmb_root(t); e.data = t->data; e.n = n;
     return e.buf->get();
 }
-void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); }
-size_t ggml_cuda_mmb_marks_count() { return g_mmb_bf16_only.size(); }
-void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) { g_mmb_bf16_only.insert(t); }
-bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return g_mmb_bf16_only.count(t) > 0; }
-void ggml_cuda_mmb_begin_graph() { for (auto & e : g_mmb_cache) delete e.buf; g_mmb_cache.clear(); for (auto & e : g_mmb_slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } }
-void ggml_cuda_mmb_release_all() {
-    ggml_cuda_mmb_begin_graph();
-    for (int i = 0; i < 4; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }
-    // the shadow weights are raw cudaMalloc, keyed by data pointer and held for the life of the
-    // process. A model has finitely many weights so this never mattered, but a long-lived process
-    // that sees many distinct tensors (test-backend-ops) keeps every one of them.
+void ggml_cuda_mmb_marks_clear(ggml_backend_cuda_context & ctx) { if (ctx.mmb_state) ctx.mmb_state->bf16_only.clear(); }
+size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context & ctx) { return ctx.mmb_state ? ctx.mmb_state->bf16_only.size() : 0; }
+void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { mmb_state(ctx).bf16_only.insert(t); }
+bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { return ctx.mmb_state && ctx.mmb_state->bf16_only.count(t) > 0; }
+void ggml_cuda_mmb_begin_graph(ggml_backend_cuda_context & ctx) {
+    if (!ctx.mmb_state) return;
+    for (auto & e : ctx.mmb_state->cache) delete e.buf;
+    ctx.mmb_state->cache.clear();
+    for (auto & e : ctx.mmb_state->slots) { e.root = nullptr; e.data = nullptr; e.n = 0; }
+}
+// at context destruction: the context's own buffers (before its pool goes), and the shared weight shadows once no
+// context that used MMB is left. The shadows are raw cudaMalloc keyed by data pointer: a model has finitely many weights,
+// but a long-lived process that sees many distinct tensors (test-backend-ops) would keep every one of them.
+void ggml_cuda_mmb_release(ggml_backend_cuda_context & ctx) {
+    if (!ctx.mmb_state) return;
+    ggml_cuda_mmb_begin_graph(ctx);
+    for (auto & e : ctx.mmb_state->slots) { delete e.buf; e.buf = nullptr; }
+    delete ctx.mmb_state;
+    ctx.mmb_state = nullptr;
+    std::lock_guard<std::mutex> lock(g_mmb_shadow_mutex);
+    if (--g_mmb_live_states > 0) return;
     for (auto & e : g_mmb_shadow)      { if (e.second) cudaFree(e.second); }
     for (auto & e : g_mmb_shadow_pair) { if (e.second) cudaFree(e.second); }
     g_mmb_shadow.clear();
@@ -922,8 +961,8 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     // the 128x256 tile spills for ROCmI4 (1 KB scratch); the 128x128 one does not
     const bool big = src0->type != GGML_TYPE_Q4_0_ROCMI4 && ((M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096));
     uint16_t * Dh = (mmb_hc16() && K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
-    bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(dst));
-    if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0) {
+    bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(ctx, dst));
+    if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(ctx, dst) && (M & 7) == 0) {
         Dh = (uint16_t *) dst->data; store_f32 = false;
     }
     dim3 grid((M + 127) / 128, big ? (T + 255) / 256 : (T + 127) / 128);
@@ -961,12 +1000,12 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
     if (K % ggml_blck_size(w->type) != 0) return false;
     if (K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t()) return false;
-    const uint16_t * xn16 = ggml_cuda_mmb_cache_lookup(xn);
+    const uint16_t * xn16 = ggml_cuda_mmb_cache_lookup(ctx, xn);
     if (!xn16) return false;
     cudaStream_t stream = ctx.stream();
     const uint16_t * lo16 = mmb_bf16_activation(ctx, lo, (size_t) T * K, stream);
     uint16_t * outh = ggml_cuda_mmb_slot_reserve(ctx, 3, dst, (size_t) T * E);
-    const bool store_f32 = !(outh && ggml_cuda_mmb_is_bf16_only(dst));
+    const bool store_f32 = !(outh && ggml_cuda_mmb_is_bf16_only(ctx, dst));
     dim3 grid(E / 32, (T + 127) / 128);
     mmb_dispatch_quant(w->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
@@ -1003,7 +1042,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN, BN_SMALL, THRESH);
 
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data; const size_t eb = (size_t) src0->nb[2];
-    uint16_t * Dh = (mmb_down16_flag() && ggml_cuda_mmb_is_bf16_only(dst)) ? (uint16_t *) dst->data : nullptr;
+    uint16_t * Dh = (mmb_down16_flag() && ggml_cuda_mmb_is_bf16_only(ctx, dst)) ? (uint16_t *) dst->data : nullptr;
     const bool store_f32 = Dh == nullptr;
     dim3 gbig((M + 127) / 128, nbig_max), gsmall((M + 127) / 128, nsmall_max);
     mmb_dispatch_quant(src0->type, [&](auto tag) {
@@ -1050,7 +1089,7 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     ggml_cuda_pool_alloc<uint32_t> desc_small(ctx.pool(), nsmall_max);
     mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN, BN_SMALL, THRESH);
     uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
-    const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(glu);
+    const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(ctx, glu);
     const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
     dim3 gbig((M + 63) / 64, nbig_max), gsmall((M + 63) / 64, nsmall_max);
     mmb_dispatch_quant(gw->type, [&](auto tag) {
@@ -1065,6 +1104,11 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
 // the shadow for an eligible Q6_K or IQ4_NL dense weight.
 void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
     if (!w) return;
+    mmb_state(ctx);   // counts this context among the shadows' users
+    // [TAG_MMB_CTX_STATE] the shadows are shared by every context of the process: made under the lock, and entered in the
+    // map only after their unpack has finished on this context's stream, so another context never reads a half-made one
+    // (once per weight, outside stream capture)
+    std::lock_guard<std::mutex> lock(g_mmb_shadow_mutex);
     if (mmb_is_resident_q6k(w)) {
         if (!mmb_shadow_q6k() || g_mmb_shadow.count(w->data) > 0) return;
         const size_t n = (size_t) w->ne[0] * w->ne[1], bytes = n * 2;
@@ -1074,6 +1118,7 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
         mmb_dq_q6k_bf16_kernel<<<(unsigned) ((n / 256 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, n / 256);
         CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
         g_mmb_shadow[w->data] = buf; g_mmb_shadow_bytes += bytes;
         return;
     }
@@ -1091,12 +1136,15 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         const size_t n0 = (size_t) w->src[0]->ne[0] * w->src[0]->ne[1], n1 = (size_t) w->src[1]->ne[0] * w->src[1]->ne[1];
         mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n0 / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->src[0]->data, buf, n0 / 32);
         mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n1 / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->src[1]->data, buf + n0, n1 / 32);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
         g_mmb_shadow_pair[{w->src[0]->data, w->src[1]->data}] = buf;
     } else {
         mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, n / 32);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
         g_mmb_shadow[w->data] = buf;
     }
-    CUDA_CHECK(cudaGetLastError());
     g_mmb_shadow_bytes += bytes;
 }
 
@@ -1109,20 +1157,20 @@ bool ggml_cuda_mmb_supported_glu(const ggml_tensor *, const ggml_tensor *, const
 void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("MMB is HIP-only"); }
 void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("MMB is HIP-only"); }
 void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("MMB is HIP-only"); }
-void ggml_cuda_mmb_begin_graph() {}
+void ggml_cuda_mmb_begin_graph(ggml_backend_cuda_context &) {}
 uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context &, const ggml_tensor *, size_t) { return nullptr; }
-const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor *) { return nullptr; }
+const uint16_t * ggml_cuda_mmb_cache_lookup(ggml_backend_cuda_context &, const ggml_tensor *) { return nullptr; }
 uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context &, int, const ggml_tensor *, size_t) { return nullptr; }
-void ggml_cuda_mmb_marks_clear() {}
-size_t ggml_cuda_mmb_marks_count() { return 0; }
-void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor *) {}
-bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor *) { return false; }
+void ggml_cuda_mmb_marks_clear(ggml_backend_cuda_context &) {}
+size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context &) { return 0; }
+void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context &, const ggml_tensor *) {}
+bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context &, const ggml_tensor *) { return false; }
 bool ggml_cuda_mmb_gatemix() { return false; }
 bool ggml_cuda_mmb_down16() { return false; }
 bool ggml_cuda_mmb_res16() { return false; }
 bool ggml_cuda_mmb_blk16() { return false; }
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, int, float, float) { return false; }
 void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context &, const ggml_tensor *) {}
-void ggml_cuda_mmb_release_all() {}
+void ggml_cuda_mmb_release(ggml_backend_cuda_context &) {}
 
 #endif // defined(GGML_USE_HIP)

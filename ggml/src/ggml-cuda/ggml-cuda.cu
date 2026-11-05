@@ -711,6 +711,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     // per-context q8 caches (device buffers referenced by this context's captured graphs)
     ggml_cuda_q8_mmq_cache_free(*this);
     ggml_cuda_mmvq_q8_cache_free(*this);
+    // [TAG_MMB_CTX_STATE] this context's MMB buffers before its pool goes (pool leak assert); the shared weight shadows
+    // once it is the last context that used MMB
+    ggml_cuda_mmb_release(*this);
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2427,11 +2430,11 @@ static bool ggml_cuda_hc_combine_rows_ok(const ggml_cuda_hc_combine_norm_args & 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
-    if (ggml_cuda_mmb_marks_count() > 0 && dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_MUL_MAT_ID && dst->op != GGML_OP_VIEW &&
+    if (ggml_cuda_mmb_marks_count(ctx) > 0 && dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_MUL_MAT_ID && dst->op != GGML_OP_VIEW &&
             dst->op != GGML_OP_RESHAPE && dst->op != GGML_OP_PERMUTE && dst->op != GGML_OP_TRANSPOSE && dst->op != GGML_OP_NONE) {
         for (int s = 0; s < GGML_MAX_SRC && dst->src[s]; ++s) {
             const ggml_tensor * src = dst->src[s];
-            if (ggml_cuda_mmb_is_bf16_only(src) || (src->view_src && ggml_cuda_mmb_is_bf16_only(src->view_src))) {
+            if (ggml_cuda_mmb_is_bf16_only(ctx, src) || (src->view_src && ggml_cuda_mmb_is_bf16_only(ctx, src->view_src))) {
                 GGML_ABORT("MMB: %s(%s) reads BF16-only tensor %s through the unfused path", ggml_op_name(dst->op), dst->name, src->name);
             }
         }
@@ -2811,7 +2814,6 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
-    ggml_cuda_mmb_release_all();   // release cached BF16 conversions before the pool is destroyed (pool leak assert)
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     delete cuda_ctx;
@@ -4485,23 +4487,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         // while prefill (>= 512 rows, where its BF16/Q8 side copies pay off) stayed bit-identical. Keep it for
         // prefill-sized batches only (ggml_cuda_hc_combine_rows_ok, shared with the BF16-only marks in graph_optimize).
         const bool rows_ok = skip > 0 && ggml_cuda_hc_combine_rows_ok(args);
-        if (skip > 0 && rows_ok && !ggml_cuda_hc_combine_norm_alias_ok(args) && ggml_cuda_mmb_is_bf16_only(args.out_xn)) {
+        if (skip > 0 && rows_ok && !ggml_cuda_hc_combine_norm_alias_ok(args) && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, args.out_xn)) {
             GGML_ABORT("hc_combine_norm: output %s is marked BF16-only but the fused kernel was refused (buffer aliasing)", args.out_xn->name);
         }
         if (skip > 0 && rows_ok && ggml_cuda_hc_combine_norm_alias_ok(args)) {
             args.out_xn_bf16 = ggml_cuda_mmb_cache_reserve(*cuda_ctx, args.out_xn, (size_t) ggml_nelements(args.out_xn));
-            args.store_xn_f32 = !(args.out_xn_bf16 && ggml_cuda_mmb_is_bf16_only(args.out_xn));
+            args.store_xn_f32 = !(args.out_xn_bf16 && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, args.out_xn));
             if (ggml_cuda_mmb_res16()) {   // 16-bit residual stream, in place over each tensor's own buffer
                 const ggml_tensor * rin  = args.residual->view_src ? args.residual->view_src : args.residual;
                 const ggml_tensor * rout = args.out_res->view_src  ? args.out_res->view_src  : args.out_res;
-                const bool in16  = ggml_cuda_mmb_is_bf16_only(rin)  && args.residual->view_offs == 0;
-                const bool out16 = ggml_cuda_mmb_is_bf16_only(rout) && args.out_res->view_offs == 0;
+                const bool in16  = ggml_cuda_mmb_is_bf16_only(*cuda_ctx, rin)  && args.residual->view_offs == 0;
+                const bool out16 = ggml_cuda_mmb_is_bf16_only(*cuda_ctx, rout) && args.out_res->view_offs == 0;
                 if (args.out_res->data == args.residual->data && in16 != out16) {
                     GGML_ABORT("hc_combine_norm: in-place residual with mismatched BF16 marks (%s); the graph_optimize "
                                "allocation dependency should have separated them", args.out_res->name);
                 }
                 const ggml_tensor * rblk = args.block_out->view_src ? args.block_out->view_src : args.block_out;
-                args.blk_in_bf16 = (ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(rblk) && args.block_out->view_offs == 0)
+                args.blk_in_bf16 = (ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, rblk) && args.block_out->view_offs == 0)
                                  ? (const uint16_t *) args.block_out->data : nullptr;
                 args.res_in_bf16  = in16  ? (const uint16_t *) args.residual->data : nullptr;
                 args.res_out_bf16 = out16 ? (uint16_t *) args.out_res->data : nullptr;
@@ -4576,7 +4578,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_cuda_mmb_blk16() && nadd < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i + match.node_count - 1, 1)) {
                     const ggml_tensor * add = cgraph->nodes[nadd];
                     if (add->op == GGML_OP_ADD && add->type == GGML_TYPE_F32 && ggml_is_contiguous(add) &&
-                            ggml_are_same_shape(add, match.dst) && ggml_cuda_mmb_is_bf16_only(add)) {
+                            ggml_are_same_shape(add, match.dst) && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, add)) {
                         const ggml_tensor * o = add->src[0] == match.dst ? add->src[1] : (add->src[1] == match.dst ? add->src[0] : nullptr);
                         if (o && o->type == GGML_TYPE_F32 && ggml_is_contiguous(o) && ggml_are_same_shape(o, match.dst)) {
                             merge = o; match.dst = const_cast<ggml_tensor *>(add); count = match.node_count + 1;
@@ -5669,8 +5671,6 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 #endif // USE_CUDA_GRAPH
 
 // tracks when a new split sequence starts, so the mmb marks are cleared once per sequence
-static bool         g_gt_after_compute = true;
-static const void * g_gt_first_split   = nullptr;
 
 // Q8_1 (MMQ D4 layout) copy of an activation written by a fused producer (hc_combine_norm) for the
 // MMQ that reads that activation next. Producer and consumer run back to back on the stream, so one
@@ -5865,8 +5865,8 @@ char * ggml_cuda_mmvq_q8_cache_get(ggml_backend_cuda_context & ctx, const ggml_t
 }
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    ggml_cuda_mmb_begin_graph();
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_mmb_begin_graph(*cuda_ctx);
     ggml_cuda_q8_mmq_cache_begin_graph(*cuda_ctx);
     ggml_cuda_mmvq_q8_cache_begin_graph(*cuda_ctx);
 
@@ -5947,7 +5947,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         ggml_cuda_op_profile_end();
     }
 
-    g_gt_after_compute = true;
+    cuda_ctx->mmb_marks_after_compute = true;
     return GGML_STATUS_SUCCESS;
 }
 
@@ -5980,7 +5980,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     {   // marks live for the whole scheduled graph (all splits): clear at the first optimize after a compute, or when the first split repeats
         const void * key = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
-        if (g_gt_after_compute || g_gt_first_split == nullptr || key == g_gt_first_split) { ggml_cuda_mmb_marks_clear(); g_gt_first_split = key; g_gt_after_compute = false; }
+        if (cuda_ctx->mmb_marks_after_compute || cuda_ctx->mmb_marks_first_split == nullptr || key == cuda_ctx->mmb_marks_first_split) {
+            ggml_cuda_mmb_marks_clear(*cuda_ctx);
+            cuda_ctx->mmb_marks_first_split   = key;
+            cuda_ctx->mmb_marks_after_compute = false;
+        }
     }
     // the BF16-only marks assume the fused kernels run, so they must not be set when fusion is disabled
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -6030,7 +6034,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
                     ok = false;
                 }
-                if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(xn);
+                if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, xn);
             }
             if (ggml_cuda_mmb_blk16()) {   // block_out (attention out-proj / MoE merge) is read only by the fused combine
                 const int ws = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
@@ -6070,7 +6074,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         if (t->op == GGML_OP_MUL || t->op == GGML_OP_ADD) continue;
                         ok = false;
                     }
-                    if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(b);
+                    if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, b);
                 }
             }
 
@@ -6102,7 +6106,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         if (next_combine) continue;
                         ok = false;
                     }
-                    if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(r);
+                    if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, r);
                 }
             }
 
@@ -6121,7 +6125,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
                     ok = false;
                 }
-                if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(d);
+                if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, d);
             }
 
             for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -6135,7 +6139,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (u->op == GGML_OP_UNARY && ggml_get_unary_op(u) == GGML_UNARY_OP_SIGMOID) { ggml_cuda_hc_mix_args ma; if (ggml_cuda_hc_mix_closed(cgraph, n, ma) > 0 && ma.gate == t) continue; }
                     ok = false;
                 }
-                if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(t);
+                if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, t);
             }
         }
     }
@@ -6153,7 +6157,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (ex->src[0]->type != GGML_TYPE_IQ4_NL) continue;
             if (!ggml_node_has_n_uses(cgraph, xi, 1)) continue;
             if (ex->ne[0] % 8 != 0 || ggml_nrows(ex) < 512) continue;
-            ggml_cuda_mmb_mark_bf16_only(ex);
+            ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, ex);
         }
     }
 
@@ -6174,7 +6178,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] == glu && ggml_cuda_mmb_supported_mmid(t->src[0], t->src[1], t->src[2], t)) continue;
                 ok = false;
             }
-            if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(glu);
+            if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, glu);
         }
     }
 

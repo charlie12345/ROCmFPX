@@ -119,8 +119,8 @@ void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx, const ggml_cuda
 
     const int64_t n_items = n_embd * n_tokens;
     static const bool hc16 = true;
-    const uint16_t * xn16 = hc16 ? ggml_cuda_mmb_cache_lookup(xn) : nullptr;
-    const uint16_t * g16  = hc16 ? ggml_cuda_mmb_cache_lookup(gate) : nullptr;
+    const uint16_t * xn16 = hc16 ? ggml_cuda_mmb_cache_lookup(ctx, xn) : nullptr;
+    const uint16_t * g16  = hc16 ? ggml_cuda_mmb_cache_lookup(ctx, gate) : nullptr;
     if (xn16 && g16) {
         const int threads = 256; const int blocks = (int) ((n_items + threads - 1) / threads);
         const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
