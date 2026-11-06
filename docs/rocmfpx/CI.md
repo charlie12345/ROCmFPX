@@ -4,7 +4,6 @@ ROCmFPX keeps the upstream llama.cpp workflow files intact for easier upstream m
 Only these workflows remain enabled:
 
 - `check-rocmfpx.yml`: focused hosted CPU reference, format, plugin ABI, PLE, script, and converter checks for ROCmFPX paths.
-- `rocmfpx-gfx1151.yml`: manual-only Vulkan and HIP qualification on a dedicated self-hosted gfx1151 runner.
 - `rocmfpx-upstream-sync.yml`: weekly and manual upstream merge preparation.
 - `rdna-fast-release.yml`: manual or version-tag release packaging.
 
