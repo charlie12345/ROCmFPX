@@ -256,7 +256,7 @@ misbehaves:
 | `GGML_HIP_FA_GQA7` | the same for seven query heads per KV head at head size 128 | models of that shape on RDNA, e.g. Nanbeige4.3-33B |
 | `GGML_HIP_FA_Q4_TILE` (`_MIN`, `_MAX`: 1, 8 tokens) | decode attention reads a q4_0 KV cache as stored, once per group of query heads, instead of converting the cache to f16 on every call | a q4_0 KV cache at head size 256 (or 128 with seven query heads per KV head), batches of 1 to 8 tokens, on RDNA; `=1` also on other HIP cards |
 | `ROCMFPX_WMMA_GEMM` | prompt batches of 512 tokens or more through an f16 WMMA GEMM instead of the int8 path | RDNA3 and RDNA3.5 with the GEMM library built. Weights: ROCmFP4/FP6 and the stock Q4_0, Q4_1, Q5_1, Q8_0, Q2_K-Q6_K, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS and IQ2 types. A cold 17k prompt: IQ4_XS 781 to 864 t/s, ROCmFP4 682 to 923. [More](#prompts-through-a-wmma-gemm) |
-| `ROCMFPX_WMMA_GEMM_MIN_BATCH`, `ROCMFPX_WMMA_GEMM_SCRATCH_MB`, `ROCMFPX_WMMA_GEMM_DIR` | the smallest batch for it (512), its f16 weight scratch (64 MB), and where its library is loaded from (next to the binaries) | tuning, and installs that keep the library elsewhere |
+| `ROCMFPX_WMMA_GEMM_MIN_BATCH`, `ROCMFPX_WMMA_GEMM_SCRATCH_MB`, `ROCMFPX_WMMA_GEMM_DIR` | the smallest batch for it (512), its f16 weight scratch (sized automatically), and where its library is loaded from (next to the binaries) | tuning, and installs that keep the library elsewhere |
 | `GGML_HIP_MM_SKINNY` | an F32 matmul kernel for weights of 9 to 256 rows at prompt and multi-slot batch sizes, instead of rocBLAS | Qwen3.5/3.8's DeltaNet gate weights, kept F32 by IQ4_XS and K-quant GGUFs, and F32 MoE routers, on RDNA: 1024-token prompts +3%, 10 to 16 parallel decodes +25-30% |
 | `GGML_HIP_GDN_CONV_SNAP` | the concat, the conv, the SILU and the rollback snapshots of a DeltaNet layer in one kernel | Qwen3.5/3.6/3.8 on HIP and CUDA. With `GGML_HIP_MMVQ_FUSE_VERIFY`: decode +2.3-3.9%, two slots +6.8%, short prompts +9-17% |
 | `GGML_HIP_MMVQ_FUSE_VERIFY` | the matmul kernel adds the residual itself in verify batches of 2 to 8 tokens | MTP and n-gram drafting, and two busy slots, on RDNA3.0 and RDNA4 |
@@ -384,9 +384,8 @@ Prompt processing is mostly matrix products of the FP4 weights: 62-72% of a
 path (weights unpacked to int8, activations quantized to 8 bits, int8 WMMA)
 does 40-44 TFLOPS on the model's shapes; an FP16 WMMA GEMM tuned for RDNA3
 does 76-92 on the same shapes. So for batches of 512 tokens or more, the weight
-rows are unpacked to f16 in chunks into a 64 MB scratch, the activations are
-converted to f16, and [rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm)
-(Adel Johar, MIT, in `vendor/rocm_wmma_gemm`) computes the product with f32
+rows are unpacked to f16, the activations are converted to f16, and
+[rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) (Adel Johar, MIT, in `vendor/rocm_wmma_gemm`) computes the product with f32
 accumulation.
 
 | one matrix product | int8 path | WMMA GEMM |

@@ -437,6 +437,50 @@ static bool fp8_gemm_on(const int cc) {
     return on && (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3(cc));
 }
 
+// [TAG_WMMA_GEMM_SCRATCH_AUTO] How many weight rows one chunk unpacks. ROCMFPX_WMMA_GEMM_SCRATCH_MB=N: chunks of at most N MB
+// of f16, as before. Unset: the whole matrix at once for batches of 2048+ tokens on inputs of at most 8192 (gate / up, q / o
+// projections) when its unpacked copy (whole_row_bytes per row) fits the room the device had at its first chunked product,
+// else 64 MB chunks (the old default). One chunk also writes dst directly: no output temporary, no 2D copy per chunk.
+// RX 7900 XT, test-backend-ops, Q4_K / IQ4_XS on the weight shapes of Llama-3.1-8B, Gemma-3-27B, Qwen3-32B, Mistral-24B and
+// Qwen3.8-27B, one chunk against 64 MB chunks (day-1106\scratch-ab.ps1): at 2048 tokens and K <= 8192 every shape is faster,
+// 0.898-0.977 (ROCm 10.1); the down projections (K 14336-32768) are slower, 1.018-1.061, and at 512 tokens it goes both
+// ways, 0.874-1.227 (Qwen3.8's down 1.227): the tuned table has entries for the chunk shapes, not for whole matrices.
+// Room = cudaMemGetInfo's free memory minus 1 GiB, at most 512 MB: on Windows that figure counts this process's own
+// allocations only, so the 1 GiB (llama's --fit target) is what is left for the desktop and other programs. A 20 GB card
+// holding an 18.4 GB server (Qwen3.8-27B IQ4_XS at 96k, prod settings) has ~1.8 GiB of it and unpacks 17408 x 5120 (178 MB)
+// in one go; a server --fit packed to its 1 GiB target keeps the chunks.
+static int64_t wmma_gemm_whole_cap(const int device) {
+    static std::mutex mutex;
+    static int64_t cap[GGML_CUDA_MAX_DEVICES];
+    static bool    known[GGML_CUDA_MAX_DEVICES] = {};
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!known[device]) {
+        size_t free = 0, total = 0;
+        ggml_cuda_set_device(device);
+        if (cudaMemGetInfo(&free, &total) != cudaSuccess) {
+            (void) cudaGetLastError();
+            free = 0;
+        }
+        cap[device]   = std::clamp<int64_t>((int64_t) free - ((int64_t) 1 << 30), 0, (int64_t) 512 << 20);
+        known[device] = true;
+        GGML_LOG_DEBUG("%s: device %d: %lld MiB free, whole-matrix unpacks up to %lld MiB\n", __func__, device,
+            (long long) (free >> 20), (long long) (cap[device] >> 20));
+    }
+    return cap[device];
+}
+
+static int64_t wmma_gemm_chunk_rows(const int device, const int64_t M, const int64_t N, const int64_t K,
+                                    const int64_t whole_row_bytes) {
+    static const int     env_mb  = wmma_gemm_env("ROCMFPX_WMMA_GEMM_SCRATCH_MB", 0);
+    static const int64_t def_mb  = 64;
+    const int64_t        f16_row = K*(int64_t) sizeof(half);
+    const int64_t        budget  = (env_mb > 0 ? env_mb : def_mb) << 20;
+    if (env_mb <= 0 && M >= 2048 && K <= 8192 && N*f16_row > budget && N*whole_row_bytes <= wmma_gemm_whole_cap(device)) {
+        return N;
+    }
+    return std::min<int64_t>(N, std::max<int64_t>(256, budget / f16_row / 256 * 256));
+}
+
 static void ggml_cuda_mul_mat_fp8_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                        ggml_tensor * dst) {
     const int64_t K = src0->ne[0];
@@ -450,8 +494,7 @@ static void ggml_cuda_mul_mat_fp8_gemm(ggml_backend_cuda_context & ctx, const gg
     fp8_e4m3_quantize_rows_cuda((const float *) src1->data, a8.get(), sa.get(), M, K, stream);
 
     // weights: chunks of whole rows, unpacked to f16 (the existing kernels), then to E4M3 with one scale per row
-    static const int64_t budget = (int64_t) std::max(1, wmma_gemm_env("ROCMFPX_WMMA_GEMM_SCRATCH_MB", 64)) << 20;
-    const int64_t rows = std::min<int64_t>(N, std::max<int64_t>(256, budget / (K*(int64_t) sizeof(half)) / 256 * 256));
+    const int64_t rows = wmma_gemm_chunk_rows(ctx.device, M, N, K, K*(int64_t) (sizeof(half) + 1));
     const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(src0->type);
     GGML_ASSERT(to_fp16);
     ggml_cuda_pool_alloc<half>    w16(ctx.pool(), rows*K);
@@ -565,12 +608,11 @@ static void wmma_gemm_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         ggml_get_to_fp16_cuda(GGML_TYPE_F32)(src1->data, a16.get(), M*K, stream);
     }
 
-    // weights: a chunk of whole rows at a time, unpacked to f16 into one scratch of at most ROCMFPX_WMMA_GEMM_SCRATCH_MB
-    // (64): a full f16 copy of a 17408 x 5120 matrix is 178 MB, which a 20 GB card running a 15 GB model has not got.
+    // weights: a chunk of whole rows at a time, unpacked to f16 into one scratch: the whole matrix where that is faster
+    // and the device has room for it, else chunks of 64 MB or ROCMFPX_WMMA_GEMM_SCRATCH_MB (wmma_gemm_chunk_rows).
     // Reading the FP4 codes inside the GEMM instead (2026-10-23) was bit-exact but slower, 14-49 vs 54-67 TFLOPS:
     // every block of activation rows decodes its weight tiles again (8-22x the unpacks), where this unpacks once.
-    static const int64_t budget = (int64_t) std::max(1, wmma_gemm_env("ROCMFPX_WMMA_GEMM_SCRATCH_MB", 64)) << 20;
-    const int64_t rows = std::min<int64_t>(N, std::max<int64_t>(256, budget / (K*(int64_t) sizeof(half)) / 256 * 256));
+    const int64_t rows = wmma_gemm_chunk_rows(ctx.device, M, N, K, K*(int64_t) sizeof(half));
     const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(src0->type);
     GGML_ASSERT(to_fp16);
     ggml_cuda_pool_alloc<half> w16(ctx.pool(), rows*K);

@@ -12915,6 +12915,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
         }
     }
+    // ROCmFPX: Qwen3.8-27B's FFN weights as IQ4_XS (the production quant) at the same batches, for the WMMA path's scratch
+    // [TAG_WMMA_GEMM_SCRATCH_AUTO]: 64 MB chunks unpack each in three, the default 17408 x 5120 at 2048 tokens in one
+    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}}) {
+        for (int64_t n : {512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+        }
+    }
 
     // ROCmFPX: decode-sized attention at depth: 1 and 4 queries (a draft step, a verify batch) over 16k and 41k cells,
     // head 256, 4 KV heads with GQA 6, the production q4_0 KV cache against f16
