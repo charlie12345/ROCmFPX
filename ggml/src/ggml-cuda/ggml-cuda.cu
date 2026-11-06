@@ -7634,8 +7634,21 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// ROCmFPX: whether dev runs sparse flash attention without a mask (the qsa kernel, RDNA3.5 only). A model that drops
+// the mask for its selected cells needs it; without it, the attention keeps the mask.
+static bool ggml_backend_cuda_dev_sparse_attn_maskless(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg()) {
+        return false;
+    }
+    const auto * ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    return GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx->device].cc);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_sparse_attn_maskless") == 0) {
+        return (void *)ggml_backend_cuda_dev_sparse_attn_maskless;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
