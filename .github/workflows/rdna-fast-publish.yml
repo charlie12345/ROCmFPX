@@ -1,0 +1,113 @@
+name: RDNA-FAST publish
+
+# Publishes a finished "RDNA-FAST release" run that was started by hand (such a run builds and tests everything but
+# publishes nothing): creates the tag at that run's commit, the GitHub prerelease with the run's archives (ROCm per GPU
+# family, Linux CPU, the UI), and pushes the container image ghcr.io/<repo>:<tag>. The tag is created with the workflow's
+# own token, which does not start the tag-triggered release workflow, so nothing is built twice.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Id of a successful "RDNA-FAST release" run (the number in its URL)'
+        required: true
+      tag:
+        description: 'Release tag to create, like v0.9.0'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      sha: ${{ steps.run.outputs.sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_ID: ${{ inputs.run_id }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check the run and the tag
+        id: run
+        run: |
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "run_id must be a number"; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag must look like v1.2.3"; exit 1; }
+          name=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID" --jq .name)
+          conclusion=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID" --jq .conclusion)
+          sha=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID" --jq .head_sha)
+          echo "run $RUN_ID: $name, $conclusion, $sha"
+          [[ "$name" == "RDNA-FAST release" ]] || { echo "not an RDNA-FAST release run"; exit 1; }
+          [[ "$conclusion" == "success" ]] || { echo "the run did not succeed"; exit 1; }
+          if gh api "repos/$GH_REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then echo "tag $TAG exists already"; exit 1; fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  github-release:
+    needs: check
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          pattern: rdna-fast-*
+          path: dist
+          merge-multiple: true
+      - name: Publish prerelease
+        run: |
+          rm -f dist/rdna-fast-ui.tree
+          ls -la dist
+          test -f dist/rdna-fast-ui.tar.gz && test -f dist/rdna-fast-linux-x86_64.tar.gz
+          gh release create "${{ inputs.tag }}" --target "${{ needs.check.outputs.sha }}" --prerelease --generate-notes dist/*
+
+  container:
+    needs: [check, github-release]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          name: rdna-fast-ui
+          path: ui-release
+      - name: Embed the UI
+        run: mkdir -p tools/ui/dist && tar -xzf ui-release/rdna-fast-ui.tar.gz -C tools/ui/dist && rm -rf ui-release
+      - uses: docker/setup-buildx-action@v3
+      - name: Normalize image name
+        id: image
+        env:
+          IMAGE_NAME: ghcr.io/${{ github.repository }}
+        run: echo "name=${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .devops/rocmfpx.Dockerfile
+          push: true
+          tags: ${{ steps.image.outputs.name }}:${{ inputs.tag }}
+          cache-from: type=gha
+          provenance: mode=max
+          sbom: true
