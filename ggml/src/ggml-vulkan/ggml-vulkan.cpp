@@ -3770,11 +3770,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 
     // Tiled routed-expert GEMM for IQ3_S prefill on int8 dot products (mul_mm_id_tiled_q8.comp),
-    // measured on AMD only
+    // measured on AMD only; built only when glslc knows GL_EXT_integer_dot_product
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     if (device->integer_dot_product && device->vendor_id == VK_VENDOR_ID_AMD) {
         ggml_vk_create_pipeline(device, device->pipeline_mmid_gather_q8, "mul_mm_id_gather_q8", mul_mm_id_gather_q8_len, mul_mm_id_gather_q8_data, "main", 4, sizeof(vk_op_mmid_gather_push_constants), {1, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_mmid_tiled_q8_iq3_s, "mul_mm_id_tiled_q8_iq3_s", mul_mm_id_tiled_q8_iq3_s_len, mul_mm_id_tiled_q8_iq3_s_data, "main", 5, sizeof(vk_op_mmid_tiled_push_constants), {128, 1, 1}, {}, 1);
     }
+#endif
 
     // comb holds a token's 4x4 matrix in one 16-lane slice of a subgroup, so it
     // needs at least 16 lanes, pinned to a known size.
