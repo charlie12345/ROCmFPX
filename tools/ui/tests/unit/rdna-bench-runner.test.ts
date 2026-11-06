@@ -5,7 +5,7 @@ import { chartGroups } from '$lib/rdna/bench/metrics';
 import { benchRunner, loadBenchRuns } from '$lib/rdna/bench/runner.svelte';
 import type { BenchRun } from '$lib/rdna/bench/types';
 import { StatusStore } from '$lib/rdna/status-store.svelte';
-import { writePart } from '$lib/rdna/storage';
+import { noteModelFile, writePart } from '$lib/rdna/storage';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const MODEL = 'qwen/qwen3.8-27b';
@@ -101,6 +101,8 @@ beforeEach(() => {
 		setItem: (k: string, v: string) => store.set(k, v)
 	});
 	vi.stubGlobal('fetch', fakeFetch);
+	// a server that names no model file: the plain keys
+	noteModelFile(MODEL, null, null);
 });
 
 afterEach(() => {

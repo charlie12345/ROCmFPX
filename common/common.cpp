@@ -45,6 +45,7 @@
 #endif
 #include <locale>
 #include <windows.h>
+#include <psapi.h>
 #include <string.h>
 #include <fcntl.h>
 #include <io.h>
@@ -964,6 +965,27 @@ void common_set_env(const std::string & name, const std::string & value) {
     } else {
         setenv(name.c_str(), value.c_str(), 1);
     }
+#endif
+}
+
+// ROCmFPX [TAG_SYSTEM_MEMORY]
+size_t common_process_resident_bytes() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc = {};
+    pmc.cb = sizeof(pmc);
+    return K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)) ? (size_t) pmc.WorkingSetSize : 0;
+#elif defined(__linux__)
+    long pages = 0;
+    long resident = 0;
+    FILE * f = fopen("/proc/self/statm", "r");
+    if (f == nullptr) {
+        return 0;
+    }
+    const int n = fscanf(f, "%ld %ld", &pages, &resident);
+    fclose(f);
+    return n == 2 && resident > 0 ? (size_t) resident * (size_t) sysconf(_SC_PAGESIZE) : 0;
+#else
+    return 0;
 #endif
 }
 

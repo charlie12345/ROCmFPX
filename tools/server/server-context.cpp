@@ -6599,6 +6599,24 @@ static json get_res_devices(const std::vector<ggml_backend_dev_t> & devices) {
     return res;
 }
 
+// [TAG_SYSTEM_MEMORY] the host's RAM and this process's share of it (the status page's RAM bar under the VRAM one);
+// through the router, /props?model= answers from that model's own process
+static json get_res_system_memory() {
+    size_t free  = 0;
+    size_t total = 0;
+    if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        ggml_backend_dev_memory(cpu, &free, &total);
+    }
+    json res = {
+        {"memory_total", total},
+        {"memory_free",  free},
+    };
+    if (const size_t own = common_process_resident_bytes()) {
+        res["process_resident"] = own;
+    }
+    return res;
+}
+
 json server_routes::get_model_info() const {
     return get_res_model_info(*meta);
 }
@@ -6770,6 +6788,7 @@ void server_routes::init_routes() {
         // [TAG_REQUEST_HISTORY] read now, also during sleep: the device memory from the backend, the disk cache
         // counters from the copy the main loop publishes (a thread-safe call that does not touch the model)
         props["devices"]           = get_res_devices(meta->devices);
+        props["system_memory"]     = get_res_system_memory();
         props["prompt_cache_disk"] = ctx_server.disk_stats_to_json();
         res->ok(props);
         return res;

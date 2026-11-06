@@ -31,6 +31,7 @@ import {
 	emptyClassifier,
 	emptyPriority,
 	loadPeaks,
+	noteModelFile,
 	writePart
 } from '$lib/rdna/storage';
 import type { ClassifierRecord, CompletionRecord, RequestRecord } from '$lib/rdna/types';
@@ -132,6 +133,7 @@ describe('depth buckets', () => {
 			removeItem: (k: string) => store.delete(k),
 			setItem: (k: string, v: string) => store.set(k, v)
 		});
+		noteModelFile('m', null, null);
 		writePart('m', 'peaks', {
 			decode: { 49152: { t: 3, v: 63.9 }, 98304: { t: 4, v: 54.2 } },
 			decodeResetAt: 0,

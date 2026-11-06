@@ -65,6 +65,8 @@ export interface RdnaProps {
 	default_generation_settings?: { n_ctx?: number };
 	devices?: RdnaDevice[];
 	prompt_cache_disk?: RdnaPromptCacheDisk;
+	/** The host's RAM and the model process's share of it (bytes). */
+	system_memory?: { memory_total?: number; memory_free?: number; process_resident?: number };
 }
 
 export interface CompletionRecord {

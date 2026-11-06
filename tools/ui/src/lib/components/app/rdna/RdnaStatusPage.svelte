@@ -173,6 +173,7 @@
 								loaded={model.loaded}
 								loading={model.loading}
 								memory={store.memory}
+								ram={store.ram}
 								pool={store.sharedPool}
 								slots={store.shownSlots}
 								status={model.status}

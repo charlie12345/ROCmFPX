@@ -15,7 +15,7 @@
 	 */
 	import RdnaPill from './RdnaPill.svelte';
 	import { fmtClock, fmtCtx, fmtInt, fmtRate, fmtTokens } from '$lib/rdna/format';
-	import type { MemorySummary } from '$lib/rdna/hardware';
+	import type { MemorySummary, RamSummary } from '$lib/rdna/hardware';
 	import type { SlotLive, SlotPhase } from '$lib/rdna/live';
 	import type { SlotMemory } from '$lib/rdna/slot-memory';
 	import type { RdnaSlot } from '$lib/rdna/types';
@@ -29,6 +29,8 @@
 		status: string;
 		pool: { used: number; total: number } | null;
 		memory: MemorySummary | null;
+		/** System RAM under the VRAM line (null: not reported, or the model runs on the CPU, whose line is RAM). */
+		ram?: RamSummary | null;
 		hardware: string | null;
 		/** Each slot's latest request, kept after it finished. */
 		lastRequests?: Record<number, SlotMemory>;
@@ -42,6 +44,7 @@
 		loading = false,
 		memory,
 		pool,
+		ram = null,
 		slots,
 		status
 	}: Props = $props();
@@ -219,6 +222,41 @@
 					: 0}%; background: var(--rf-text-dim);"
 			></div>
 		</div>
+
+		<!-- system RAM (owner, 2026-11-07): the model's own share bright, the rest of the system dim -->
+		{#if ram && memory?.kind !== 'RAM'}
+			<p
+				class="rf-mem-line rf-mem-ram"
+				title={ram.own !== null
+					? `This model: ${(ram.own / GIB).toFixed(1)} GB, everything else: ${((ram.used - ram.own) / GIB).toFixed(1)} GB`
+					: undefined}
+			>
+				<span class="rf-mem-hw">RAM</span>
+
+				<span class="rf-mem-figure"
+					><strong>{(ram.used / GIB).toFixed(1)}</strong>/{(ram.total / GIB).toFixed(
+						1
+					)}&nbsp;GB</span
+				>
+			</p>
+
+			<div class="rf-track rf-ram-track">
+				<div
+					class="rf-fill rf-ram-rest"
+					style="width: {Math.min(100, (100 * ram.used) / ram.total)}%;"
+				></div>
+
+				{#if ram.own !== null}
+					<div
+						class="rf-fill rf-ram-own"
+						style="width: {Math.min(
+							100,
+							(100 * ram.own) / ram.total
+						)}%; background: var(--rf-text-dim);"
+					></div>
+				{/if}
+			</div>
+		{/if}
 	</div>
 </section>
 
@@ -396,6 +434,27 @@
 		flex: none;
 		margin-left: auto;
 		white-space: nowrap;
+	}
+
+	.rf-mem-ram {
+		margin-top: 4px;
+	}
+
+	/* the model's share over the whole system's use */
+	.rf-ram-track {
+		position: relative;
+	}
+
+	.rf-ram-rest {
+		background: var(--rf-text-dim);
+		opacity: 0.35;
+	}
+
+	.rf-ram-own {
+		position: absolute;
+		left: 0;
+		top: 0;
+		bottom: 0;
 	}
 
 	/* a value with its unit never breaks inside */

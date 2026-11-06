@@ -4,7 +4,7 @@
  */
 
 import { TIMES } from './constants';
-import type { RdnaDevice } from './types';
+import type { RdnaDevice, RdnaProps } from './types';
 
 function isCpu(d: RdnaDevice): boolean {
 	return (d.type ?? '').toLowerCase() === 'cpu' || (d.name ?? '').toUpperCase() === 'CPU';
@@ -77,6 +77,25 @@ export function memorySummary(devices: readonly RdnaDevice[] | undefined): Memor
 	if (total <= 0) return null;
 
 	return { kind: list.every(isCpu) ? 'RAM' : 'VRAM', total, used: total - free };
+}
+
+/** System RAM in use (bytes) and the model process's share of it. */
+export interface RamSummary {
+	total: number;
+	used: number;
+	own: number | null;
+}
+
+export function ramSummary(sm: RdnaProps['system_memory'] | undefined): RamSummary | null {
+	const total = sm?.memory_total ?? 0;
+
+	if (!sm || total <= 0) return null;
+
+	const used = total - Math.max(0, Math.min(sm.memory_free ?? 0, total));
+	const own =
+		sm.process_resident && sm.process_resident > 0 ? Math.min(sm.process_resident, used) : null;
+
+	return { own, total, used };
 }
 
 /** The design's label sizes (in cqw of the card) by label length. */

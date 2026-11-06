@@ -24,8 +24,98 @@ export type ModelPart =
 	| 'bench'
 	| 'copyBoost';
 
-export function storageKey(modelId: string, part: ModelPart): string {
-	return `${STORAGE_PREFIX}:model:${modelId}:${part}`;
+const MODEL_PARTS: ModelPart[] = [
+	'history',
+	'peaks',
+	'prio',
+	'cache',
+	'classifier',
+	'hw',
+	'bench',
+	'copyBoost'
+];
+/**
+ * The parts belong to the model FILE a router id serves, not to the id (owner, 2026-11-07: Flash-Next tried under
+ * qwen/qwen3.8-27b showed Swift's bench): a different GGUF under the same id starts empty and the earlier file's
+ * data stays for it. The key carries a hash of the model path that /v1/models lists for the id; an id without a
+ * path (a single-model server) keeps the plain key. Until a model's file is known, its parts are neither read nor
+ * written, so the first answers after a swap cannot land in the earlier file's data.
+ */
+const LEGACY = '';
+const identities = new Map<string, string>();
+
+function fnv1a(s: string): string {
+	let h = 0x811c9dc5;
+
+	for (let i = 0; i < s.length; i++) {
+		h ^= s.charCodeAt(i);
+		h = Math.imul(h, 0x01000193) >>> 0;
+	}
+
+	return h.toString(16).padStart(8, '0');
+}
+
+function partKey(modelId: string, ident: string, part: string): string {
+	return ident === LEGACY
+		? `${STORAGE_PREFIX}:model:${modelId}:${part}`
+		: `${STORAGE_PREFIX}:model:${modelId}@${ident}:${part}`;
+}
+
+export function storageKey(modelId: string, part: ModelPart): string | null {
+	const ident = identities.get(modelId);
+
+	return ident === undefined ? null : partKey(modelId, ident, part);
+}
+
+/**
+ * Data kept under the plain key before files had their own: it goes to the first file that comes up under the id,
+ * unless its bench runs name another model (then it waits for that one); copied once, the plain keys stay as they
+ * were.
+ */
+function adoptLegacy(modelId: string, ident: string, name: string | null): void {
+	const ownerKey = `${STORAGE_PREFIX}:model:${modelId}:legacyOwner`;
+
+	if (readJson<string>(ownerKey) !== null) return;
+
+	if (MODEL_PARTS.some((p) => readJson(partKey(modelId, ident, p)) !== null)) return;
+
+	const present = MODEL_PARTS.filter((p) => readJson(partKey(modelId, LEGACY, p)) !== null);
+
+	if (present.length === 0) return;
+
+	const bench = readJson<{ modelLabel?: unknown }[]>(partKey(modelId, LEGACY, 'bench'));
+	const names = Array.isArray(bench)
+		? bench.map((r) => r?.modelLabel).filter((n): n is string => typeof n === 'string' && n !== '')
+		: [];
+
+	if (names.length > 0 && (!name || !names.some((n) => n === name || n.startsWith(`${name} `))))
+		return;
+
+	for (const p of present)
+		writeJson(partKey(modelId, ident, p), readJson(partKey(modelId, LEGACY, p)));
+
+	writeJson(ownerKey, ident);
+}
+
+/**
+ * Tell the storage which file a model id serves now (its path from /v1/models, null if the server names none) and
+ * its NAME (the file stem without the quant, as the bench records it). True when that changed: the caller reloads
+ * what it shows for the id.
+ */
+export function noteModelFile(
+	modelId: string,
+	path: string | null | undefined,
+	name: string | null
+): boolean {
+	const ident = path ? fnv1a(path.replace(/\//g, '\\').toLowerCase()) : LEGACY;
+
+	if (identities.get(modelId) === ident) return false;
+
+	identities.set(modelId, ident);
+
+	if (ident !== LEGACY) adoptLegacy(modelId, ident, name);
+
+	return true;
 }
 
 export function readJson<T>(key: string): T | null {
@@ -55,11 +145,15 @@ export function writeJson(key: string, value: unknown): void {
 }
 
 export function readPart<T>(modelId: string, part: ModelPart): T | null {
-	return readJson<T>(storageKey(modelId, part));
+	const key = storageKey(modelId, part);
+
+	return key ? readJson<T>(key) : null;
 }
 
 export function writePart(modelId: string, part: ModelPart, value: unknown): void {
-	writeJson(storageKey(modelId, part), value);
+	const key = storageKey(modelId, part);
+
+	if (key) writeJson(key, value);
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {

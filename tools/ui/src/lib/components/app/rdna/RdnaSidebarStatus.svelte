@@ -18,7 +18,8 @@
 	} from '$lib/rdna/constants';
 	import { fmtRate } from '$lib/rdna/format';
 	import { LiveRates, type SlotLive } from '$lib/rdna/live';
-	import { loadPeaks } from '$lib/rdna/storage';
+	import { modelNaming, modelPathOf } from '$lib/rdna/model-info';
+	import { loadPeaks, noteModelFile } from '$lib/rdna/storage';
 	import type { PeakMap, RdnaSlot } from '$lib/rdna/types';
 	import { modelsStore, serverStore } from '$lib/stores';
 	import { onDestroy, onMount } from 'svelte';
@@ -98,7 +99,14 @@
 
 			if (res.ok && Array.isArray(res.data) && id === modelId) {
 				const t = Date.now();
-				// the status page may have recorded new peaks since the last poll
+				// the status page may have recorded new peaks since the last poll; they are kept per model file
+				const entry = modelsStore.routerModels.find((m) => m.id === id) as
+					| { status?: { args?: string[] } }
+					| undefined;
+				const path = modelPathOf(entry?.status?.args);
+
+				noteModelFile(id, path ?? null, modelNaming(path, null)?.name ?? null);
+
 				const stored = loadPeaks(id);
 
 				live = rates.update(res.data, t);

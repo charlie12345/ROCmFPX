@@ -948,6 +948,10 @@ std::string fs_path_to_utf8(const std::filesystem::path & path);
 std::string common_get_env(const std::string & name);
 void        common_set_env(const std::string & name, const std::string & value);
 
+// ROCmFPX [TAG_SYSTEM_MEMORY] the RAM this process holds (its working set on Windows, resident pages on Linux), 0 if
+// unknown; mapped model pages count while they are in use
+size_t common_process_resident_bytes();
+
 // reads a path from the environment, an unset variable gives an empty path
 std::filesystem::path common_get_path_from_env(const std::string & name);
 

@@ -28,7 +28,7 @@ import {
 	POLL_SLOTS_MS
 } from './constants';
 import { bucketIndex, type DepthBucket, depthBuckets } from './depth';
-import { hardwareLabel, memorySummary } from './hardware';
+import { hardwareLabel, memorySummary, ramSummary } from './hardware';
 import { type HfRepoInfo, lookupAvatar, lookupRepo, splitRepo } from './hf';
 import {
 	addToClassifier,
@@ -67,6 +67,7 @@ import {
 	loadPriority,
 	loadSeenHardware,
 	loadUiState,
+	noteModelFile,
 	saveSeenHardware,
 	saveUiState,
 	writePart
@@ -260,10 +261,11 @@ export class StatusStore {
 	now = $state(Date.now());
 	online = $state<boolean | null>(null);
 	prefillRows: DepthRow[] = $derived(this.depthRows(this.peaks.prefill, 'prefill'));
+	prio = $state.raw<PriorityMemory>(emptyPriority());
 
 	// ---------------------------------------------------------------- derived
 
-	prio = $state.raw<PriorityMemory>(emptyPriority());
+	ram = $derived(ramSummary(this.selectedProps?.system_memory));
 
 	requestsMissing = $state.raw<Record<string, boolean>>({});
 
@@ -760,6 +762,16 @@ export class StatusStore {
 
 		this.entries = list;
 		this.modelsLoaded = true;
+
+		// what the page keeps is per model file (storage.ts): another file under the selected id shows its own
+		for (const m of this.models) {
+			if (
+				noteModelFile(m.id, modelPathOf(m.args) ?? null, m.naming?.name ?? null) &&
+				m.id === this.selectedId
+			) {
+				this.loadMemory(m.id);
+			}
+		}
 
 		if (!this.selectedId || !list.some((e) => e.id === this.selectedId)) {
 			const views = this.models;
