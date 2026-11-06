@@ -212,6 +212,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int kbx  = txi / QI4_0;
     const int kqsx = txi % QI4_0;
 
+#if ROCMFPX_MMQ_LOAD_U32
+    // [TAG_MMQ_LOAD_U32]: the in-block index too (kqsx), else each load gets one more 64-bit add per K step
+    const char * x_base = x + (int64_t) kbx0*(int64_t) sizeof(block_q4_0);
+#endif // ROCMFPX_MMQ_LOAD_U32
+
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
         int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
@@ -220,8 +225,12 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
+#if ROCMFPX_MMQ_LOAD_U32
+        const int qs0 = get_int_b2(ggml_cuda_mmq_x_byte<block_q4_0>(x_base, i, stride, kbx, offsetof(block_q4_0, qs) + 4*kqsx), 0);
+#else
         const block_q4_0 * bxi = (const block_q4_0 *) x + kbx0 + i*stride + kbx;
         const int qs0 = get_int_b2(bxi->qs, kqsx);
+#endif // ROCMFPX_MMQ_LOAD_U32
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_qs[i*sram_stride + kbx*(2*QI4_0) + kqsx + 0]     = __vsub4((qs0 >> 0) & 0x0F0F0F0F, 0x08080808);
@@ -243,7 +252,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
+#if ROCMFPX_MMQ_LOAD_U32
+        const block_q4_0 * bxi = (const block_q4_0 *) ggml_cuda_mmq_x_byte<block_q4_0>(x_base, i, stride, kbxd, 0);
+#else
         const block_q4_0 * bxi = (const block_q4_0 *) x + kbx0 + i*stride + kbxd;
+#endif // ROCMFPX_MMQ_LOAD_U32
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride                     + kbxd] = bxi->d;
@@ -511,9 +524,19 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
             i = min(i, i_max);
         }
 
+#if ROCMFPX_MMQ_LOAD_U32
+        const char * q0 = ggml_cuda_mmq_x_row_byte<block_q8_0, has_fusion>(x, x_gate, kbx0, i, stride, kbx, offsetof(block_q8_0, qs) + 4*kqsx);
+#else
         const block_q8_0 * bxi = ggml_cuda_mmq_x_row<block_q8_0, has_fusion>(x, x_gate, kbx0, i, stride) + kbx;
+#endif // ROCMFPX_MMQ_LOAD_U32
 
-#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#if ROCMFPX_MMQ_LOAD_U32 && (defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE))
+        x_qs[i*sram_stride + 0             + txi] = get_int_b2(q0, 0);
+        x_qs[i*sram_stride + MMQ_TILE_NE_K + txi] = get_int_b2(q0 + (MMQ_TILE_NE_K/QI8_0)*sizeof(block_q8_0), 0);
+#elif ROCMFPX_MMQ_LOAD_U32
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = get_int_b2(q0, 0);
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = get_int_b2(q0 + (MMQ_TILE_NE_K/QI8_0)*sizeof(block_q8_0), 0);
+#elif defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_qs[i*sram_stride + 0             + txi] = get_int_b2(bxi[0].qs,                   kqsx);
         x_qs[i*sram_stride + MMQ_TILE_NE_K + txi] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
 #else
@@ -1481,9 +1504,14 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
             i = min(i, i_max);
         }
 
+#if ROCMFPX_MMQ_LOAD_U32
+        const int aux_q4 = get_int_b4(ggml_cuda_mmq_x_row_byte<block_iq4_xs, has_fusion>(x, x_gate, kbx0, i, stride, 0,
+                                          offsetof(block_iq4_xs, qs) + 4*kqsx), 0);
+#else
         const block_iq4_xs * bxi = ggml_cuda_mmq_x_row<block_iq4_xs, has_fusion>(x, x_gate, kbx0, i, stride);
 
         const int aux_q4 = get_int_b4(bxi->qs, kqsx);
+#endif // ROCMFPX_MMQ_LOAD_U32
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
         const int k0 = 8 * (kqsx / 4) + kqsx % 4;
 

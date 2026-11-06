@@ -461,6 +461,18 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_fusion_supported(const g
 // Fused gate/up/GLU: the weight tile alternates chunks of this many up and gate rows, so rows r and r + 8 of an MMA tile (same thread) pair up.
 static constexpr int GGML_CUDA_MMQ_FUSION_ROWS = 8;
 
+// ROCmFPX [TAG_MMQ_LOAD_U32] (HIP, clang 22+): weight tile addresses as the tile's base (x + kbx0 blocks) plus a 32-bit
+// unsigned byte offset within the tile. From the signed block index kbx0 + i*stride, clang 24 computes every load's 64-bit
+// address with a v_mad_i64_i32 on every K step (17-25 per step in the 16- to 64-column tiles of every MMQ type), and the
+// 64-bit addresses it keeps cost the 16-column tiles two waves (Q4_0: 189 -> 144 VGPRs with the offsets, 8 -> 10 waves).
+// The offset within the tile does not change from step to step. Clang 21 (ROCm 7.2) keeps the signed form: there the
+// offsets made Q4_0's 32-column tile spill more (112 -> 164 bytes per lane, 5.6% slower at 32 tokens).
+#if defined(GGML_USE_HIP) && defined(__clang_major__) && __clang_major__ >= 22
+#define ROCMFPX_MMQ_LOAD_U32 1
+#else
+#define ROCMFPX_MMQ_LOAD_U32 0
+#endif
+
 // Source of weight tile row i; with has_fusion the up or gate row that the interleaved tile holds there.
 template <typename block_t, bool has_fusion>
 static __device__ __forceinline__ const block_t * ggml_cuda_mmq_x_row(
@@ -468,12 +480,47 @@ static __device__ __forceinline__ const block_t * ggml_cuda_mmq_x_row(
     if constexpr (has_fusion) {
         constexpr int R = GGML_CUDA_MMQ_FUSION_ROWS;
         const char * x_src = (i / R) % 2 == 0 ? x : x_gate;
+#if ROCMFPX_MMQ_LOAD_U32
+        return (const block_t *) (x_src + (int64_t) kbx0*(int64_t) sizeof(block_t) +
+            (uint32_t) ((i / (2*R))*R + i % R)*(uint32_t) stride*(uint32_t) sizeof(block_t));
+#else
         return (const block_t *) x_src + kbx0 + ((i / (2*R))*R + i % R)*stride;
+#endif // ROCMFPX_MMQ_LOAD_U32
     } else {
         GGML_UNUSED(x_gate);
+#if ROCMFPX_MMQ_LOAD_U32
+        return (const block_t *) (x + (int64_t) kbx0*(int64_t) sizeof(block_t) +
+            (uint32_t) i*(uint32_t) stride*(uint32_t) sizeof(block_t));
+#else
         return (const block_t *) x + kbx0 + i*stride;
+#endif // ROCMFPX_MMQ_LOAD_U32
     }
 }
+
+#if ROCMFPX_MMQ_LOAD_U32
+// [TAG_MMQ_LOAD_U32] byte `byte` of block kb of weight tile row i, the whole in-tile offset in 32 bits (x_base = x + kbx0
+// blocks). An index added to the row pointer afterwards (bxi + kb, bxi->qs[k]) costs one more 64-bit add per K step.
+template <typename block_t>
+static __device__ __forceinline__ const char * ggml_cuda_mmq_x_byte(const char * x_base, const int i, const int stride, const int kb,
+                                                                  const int byte) {
+    return x_base + (((uint32_t) i*(uint32_t) stride + (uint32_t) kb)*(uint32_t) sizeof(block_t) + (uint32_t) byte);
+}
+
+// the same with ggml_cuda_mmq_x_row's row mapping (has_fusion: the up or gate row)
+template <typename block_t, bool has_fusion>
+static __device__ __forceinline__ const char * ggml_cuda_mmq_x_row_byte(
+        const char * __restrict__ x, const char * __restrict__ x_gate, const int kbx0, const int i, const int stride, const int kb,
+        const int byte) {
+    if constexpr (has_fusion) {
+        constexpr int R = GGML_CUDA_MMQ_FUSION_ROWS;
+        const char * x_src = (i / R) % 2 == 0 ? x : x_gate;
+        return ggml_cuda_mmq_x_byte<block_t>(x_src + (int64_t) kbx0*(int64_t) sizeof(block_t), (i / (2*R))*R + i % R, stride, kb, byte);
+    } else {
+        GGML_UNUSED(x_gate);
+        return ggml_cuda_mmq_x_byte<block_t>(x + (int64_t) kbx0*(int64_t) sizeof(block_t), i, stride, kb, byte);
+    }
+}
+#endif // ROCMFPX_MMQ_LOAD_U32
 
 #include "mmq-load-tiles.cuh"
 #include "mmq-vec-dot.cuh"
