@@ -146,7 +146,7 @@
 	--rf-enter-border: rgba(237, 28, 36, 0.9);
 	--rf-enter-glow: rgba(237, 28, 36, 0.4);
 	--rf-enter-sweep-glow: rgba(255, 106, 61, 0.85);
-	--rf-enter-bracket: #ff6a3d;
+	--rf-enter-bracket: rgb(255, 106, 61);
 	--rf-enter-bright: 1.7;
 }
 

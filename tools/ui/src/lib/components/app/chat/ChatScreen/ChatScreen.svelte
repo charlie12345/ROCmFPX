@@ -18,6 +18,7 @@
 	import { useChatScreenFileUpload } from '$lib/hooks/use-chat-screen-file-upload.svelte';
 	import { useChatScreenScroll } from '$lib/hooks/use-chat-screen-scroll.svelte';
 	import { useKeyboardShortcuts } from '$lib/hooks/use-keyboard-shortcuts.svelte';
+	import { ENTRANCE_CHAT_INPUT, playEntrance } from '$lib/rdna/entrance';
 	import {
 		chatStore,
 		conversationsStore,
@@ -26,7 +27,6 @@
 		settingsStore
 	} from '$lib/stores';
 	import { parseFilesToMessageExtras } from '$lib/utils/browser-only';
-	import { ENTRANCE_CHAT_INPUT, playEntrance } from '$lib/rdna/entrance';
 	import { onDestroy, onMount, tick } from 'svelte';
 
 	let { showCenteredEmpty = false } = $props();

@@ -155,11 +155,13 @@
 				<span class:rf-side-none={prefillNow === null} class="rf-side-num rf-num"
 					>{prefillNow !== null ? fmtRate(prefillNow, 0) : '–'}</span
 				>
+
 				<span class="rf-side-unit">prefill</span>
 			</span>
 
 			<span class="rf-side-figure">
 				<span class="rf-side-unit">decode</span>
+
 				<span class:rf-side-none={decodeNow === null} class="rf-side-num rf-num"
 					>{decodeNow !== null ? fmtRate(decodeNow, 1) : '–'}</span
 				>
