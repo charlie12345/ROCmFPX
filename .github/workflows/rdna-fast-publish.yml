@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: 'Id of a successful "RDNA-FAST release" run (the number in its URL)'
+        description: 'A successful "RDNA-FAST release" run: its id or its URL'
         required: true
       tag:
         description: 'Release tag to create, like v0.9.0'
@@ -26,17 +26,23 @@ jobs:
       contents: read
     outputs:
       sha: ${{ steps.run.outputs.sha }}
+      run_id: ${{ steps.run.outputs.run_id }}
+      tag: ${{ steps.run.outputs.tag }}
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      RUN_ID: ${{ inputs.run_id }}
-      TAG: ${{ inputs.tag }}
+      RUN_IN: ${{ inputs.run_id }}
+      TAG_IN: ${{ inputs.tag }}
     steps:
       - name: Check the run and the tag
         id: run
         run: |
-          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "run_id must be a number"; exit 1; }
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag must look like v1.2.3"; exit 1; }
+          # the run id from a run or job URL (.../actions/runs/<id>[/job/<job>]) or a bare number; spaces trimmed
+          if [[ "$RUN_IN" =~ runs/([0-9]+) ]]; then RUN_ID="${BASH_REMATCH[1]}"
+          elif [[ "$RUN_IN" =~ ([0-9]+) ]]; then RUN_ID="${BASH_REMATCH[1]}"
+          else echo "no run id in run_id: '$RUN_IN'"; exit 1; fi
+          TAG="$(echo "$TAG_IN" | tr -d '[:space:]')"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag must look like v1.2.3, got: '$TAG_IN'"; exit 1; }
           name=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID" --jq .name)
           conclusion=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID" --jq .conclusion)
           sha=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID" --jq .head_sha)
@@ -45,6 +51,8 @@ jobs:
           [[ "$conclusion" == "success" ]] || { echo "the run did not succeed"; exit 1; }
           if gh api "repos/$GH_REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then echo "tag $TAG exists already"; exit 1; fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
   github-release:
     needs: check
@@ -58,7 +66,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          run-id: ${{ inputs.run_id }}
+          run-id: ${{ needs.check.outputs.run_id }}
           github-token: ${{ github.token }}
           pattern: rdna-fast-*
           path: dist
@@ -68,7 +76,7 @@ jobs:
           rm -f dist/rdna-fast-ui.tree
           ls -la dist
           test -f dist/rdna-fast-ui.tar.gz && test -f dist/rdna-fast-linux-x86_64.tar.gz
-          gh release create "${{ inputs.tag }}" --target "${{ needs.check.outputs.sha }}" --prerelease --generate-notes dist/*
+          gh release create "${{ needs.check.outputs.tag }}" --target "${{ needs.check.outputs.sha }}" --prerelease --generate-notes dist/*
 
   container:
     needs: [check, github-release]
@@ -84,7 +92,7 @@ jobs:
           submodules: recursive
       - uses: actions/download-artifact@v4
         with:
-          run-id: ${{ inputs.run_id }}
+          run-id: ${{ needs.check.outputs.run_id }}
           github-token: ${{ github.token }}
           name: rdna-fast-ui
           path: ui-release
@@ -107,7 +115,7 @@ jobs:
           context: .
           file: .devops/rocmfpx.Dockerfile
           push: true
-          tags: ${{ steps.image.outputs.name }}:${{ inputs.tag }}
+          tags: ${{ steps.image.outputs.name }}:${{ needs.check.outputs.tag }}
           cache-from: type=gha
           provenance: mode=max
           sbom: true
