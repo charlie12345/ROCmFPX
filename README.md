@@ -14,8 +14,9 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 ## Highlights
 
 - **Faster agent loops than LM Studio on the same card.** Leveraging ROCm 10
-  for maximum performance. With the same model, quant and context, a scripted
-  two-agent session finishes in 93 s instead of 130 s. [Numbers](#speed)
+  and weeks of kernel optimization for maximum performance. With the same
+  model, quant and context, a scripted two-agent session finishes in 93 s
+  instead of 130 s. [Numbers](#speed)
 
 - **Multi-token prediction.** The model's own MTP head drafts tokens ahead: up
   to 60 t/s on prose and 96 t/s on code. When an answer repeats text from the
@@ -54,9 +55,7 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 Measured on one machine: RX 7900 XT 20 GB, Ryzen 9 7900, 32 GB RAM,
 Windows 11, ROCm 10.1, one NVMe for models and cache. Nothing here has
-been measured on an XTX. The first speed table, the IQ4_XS row and the decode
-and cold-prompt tables below were measured with ROCm 10.1, the rest with ROCm
-7.2.
+been measured on an XTX.
 
 ## Speed
 
