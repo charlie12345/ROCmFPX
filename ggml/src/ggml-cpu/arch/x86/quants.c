@@ -731,8 +731,59 @@ static inline __m256 q2_0_acc_block_avx2(const block_q2_0 * x, const block_q8_0 
 }
 #endif
 
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+// ROCmFPX [TAG_EXPERT_HANDOFF] one Q2_0 block (64 weights, 16 bytes) against its two Q8_0 blocks in one 512-bit step:
+// VBMI's multishift pulls the four 2-bit fields out of every byte, VNNI's dpbusd multiplies and adds them, and
+// sum((v - 1) * y) = sum(v * y) - sum(y) stays exact in int32. Weight j sits in byte j/4 at bit 2*(j%4), so output
+// byte j (lane j/8) takes its field from source bytes 2*(j/8) and 2*(j/8) + 1, placed in the low 16 bits of the lane.
+static inline __m512 q2_0_acc_block_avx512(const block_q2_0 * x, const block_q8_0 * y, __m512 acc) {
+    static const uint8_t lane_bytes[64] = {
+         0,  1,  1,  1,  1,  1,  1,  1,   2,  3,  3,  3,  3,  3,  3,  3,
+         4,  5,  5,  5,  5,  5,  5,  5,   6,  7,  7,  7,  7,  7,  7,  7,
+         8,  9,  9,  9,  9,  9,  9,  9,  10, 11, 11, 11, 11, 11, 11, 11,
+        12, 13, 13, 13, 13, 13, 13, 13,  14, 15, 15, 15, 15, 15, 15, 15,
+    };
+    const __m512i idx = _mm512_loadu_si512((const void *) lane_bytes);
+    const __m512i ctl = _mm512_set1_epi64(0x0E0C0A0806040200LL); // bit offsets 0, 2, ..., 14 of bytes 0..7
+    const __m512i q   = _mm512_permutexvar_epi8(idx, _mm512_castsi128_si512(_mm_loadu_si128((const __m128i *) x->qs)));
+    const __m512i v   = _mm512_and_si512(_mm512_multishift_epi64_epi8(ctl, q), _mm512_set1_epi8(3));
+    const __m512i yy  = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) y[0].qs)),
+                                           _mm256_loadu_si256((const __m256i *) y[1].qs), 1);
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i p   = _mm512_sub_epi32(_mm512_dpbusd_epi32(zero, v, yy), _mm512_dpbusd_epi32(zero, _mm512_set1_epi8(1), yy));
+    const float   dx  = GGML_CPU_FP16_TO_FP32(x->d);
+    const __m512  d   = _mm512_mask_blend_ps((__mmask16) 0xFF00, _mm512_set1_ps(dx * GGML_CPU_FP16_TO_FP32(y[0].d)),
+                                                                 _mm512_set1_ps(dx * GGML_CPU_FP16_TO_FP32(y[1].d)));
+    return _mm512_fmadd_ps(_mm512_cvtepi32_ps(p), d, acc);
+}
+#endif
+
 void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-#if defined(__AVX2__)
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+    assert(n % QK2_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    const int nb = n / QK2_0;
+
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 1 < nb; i += 2) {
+        acc0 = q2_0_acc_block_avx512(x + i + 0, y + 2*i + 0, acc0);
+        acc1 = q2_0_acc_block_avx512(x + i + 1, y + 2*i + 2, acc1);
+    }
+    if (i < nb) {
+        acc0 = q2_0_acc_block_avx512(x + i, y + 2*i, acc0);
+    }
+
+    *s = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+#elif defined(__AVX2__)
     assert(n % QK2_0 == 0);
     assert(nrc == 1);
     UNUSED(nrc);

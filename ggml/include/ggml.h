@@ -641,6 +641,8 @@ extern "C" {
 
         GGML_OP_GATED_DELTA_NET_REPLAY,
 
+        GGML_OP_EXPERT_HANDOFF, // ROCmFPX [TAG_EXPERT_HANDOFF], see ggml-expert-handoff.h
+
         GGML_OP_COUNT,
     };
 
@@ -2717,6 +2719,47 @@ extern "C" {
             struct ggml_tensor  * hist,
             struct ggml_tensor  * rep,
             int64_t               K);
+
+    // ROCmFPX [TAG_EXPERT_HANDOFF] expert handoff (layout and protocol in ggml-expert-handoff.h)
+    // send: looks up the selected experts' cache slots, writes the routed experts' input and selection to the
+    //       mailbox and rings it, so the host can compute the experts the device does not hold while the device
+    //       computes the others. Returns the slots [n_used, n_tokens] I32: the expert matmuls read their slots from
+    //       it, which orders the send before them.
+    //   x        : [n_embd, n_tokens]          F32
+    //   ids      : [n_used, n_tokens]          I32 the selected experts
+    //   slot_map : [n_expert] (any shape)      I32 each expert's cache slot, the layer's miss slot for the host's
+    //                                              experts (an id outside the map counts as a miss)
+    //   weights  : [1, n_used, n_tokens]       F32 the routing weights
+    // A selection without a miss is not sent: its join returns y at once (see ggml-expert-handoff.h).
+    struct ggml_expert_handoff_params {
+        void    * mailbox;       // host memory the device reads and writes in place, at the same address on both
+        int32_t   layer;
+        int32_t   max_tokens;    // the mailbox's capacities
+        int32_t   max_embd;
+        int32_t   max_used;
+        int32_t   miss_slot;     // the slot of the experts the host computes
+        int32_t * flags;         // memory of the computing backend, [n_layer]: the misses of each layer's last send
+        int32_t * counts;        // memory of the computing backend or NULL, [n_layer][counts_stride]: routing counts
+        int32_t   counts_stride;
+        int32_t   timeout_ms;    // join: give up waiting after this long
+    };
+
+    // (contiguous inputs)
+    GGML_API struct ggml_tensor * ggml_expert_handoff_send(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * slot_map,
+            struct ggml_tensor  * weights,
+            const struct ggml_expert_handoff_params * params);
+
+    // join: waits for the host's answer to the layer's send and returns y plus the host's experts' sum (after
+    // timeout_ms without an answer it returns y alone and counts a timeout in the mailbox header)
+    //   y : [n_embd, n_tokens] F32 the device's experts' sum
+    GGML_API struct ggml_tensor * ggml_expert_handoff_join(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * y,
+            const struct ggml_expert_handoff_params * params);
 
     // DSA lightning indexer
     //

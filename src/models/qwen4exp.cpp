@@ -1107,11 +1107,22 @@ static bool qwen4exp_qsa_decode_blocks(int64_t n_tokens, int64_t n_stream, int64
     return enabled && n_stream == 1 && qwen4exp_qsa_decode_direct(n_tokens, n_tokens, n_kv);
 }
 
+// the block selection of prompt ubatches lists -1 sentinels that only the maskless qsa kernel reads; it exists on
+// RDNA3.5 only, so on other cards (and when any layer's device lacks it) prompts keep the masked path
+static bool qwen4exp_dev_sparse_maskless(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+    using fn_t = bool (*)(ggml_backend_dev_t);
+    auto fn = (fn_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_dev_sparse_attn_maskless");
+    return fn != nullptr && fn(dev);
+}
+
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
-        const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams) {
+        const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams, bool sparse_maskless) {
     return blk_bias && n_stream==1 && ratio>1 && hparams.indexer_top_k%ratio==0 &&
         n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=16777216 && ubatch.token &&
-        (ubatch.n_tokens >= 128 || qwen4exp_qsa_decode_blocks(ubatch.n_tokens, n_stream, n_kv)) &&
+        ((ubatch.n_tokens >= 128 && sparse_maskless) || qwen4exp_qsa_decode_blocks(ubatch.n_tokens, n_stream, n_kv)) &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
         !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256;
 }
@@ -1194,7 +1205,7 @@ public:
         res &= bias->ne[0] == (compact ? n_blocks+params.ubatch.n_tokens : (blk_bias ? n_blocks : n_kv));
         res &= compact || bias->ne[1] == params.ubatch.n_tokens/n_stream;
         const bool blocks=qwen4exp_use_block_selection(blk_bias,n_stream,ratio,n_kv,
-                params.ubatch,params.cparams,params.hparams);
+                params.ubatch,params.cparams,params.hparams,sparse_maskless);
         const bool scalar=blocks && causal_attn && params.hparams.n_swa==0 && mctx->qsa_scalar_visibility(params.ubatch);
         res &= (tail_idxs != nullptr) == scalar;
         res &= compact == scalar;
@@ -1222,6 +1233,7 @@ public:
     bool decode_cached = false;
     bool compact = false;
     bool maskless = false;
+    bool sparse_maskless = false;   // every layer's device has the maskless qsa kernel
     int64_t score_strip = 0;
     std::vector<int64_t> score_key_limits;       // [QSA_SCORE_BOUNDS] per strip, empty = no bound
 
@@ -1377,7 +1389,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-        const bool scalar = qwen4exp_use_block_selection(blk_bias,n_stream,r,n_kv,ubatch,cparams,hparams) &&
+        bool sparse_maskless = true;
+        for (int32_t jl = 0; jl < (int32_t) hparams.n_layer() && sparse_maskless; ++jl) {
+            sparse_maskless = qwen4exp_dev_sparse_maskless(model.dev_layer(jl));
+        }
+        qsa->sparse_maskless = sparse_maskless;
+        const bool scalar = qwen4exp_use_block_selection(blk_bias,n_stream,r,n_kv,ubatch,cparams,hparams,sparse_maskless) &&
             cparams.causal_attn && hparams.n_swa==0 && mctx_hyb->qsa_scalar_visibility(ubatch);
         qsa->incremental_prefix = r == 4 && mctx_hyb->qsa_prefix_matches(ubatch);
         qsa->compact = scalar;

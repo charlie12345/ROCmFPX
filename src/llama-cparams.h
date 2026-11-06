@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace rocmfpx { class draft_vocabulary; }
@@ -59,6 +60,16 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;
+
+    // [TAG_EXPERT_HANDOFF]
+    int32_t     expert_cache;
+    int32_t     vram_reserve_mib;
+    int32_t     pool_workers;
+    std::string expert_profile;
+    std::string expert_profile_save;
+    int32_t     adapt_every;
+    int32_t     adapt_swaps;
+    float       adapt_decay;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

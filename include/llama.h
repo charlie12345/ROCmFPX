@@ -424,7 +424,18 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
-        size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        // ROCmFPX [TAG_EXPERT_HANDOFF] expert handoff: the routed experts kept in host memory are split per layer
+        // between a VRAM cache of the most used ones and host threads that compute the others [EXPERIMENTAL].
+        // It replaces upstream's MoE cache: moe_cache_size keeps its name and now sizes the handoff's cache.
+        size_t       moe_cache_size;      // VRAM cache size in bytes, 0 = off (unless expert_cache is set)
+        int32_t      expert_cache;        // VRAM cache size in units of the largest expert, -1 = fill the free VRAM, 0 = off (wins over moe_cache_size)
+        int32_t      vram_reserve_mib;    // VRAM the automatic cache size leaves free beyond the compute buffers, -1 = default (1024)
+        int32_t      pool_workers;        // host threads computing the experts the cache misses, 0 = auto
+        const char * expert_profile;      // routing counts to fill the cache from, NULL = none
+        const char * expert_profile_save; // file to write the routing counts to at exit, NULL = none
+        int32_t      adapt_every;         // swap hot experts into the cache every N decode graphs, 0 = the profile's cache stays (default 4)
+        int32_t      adapt_swaps;         // most swaps per round (default 96)
+        float        adapt_decay;         // the routing counts behind the swaps are multiplied by this after each round (default 0.7)
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

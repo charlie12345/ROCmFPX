@@ -22,9 +22,7 @@ struct llama_layer;
 struct llama_prec_policy;
 struct llama_hadamard;
 
-class llama_moe_cache;
-
-class llama_moe_cache;
+class llama_expert_handoff; // [TAG_EXPERT_HANDOFF]
 
 struct llama_memory_context_i;
 
@@ -823,7 +821,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_moe_cache        * moe_cache;
+    const llama_expert_handoff   * expert_handoff; // [TAG_EXPERT_HANDOFF] replaces upstream's MoE cache
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -1076,7 +1074,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_moe_cache        * moe_cache;
+    const llama_expert_handoff   * expert_handoff; // [TAG_EXPERT_HANDOFF] replaces upstream's MoE cache
 
     const llama_prec_policy * prec_policy;
 
@@ -1126,7 +1124,7 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
-    // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
+    // if slots is set, the experts are read from the expert handoff's VRAM cache at these slots (see build_moe_ffn)
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
@@ -1229,14 +1227,8 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
 
-    // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
-    ggml_tensor * build_moe_cache_slots(
-             ggml_tensor * selected_experts,
-             ggml_tensor * up_exps,
-             ggml_tensor * gate_exps,
-             ggml_tensor * down_exps,
-             ggml_tensor * gate_up_exps,
-                     int   il) const;
+    // [TAG_EXPERT_HANDOFF] the expert handoff's VRAM cache view used in place of the host experts w
+    ggml_tensor * build_cached_experts(ggml_tensor * w) const;
 
     //
     // inputs

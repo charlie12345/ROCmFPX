@@ -40,6 +40,11 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
+// ROCmFPX [TAG_EXPERT_HANDOFF] host memory the device reads and writes in place at the same address (pinned, mapped,
+// coherent; zeroed), for the expert handoff mailbox. NULL on failure. Not affected by GGML_CUDA_NO_PINNED.
+GGML_BACKEND_API void * ggml_backend_cuda_host_mapped_alloc(size_t size);
+GGML_BACKEND_API void   ggml_backend_cuda_host_mapped_free(void * ptr);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
 #ifdef  __cplusplus

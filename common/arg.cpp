@@ -943,6 +943,17 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.cors_origins = "localhost";
     }
 
+    // ROCmFPX [TAG_EXPERT_HANDOFF] the expert handoff reads the routed experts in place from host memory: keep all of
+    // them there unless an override already places them (--cpu-moe, --n-cpu-moe, -ot), and do not repack them
+    if (params.expert_cache != 0 || params.moe_cache_size > 0) {
+        const bool placed = std::any_of(params.tensor_buft_overrides.begin(), params.tensor_buft_overrides.end(),
+            [](const llama_model_tensor_buft_override & o) { return o.pattern && strstr(o.pattern, "exps") != nullptr; });
+        if (!placed) {
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
+        params.no_extra_bufts = true;
+    }
+
     // pad tensor_buft_overrides for llama_params_fit:
     const size_t ntbo = llama_max_tensor_buft_overrides();
     while (params.tensor_buft_overrides.size() < ntbo) {
@@ -2872,7 +2883,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
+        "expert handoff (see --expert-cache) with a VRAM expert cache of N MiB (default: 0, disabled)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
@@ -2880,6 +2891,90 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_cache_size = (size_t) value*1024*1024;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+    // ROCmFPX [TAG_EXPERT_HANDOFF] expert handoff (docs/expert-handoff.md)
+    add_opt(common_arg(
+        {"--expert-cache"}, "N|auto",
+        "expert handoff: keep the routed MoE experts in host RAM and the most used of them in a VRAM cache of N expert slots\n"
+        "(N times the largest expert; auto = the free VRAM less --vram-reserve-mib). Small batches split every layer:\n"
+        "the GPU computes the cached experts while CPU threads compute the others in place (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.expert_cache = -1;
+                return;
+            }
+            const int n = std::stoi(value);
+            if (n < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_cache = n == 0 ? 0 : n;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE"));
+    add_opt(common_arg(
+        {"--vram-reserve-mib"}, "N",
+        "expert handoff: VRAM that --expert-cache auto leaves free beyond the compute buffers (default: 1024)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vram_reserve_mib = value;
+        }
+    ).set_env("LLAMA_ARG_VRAM_RESERVE_MIB"));
+    add_opt(common_arg(
+        {"--pool-workers"}, "N",
+        "expert handoff: CPU threads computing the experts the VRAM cache misses (default: 0 = one per 4 logical CPUs, at least 2)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.pool_workers = value;
+        }
+    ).set_env("LLAMA_ARG_POOL_WORKERS"));
+    add_opt(common_arg(
+        {"--expert-profile"}, "FILE",
+        "expert handoff: routing counts to fill the VRAM expert cache from (written by --expert-profile-save)",
+        [](common_params & params, const std::string & value) {
+            params.expert_profile = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_PROFILE"));
+    add_opt(common_arg(
+        {"--expert-profile-save"}, "FILE",
+        "expert handoff: write the routing counts (those of --expert-profile plus this run's) to FILE at exit",
+        [](common_params & params, const std::string & value) {
+            params.expert_profile_save = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_PROFILE_SAVE"));
+    add_opt(common_arg(
+        {"--adapt-every"}, "N",
+        "expert handoff: every N decode steps, swap the most routed experts the VRAM cache misses in for the least "
+        "routed ones it holds (default: 4, 0 = the cache keeps what the profile put there)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.adapt_every = value;
+        }
+    ).set_env("LLAMA_ARG_ADAPT_EVERY"));
+    add_opt(common_arg(
+        {"--adapt-swaps"}, "N",
+        "expert handoff: most experts swapped into the VRAM cache per round (default: 96, 0 = none)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.adapt_swaps = value;
+        }
+    ).set_env("LLAMA_ARG_ADAPT_SWAPS"));
+    add_opt(common_arg(
+        {"--adapt-decay"}, "F",
+        "expert handoff: the routing counts behind the swaps are multiplied by F after each round (default: 0.7)",
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (!(f >= 0.0f && f <= 1.0f)) {
+                throw std::invalid_argument("invalid value: between 0 and 1");
+            }
+            params.adapt_decay = f;
+        }
+    ).set_env("LLAMA_ARG_ADAPT_DECAY"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

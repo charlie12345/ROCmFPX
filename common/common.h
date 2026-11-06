@@ -601,6 +601,16 @@ struct common_params {
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 
+    // ROCmFPX [TAG_EXPERT_HANDOFF] expert handoff
+    int32_t     expert_cache     =  0; // VRAM expert slots, -1 = auto, 0 = off
+    int32_t     vram_reserve_mib = -1; // -1 = default
+    int32_t     pool_workers     =  0; // 0 = auto
+    std::string expert_profile;        // NOLINT
+    std::string expert_profile_save;   // NOLINT
+    int32_t     adapt_every      =  4;   // 0 = off
+    int32_t     adapt_swaps      = 96;
+    float       adapt_decay      = 0.7f;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

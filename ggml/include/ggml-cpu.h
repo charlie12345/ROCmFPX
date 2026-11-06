@@ -147,6 +147,81 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
 
+    //
+    // ROCmFPX [TAG_EXPERT_HANDOFF] the host side of the expert handoff (protocol in ggml-expert-handoff.h): a pool of
+    // threads that answers a mailbox by computing the routed experts the device does not hold, from host memory
+    //
+
+    // the activation between the experts' gate/up and down projections, as build_moe_ffn applies it
+    enum ggml_expert_handoff_act {
+        GGML_EXPERT_HANDOFF_ACT_SILU       = 0,  // silu(gate) * up (ggml_swiglu_split)
+        GGML_EXPERT_HANDOFF_ACT_GELU       = 1,  // gelu(gate) * up, tanh approximation (ggml_geglu_split)
+        GGML_EXPERT_HANDOFF_ACT_RELU       = 2,  // relu(gate) * up (ggml_reglu_split)
+        GGML_EXPERT_HANDOFF_ACT_SWIGLU_OAI = 3,  // g = min(gate, limit): g*sigmoid(alpha*g) * (clamp(up, +-limit) + 1)
+        GGML_EXPERT_HANDOFF_ACT_SILU_CLAMP = 4,  // silu(min(gate, limit)) * clamp(up, +-limit) (ggml_swiglu_clamp)
+        GGML_EXPERT_HANDOFF_ACT_SILU_LIMIT = 5,  // min(silu(gate), limit) * clamp(up, +-limit)
+        GGML_EXPERT_HANDOFF_ACT_SITU       = 6,  // beta*tanh(gate/beta)*sigmoid(gate) * (lb > 0 ? lb*tanh(up/lb) : up)
+        // experts without a gate projection: the activation of up alone
+        GGML_EXPERT_HANDOFF_ACT_UP_SILU     = 7,
+        GGML_EXPERT_HANDOFF_ACT_UP_GELU     = 8,
+        GGML_EXPERT_HANDOFF_ACT_UP_RELU     = 9,
+        GGML_EXPERT_HANDOFF_ACT_UP_RELU_SQR = 10,
+    };
+
+    struct ggml_expert_handoff_layer {
+        // the routed experts in host memory, ggml layout: gate and up [n_embd, n_ff, n_expert] or the merged
+        // gate_up [n_embd, 2*n_ff, n_expert] (gate rows first), or up alone; down [n_ff, n_embd, n_expert]
+        const struct ggml_tensor * gate;
+        const struct ggml_tensor * up;
+        const struct ggml_tensor * gate_up;
+        const struct ggml_tensor * down;
+        // per-expert output scales [n_expert] or NULL (gate_up takes up_scale, like the graph)
+        const float * gate_scale;
+        const float * up_scale;
+        const float * down_scale;
+        // per-expert biases in host memory or NULL: gate and up [n_expert][n_ff] (gate_up: [n_expert][2*n_ff],
+        // in up_bias), down [n_expert][n_embd]; added after the scale, like the graph
+        const float * gate_bias;
+        const float * up_bias;
+        const float * down_bias;
+        enum ggml_expert_handoff_act act;
+        float   alpha;         // SWIGLU_OAI
+        float   limit;         // SWIGLU_OAI, SILU_CLAMP, SILU_LIMIT
+        float   beta;          // SITU
+        float   lb;            // SITU
+        bool    weight_before; // the routing weight scales the input (llama4) instead of the output
+        int32_t n_used;        // only the first n_used selected experts of a token count, 0 = all
+        int32_t miss_slot;     // the slot the device gives the experts the host computes
+    };
+
+    struct ggml_expert_handoff_stats {
+        uint64_t n_layers;  // layers answered
+        uint64_t n_routed;  // experts routed in them
+        uint64_t n_host;    // of which the host computed
+        uint64_t busy_ns;   // time from a send to its answer
+    };
+
+    typedef struct ggml_expert_handoff_host * ggml_expert_handoff_host_t;
+
+    // mailbox: at least ggml_expert_handoff_size(dims) bytes the device reads and writes in place; n_layer: the
+    // highest layer index + 1; n_workers: threads (they spin while work is expected)
+    GGML_BACKEND_API ggml_expert_handoff_host_t ggml_expert_handoff_host_new(
+            void * mailbox, int32_t max_tokens, int32_t max_embd, int32_t max_used, int32_t n_layer, int32_t n_workers);
+    GGML_BACKEND_API void ggml_expert_handoff_host_free(ggml_expert_handoff_host_t host);
+
+    // returns false if the host cannot compute these experts (types without CPU dot products, shapes)
+    GGML_BACKEND_API bool ggml_expert_handoff_host_set_layer(ggml_expert_handoff_host_t host, int32_t layer, const struct ggml_expert_handoff_layer * l);
+
+    // a graph with handoff layers is about to run: spin for work from now on (the pool sleeps after a quiet spell)
+    GGML_BACKEND_API void ggml_expert_handoff_host_wake(ggml_expert_handoff_host_t host);
+    // the graphs are done: stop spinning (one thread keeps looking at the mailbox every millisecond)
+    GGML_BACKEND_API void ggml_expert_handoff_host_idle(ggml_expert_handoff_host_t host);
+
+    GGML_BACKEND_API void ggml_expert_handoff_host_get_stats(ggml_expert_handoff_host_t host, struct ggml_expert_handoff_stats * stats);
+
+    // how often each expert of a layer was routed since the start (hits and misses), n_expert entries or NULL
+    GGML_BACKEND_API const uint64_t * ggml_expert_handoff_host_counts(ggml_expert_handoff_host_t host, int32_t layer);
+
 #ifdef __cplusplus
 }
 #endif

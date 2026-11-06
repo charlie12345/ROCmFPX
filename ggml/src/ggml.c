@@ -7,6 +7,7 @@
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "ggml-expert-handoff.h"
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
@@ -1192,9 +1193,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "GATED_DELTA_NET_REPLAY",
+
+    "EXPERT_HANDOFF",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1309,9 +1312,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "gated_delta_net_replay(q, k, v, g, beta, s, hist, rep)",
+
+    "expert_handoff(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6607,6 +6612,76 @@ struct ggml_tensor * ggml_gated_delta_net_replay(
     result->src[5] = state;
     result->src[6] = hist;
     result->src[7] = rep;
+
+    return result;
+}
+
+// ggml_expert_handoff_send / ggml_expert_handoff_join [TAG_EXPERT_HANDOFF]
+
+static void ggml_expert_handoff_set_ptr(struct ggml_tensor * result, int32_t lo, int32_t hi, const void * ptr) {
+    const uint64_t p = (uint64_t) (uintptr_t) ptr;
+    ggml_set_op_params_i32(result, lo, (int32_t) (uint32_t) (p & 0xffffffffu));
+    ggml_set_op_params_i32(result, hi, (int32_t) (uint32_t) (p >> 32));
+}
+
+static void ggml_expert_handoff_set_params(struct ggml_tensor * result, int32_t mode, const struct ggml_expert_handoff_params * p) {
+    GGML_ASSERT(p->mailbox != NULL && p->flags != NULL);
+    ggml_set_op_params_i32(result, GGML_EXPERT_HANDOFF_P_MODE,       mode);
+    ggml_expert_handoff_set_ptr(result, GGML_EXPERT_HANDOFF_P_PTR_LO, GGML_EXPERT_HANDOFF_P_PTR_HI, p->mailbox);
+    ggml_set_op_params_i32(result, GGML_EXPERT_HANDOFF_P_LAYER,      p->layer);
+    ggml_set_op_params_i32(result, GGML_EXPERT_HANDOFF_P_MAX_TOKENS, p->max_tokens);
+    ggml_set_op_params_i32(result, GGML_EXPERT_HANDOFF_P_MAX_EMBD,   p->max_embd);
+    ggml_set_op_params_i32(result, GGML_EXPERT_HANDOFF_P_MAX_USED,   p->max_used);
+    ggml_set_op_params_i32(result, GGML_EXPERT_HANDOFF_P_TIMEOUT_MS, p->timeout_ms);
+    ggml_set_op_params_i32(result, GGML_EXPERT_HANDOFF_P_MISS_SLOT,  p->miss_slot);
+    ggml_expert_handoff_set_ptr(result, GGML_EXPERT_HANDOFF_P_FLAGS_LO,  GGML_EXPERT_HANDOFF_P_FLAGS_HI,  p->flags);
+    ggml_expert_handoff_set_ptr(result, GGML_EXPERT_HANDOFF_P_COUNTS_LO, GGML_EXPERT_HANDOFF_P_COUNTS_HI, p->counts);
+    ggml_set_op_params_i32(result, GGML_EXPERT_HANDOFF_P_COUNTS_STRIDE, p->counts_stride);
+}
+
+struct ggml_tensor * ggml_expert_handoff_send(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * slot_map,
+        struct ggml_tensor  * weights,
+        const struct ggml_expert_handoff_params * p) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && slot_map->type == GGML_TYPE_I32 && weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(ids) && ggml_is_contiguous(slot_map) && ggml_is_contiguous(weights));
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t n_tokens = ggml_nrows(x);
+    const int64_t n_used   = ids->ne[0];
+
+    GGML_ASSERT(ggml_nelements(ids) == n_used*n_tokens && ggml_nelements(weights) == n_used*n_tokens);
+    GGML_ASSERT(n_tokens <= p->max_tokens && n_embd <= p->max_embd && n_used <= p->max_used);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+
+    ggml_expert_handoff_set_params(result, GGML_EXPERT_HANDOFF_SEND, p);
+
+    result->op     = GGML_OP_EXPERT_HANDOFF;
+    result->src[0] = x;
+    result->src[1] = ids;
+    result->src[2] = slot_map;
+    result->src[3] = weights;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_expert_handoff_join(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * y,
+        const struct ggml_expert_handoff_params * p) {
+    GGML_ASSERT(y->type == GGML_TYPE_F32 && ggml_is_contiguous(y));
+    GGML_ASSERT(ggml_nrows(y) <= p->max_tokens && y->ne[0] <= p->max_embd);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, y->ne);
+
+    ggml_expert_handoff_set_params(result, GGML_EXPERT_HANDOFF_JOIN, p);
+
+    result->op     = GGML_OP_EXPERT_HANDOFF;
+    result->src[0] = y;
 
     return result;
 }

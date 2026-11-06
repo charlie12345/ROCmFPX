@@ -77,6 +77,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx, const 
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/expert-handoff.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -2759,6 +2760,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_GATED_DELTA_NET_REPLAY:
             ggml_cuda_op_gated_delta_net(ctx, dst);
+            break;
+        case GGML_OP_EXPERT_HANDOFF:
+            ggml_cuda_op_expert_handoff(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -6656,6 +6660,14 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
     *total /= share_count;
 }
 
+void * ggml_backend_cuda_host_mapped_alloc(size_t size) {
+    return ggml_cuda_host_mapped_alloc(size);
+}
+
+void ggml_backend_cuda_host_mapped_free(void * ptr) {
+    ggml_cuda_host_mapped_free(ptr);
+}
+
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return false;
@@ -7424,6 +7436,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_GATED_DELTA_NET_REPLAY:
             // RDNA3.5 keeps the snapshots: its tiled kernel for 16+ token batches has no replay variant
             return !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[dev_ctx->device].cc);
+        case GGML_OP_EXPERT_HANDOFF: // [TAG_EXPERT_HANDOFF] shapes and types are checked when the op is made
+            return true;
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -7620,8 +7634,21 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// ROCmFPX: whether dev runs sparse flash attention without a mask (the qsa kernel, RDNA3.5 only). A model that drops
+// the mask for its selected cells needs it; without it, the attention keeps the mask.
+static bool ggml_backend_cuda_dev_sparse_attn_maskless(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg()) {
+        return false;
+    }
+    const auto * ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    return GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx->device].cc);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_sparse_attn_maskless") == 0) {
+        return (void *)ggml_backend_cuda_dev_sparse_attn_maskless;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
@@ -7639,6 +7666,13 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    // ROCmFPX [TAG_EXPERT_HANDOFF]
+    if (strcmp(name, "ggml_backend_host_mapped_alloc") == 0) {
+        return (void *)ggml_backend_cuda_host_mapped_alloc;
+    }
+    if (strcmp(name, "ggml_backend_host_mapped_free") == 0) {
+        return (void *)ggml_backend_cuda_host_mapped_free;
     }
     return nullptr;
 }

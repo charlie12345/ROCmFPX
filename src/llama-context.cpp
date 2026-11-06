@@ -13,15 +13,16 @@
 #include "llama-kv-cache.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
-#include "llama-moe-cache.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -36,11 +37,11 @@ static void llama_verify_hadamard_graph(
         ggml_cgraph * gf,
         const llama_hadamard_rotations & rotations,
         const llama_hadamard_rotations & inverses,
-        const llama_moe_cache * moe_cache) {
-    // the MoE cache gives the matmul a copy of the expert weights, so the copy also needs the transform of its source
+        const llama_expert_handoff * expert_handoff) {
+    // the expert handoff's VRAM cache gives the matmul a copy of the expert weights, so the copy also needs the transform of its source
     llama_hadamard_rotations forward = rotations;
     for (const auto & [w, t] : rotations) {
-        if (const ggml_tensor * cached = moe_cache ? moe_cache->get_experts(w) : nullptr) {
+        if (const ggml_tensor * cached = expert_handoff ? expert_handoff->get_experts(w) : nullptr) {
             forward.emplace(cached, t);
         }
     }
@@ -390,6 +391,16 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
 
+    // [TAG_EXPERT_HANDOFF]
+    cparams.expert_cache        = params.expert_cache;
+    cparams.vram_reserve_mib    = params.vram_reserve_mib;
+    cparams.pool_workers        = params.pool_workers;
+    cparams.expert_profile      = params.expert_profile      ? params.expert_profile      : "";
+    cparams.expert_profile_save = params.expert_profile_save ? params.expert_profile_save : "";
+    cparams.adapt_every         = params.adapt_every;
+    cparams.adapt_swaps         = params.adapt_swaps;
+    cparams.adapt_decay         = params.adapt_decay;
+
     // initialized later
     cparams.pipeline_parallel = false;
     cparams.training = false;
@@ -588,7 +599,8 @@ llama_context::llama_context(
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides() &&
-            cparams.moe_cache_size == 0; // not supported by the MoE cache
+            cparams.moe_cache_size == 0 && // not supported by the expert handoff (one mailbox, one stream)
+            cparams.expert_cache == 0;
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -616,8 +628,34 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+        // [TAG_EXPERT_HANDOFF] replaces upstream's MoE cache: moe_cache_size (--moe-cache-mib) sizes the handoff's
+        // VRAM cache in bytes, expert_cache (--expert-cache) in experts or auto; the expert slots win
+        if ((cparams.expert_cache != 0 || cparams.moe_cache_size > 0) && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+            // tensor parallelism splits every layer over the GPUs; the handoff follows the layer split
+            LLAMA_LOG_WARN("%s: expert handoff does not work with --split-mode tensor; the experts stay where they are\n", __func__);
+        } else if (cparams.expert_cache != 0 || cparams.moe_cache_size > 0) {
+            // the compute buffers first, so the cache takes the VRAM they leave: a large ubatch needs several GB of
+            // them (prompts of that size take the usual path, which the reserve graph already is without a cache)
+            if (!model.hparams.no_alloc) {
+                sched_reserve();
+                sched_need_reserve = true;
+            }
+            llama_expert_handoff_params ehp;
+            ehp.n_slots          = cparams.expert_cache != 0 ? cparams.expert_cache : -1;
+            ehp.budget_bytes     = cparams.expert_cache != 0 ? 0 : cparams.moe_cache_size;
+            ehp.vram_reserve_mib = cparams.vram_reserve_mib;
+            ehp.n_workers        = cparams.pool_workers;
+            ehp.profile          = cparams.expert_profile;
+            ehp.profile_save     = cparams.expert_profile_save;
+            // the mailbox holds a whole ubatch up to 512 tokens: prompts that small may go to the host
+            ehp.max_tokens       = std::max<uint32_t>(32, std::min<uint32_t>(cparams.n_ubatch, 512));
+            ehp.adapt_every      = cparams.adapt_every;
+            ehp.adapt_swaps      = cparams.adapt_swaps;
+            ehp.adapt_decay      = cparams.adapt_decay;
+            expert_handoff = std::make_unique<llama_expert_handoff>(model, backend_ptrs, backend_buft, ehp);
+        } else if (params.ctx_other != nullptr && llama_get_model(params.ctx_other) == &model) {
+            // an MTP draft context of the same model reads the target's VRAM cache, which holds its layer whole
+            expert_handoff_shared = params.ctx_other->get_expert_handoff();
         }
 
         sched_reserve();
@@ -948,6 +986,11 @@ void llama_context::synchronize() {
     const int64_t t_prof_sync = prof_on ? ggml_time_us() : 0;
 
     ggml_backend_sched_synchronize(sched.get());
+
+    // [TAG_EXPERT_HANDOFF] the graphs are done: the host pool stops spinning until the next one
+    if (expert_handoff) {
+        expert_handoff->idle();
+    }
 
     if (prof_on) {
         prof_t_sync += ggml_time_us() - t_prof_sync;
@@ -1634,6 +1677,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // [TAG_DECODE_PROFILE] LLAMA_GRAPH_OPS=1: the ops of the first single-token graph, by count (views and
+        // reshapes are free and left out)
+        static const bool graph_ops = getenv("LLAMA_GRAPH_OPS") && atoi(getenv("LLAMA_GRAPH_OPS")) != 0;
+        static bool graph_ops_done = false;
+        if (graph_ops && !graph_ops_done && ubatch.n_tokens == 1 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            graph_ops_done = true;
+            std::map<std::string, int> hist;
+            int n_real = 0;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                const ggml_tensor * t = ggml_graph_node(gf, i);
+                if (ggml_is_empty(t) || t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE ||
+                    t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) {
+                    continue;
+                }
+                hist[ggml_op_desc(t)]++;
+                n_real++;
+            }
+            std::vector<std::pair<int, std::string>> v;
+            for (const auto & [k, n] : hist) {
+                v.emplace_back(n, k);
+            }
+            std::sort(v.rbegin(), v.rend());
+            std::string s;
+            for (const auto & [n, k] : v) {
+                s += " " + k + " " + std::to_string(n);
+            }
+            LLAMA_LOG_WARN("graph ops: %d nodes, %d that run:%s\n", ggml_graph_n_nodes(gf), n_real, s.c_str());
+        }
+
         gf_res_prev_active = res;
     }
 
@@ -1650,6 +1722,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     prof_lap(prof_t_inputs);
+
+    // [TAG_EXPERT_HANDOFF] the adaptive cache's swaps, between decode graphs
+    if (expert_handoff) {
+        expert_handoff->adapt(ubatch.n_tokens);
+    }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
@@ -2879,7 +2956,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
-        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
+        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, get_expert_handoff());
         hadamard_verified = true;
     }
 
@@ -2919,7 +2996,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.moe_cache   =*/ moe_cache.get(),
+        /*.expert_handoff =*/ get_expert_handoff(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
@@ -2969,6 +3046,12 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+    // [TAG_EXPERT_HANDOFF] the host pool must be spinning before the device sends it a layer
+    if (expert_handoff) {
+        expert_handoff->check();
+        expert_handoff->wake();
+    }
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         if (auto * qsa = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) { qsa->qsa_invalidate(); }
@@ -2982,11 +3065,6 @@ ggml_status llama_context::graph_compute(
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
-
-    // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
-        return true;
-    }
 
     auto & st = lctx->copy_experts;
 
@@ -3035,10 +3113,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             last++;
         }
 
-        // the experts in the MoE cache are copied from device memory, the others are uploaded
+        // the experts in the expert handoff's VRAM cache are copied from device memory, the others are uploaded
+        const llama_expert_handoff * eh = lctx->get_expert_handoff();
         int64_t next = first;
-        for (int64_t e = first; e <= last && lctx->moe_cache; ) {
-            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
+        for (int64_t e = first; e <= last && eh; ) {
+            const int64_t n = eh->copy_experts(backend, src, dst, e, last);
             if (n == 0) {
                 e++;
                 continue;
@@ -3935,8 +4014,8 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
-    if (moe_cache) {
-        for (const auto & [buft, size] : moe_cache->memory_breakdown()) {
+    if (expert_handoff) {
+        for (const auto & [buft, size] : expert_handoff->memory_breakdown()) {
             ret[buft].context += size;
         }
     }
@@ -4230,6 +4309,14 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.expert_cache                =*/ 0,
+        /*.vram_reserve_mib            =*/ -1,
+        /*.pool_workers                =*/ 0,
+        /*.expert_profile              =*/ nullptr,
+        /*.expert_profile_save         =*/ nullptr,
+        /*.adapt_every                 =*/ 4,
+        /*.adapt_swaps                 =*/ 96,
+        /*.adapt_decay                 =*/ 0.7f,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

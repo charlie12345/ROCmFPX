@@ -2,7 +2,10 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
-#include "llama-moe-cache.h"
+#include "llama-expert-handoff.h"
+
+#include "ggml-expert-handoff.h"
+#include "ggml-cpu.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -1491,7 +1494,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
-    moe_cache        (params.moe_cache),
+    expert_handoff   (params.expert_handoff),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     samplers         (params.samplers),
@@ -1592,10 +1595,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w_s,
           ggml_tensor * slots) const {
     cur = build_hadamard_input(w, cur);
-    // the experts in the MoE cache are selected by their slots
+    // the experts in the expert handoff's VRAM cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+        ggml_mul_mat_id(ctx0, build_cached_experts(w), cur, slots);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2225,8 +2228,92 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    ggml_tensor * slots = nullptr;
+
+    // ROCmFPX [TAG_EXPERT_HANDOFF] small batches split the layer: the device computes the experts in its VRAM cache
+    // (the others read the zeroed miss slot), the host pool computes the others meanwhile, the join adds its sum.
+    // The send runs before the device's experts because their matmuls take their slots from it.
+    bool eh_join = false;
+    ggml_backend_t eh_backend = nullptr;
+    if (expert_handoff != nullptr && il >= 0) {
+        // the expert FFN as the code below computes it, for the host pool
+        llama_expert_handoff_form form;
+        const bool  gated = gate_exps || gate_up_exps;
+        const float limit = hparams.swiglu_clamp_exp[il];
+        switch (type_op) {
+            case LLM_FFN_SILU:
+                if (!gated) {
+                    form.act = GGML_EXPERT_HANDOFF_ACT_UP_SILU;
+                } else if (gate_exps && limit > 1e-6f) {
+                    const bool fused = arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT ||
+                        (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4;
+                    form.act   = fused ? GGML_EXPERT_HANDOFF_ACT_SILU_CLAMP : GGML_EXPERT_HANDOFF_ACT_SILU_LIMIT;
+                    form.limit = limit;
+                } else {
+                    form.act = GGML_EXPERT_HANDOFF_ACT_SILU;
+                }
+                break;
+            case LLM_FFN_GELU:
+                form.act = gated ? GGML_EXPERT_HANDOFF_ACT_GELU : GGML_EXPERT_HANDOFF_ACT_UP_GELU;
+                break;
+            case LLM_FFN_RELU:
+                form.act = gated ? GGML_EXPERT_HANDOFF_ACT_RELU : GGML_EXPERT_HANDOFF_ACT_UP_RELU;
+                break;
+            case LLM_FFN_RELU_SQR:
+                form.act = gated ? -1 : GGML_EXPERT_HANDOFF_ACT_UP_RELU_SQR;
+                break;
+            case LLM_FFN_SWIGLU_OAI_MOE:
+                form.act   = GGML_EXPERT_HANDOFF_ACT_SWIGLU_OAI;
+                form.alpha = 1.702f; // as in the case below
+                form.limit = 7.0f;
+                break;
+            case LLM_FFN_SITU:
+                form.act  = gated ? GGML_EXPERT_HANDOFF_ACT_SITU : -1;
+                form.beta = hparams.situ_beta;
+                form.lb   = hparams.situ_linear_beta;
+                break;
+            default:
+                break;
+        }
+        form.weight_before = weight_before_ffn;
+        if ((int64_t) hparams.n_expert_used(il) != selected_experts->ne[0]) {
+            form.n_used = (int32_t) hparams.n_expert_used(il);
+        }
+        bool ok = form.act >= 0 && arch != LLM_ARCH_GROVEMOE;
+        if (ok && hdmd) {
+            for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
+                ok = ok && (w == nullptr || hdmd->rot.find(w) == hdmd->rot.end());
+            }
+        }
+        // this scheduler's backend on the GPU that caches the layer (an MTP draft context shares the target's
+        // handoff, but has backends of its own)
+        eh_backend = nullptr;
+        if (ok) {
+            ggml_backend_dev_t dev = expert_handoff->device(il);
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched) && eh_backend == nullptr && dev != nullptr; ++i) {
+                ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+                if (ggml_backend_get_device(b) == dev) {
+                    eh_backend = b;
+                }
+            }
+            ok = eh_backend != nullptr;
+        }
+        if (ok && expert_handoff->use(il, n_tokens, form)) {
+            ggml_tensor * ids = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
+            ggml_tensor * x   = ggml_is_contiguous(cur)     ? cur     : ggml_cont(ctx0, cur);
+            ggml_tensor * w   = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
+            const ggml_expert_handoff_params ehp = expert_handoff->params(il);
+            // the send looks the slots up in the layer's slot map itself (one kernel less per layer)
+            ggml_tensor * send = ggml_expert_handoff_send(ctx0, x, ids, expert_handoff->slot_map(il), w, &ehp);
+            if (ggml_backend_supports_op(eh_backend, send)) {
+                slots = send;
+                ggml_backend_sched_set_tensor_backend(sched, slots, eh_backend);
+                cb(slots, "ffn_moe_handoff_send", il);
+                ggml_build_forward_expand(gf, slots);
+                eh_join = true;
+            }
+        }
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2250,7 +2337,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_up_exps_b) {
-            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
+            gate_up = slots ? ggml_add_id(ctx0, gate_up, build_cached_experts(gate_up_exps_b), slots) // [TAG_EXPERT_HANDOFF] zero at the miss slot
+                          : ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
             cb(gate_up, "ffn_moe_gate_up_biased", il);
         }
 
@@ -2269,7 +2357,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (up_exps_b) {
-            up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
+            up = slots ? ggml_add_id(ctx0, up, build_cached_experts(up_exps_b), slots) // [TAG_EXPERT_HANDOFF] zero at the miss slot
+                          : ggml_add_id(ctx0, up, up_exps_b, selected_experts);
             cb(up, "ffn_moe_up_biased", il);
         }
 
@@ -2285,7 +2374,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps_b) {
-            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
+            cur = slots ? ggml_add_id(ctx0, cur, build_cached_experts(gate_exps_b), slots) // [TAG_EXPERT_HANDOFF] zero at the miss slot
+                          : ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
             cb(cur, "ffn_moe_gate_biased", il);
         }
     }
@@ -2387,7 +2477,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (down_exps_b) {
-        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+        experts = slots ? ggml_add_id(ctx0, experts, build_cached_experts(down_exps_b), slots) // [TAG_EXPERT_HANDOFF] zero at the miss slot
+                          : ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
     }
 
@@ -2427,51 +2518,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         moe_out = ggml_cont(ctx0, moe_out);
     }
 
+    // [TAG_EXPERT_HANDOFF] add the host's experts
+    if (eh_join) {
+        if (!ggml_is_contiguous(moe_out)) {
+            moe_out = ggml_cont(ctx0, moe_out);
+        }
+        const ggml_expert_handoff_params ehp = expert_handoff->params(il);
+        moe_out = ggml_expert_handoff_join(ctx0, moe_out, &ehp);
+        ggml_backend_sched_set_tensor_backend(sched, moe_out, eh_backend);
+        cb(moe_out, "ffn_moe_handoff_join", il);
+    }
+
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
 }
 
-ggml_tensor * llm_graph_context::build_moe_cache_slots(
-         ggml_tensor * selected_experts,
-         ggml_tensor * up_exps,
-         ggml_tensor * gate_exps,
-         ggml_tensor * down_exps,
-         ggml_tensor * gate_up_exps,
-                 int   il) const {
-    if (moe_cache == nullptr) {
-        return nullptr;
-    }
-
-    ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0]);
-    if (slot_map == nullptr) {
-        return nullptr;
-    }
-    for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
-        if (w != nullptr && moe_cache->get_experts(w) == nullptr) {
-            return nullptr;
+ggml_tensor * llm_graph_context::build_cached_experts(ggml_tensor * w) const {
+    if (expert_handoff != nullptr) {
+        if (ggml_tensor * t = expert_handoff->get_experts(w)) {
+            return t;
         }
     }
-
-    ggml_tensor * ids = selected_experts;
-    if (!ggml_is_contiguous(ids)) {
-        ids = ggml_cont(ctx0, ids);
-    }
-    ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
-
-    // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
-    // the callback reads the selected experts, uploads the missing ones and updates the slot map
-    ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids); // [1, n_expert_used*n_tokens]
-    if (!ggml_backend_supports_op(moe_cache->backend(il), slots)) {
-        return nullptr;
-    }
-    ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
-    cb(slots, "ffn_moe_slots", il);
-
-    // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first
-    ggml_build_forward_expand(gf, slots);
-
-    return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
+    return nullptr;
 }
 
 // input embeddings with optional lora
