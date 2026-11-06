@@ -634,6 +634,9 @@ llama_context::llama_context(
             ehp.profile          = cparams.expert_profile;
             ehp.profile_save     = cparams.expert_profile_save;
             expert_handoff = std::make_unique<llama_expert_handoff>(model, backend_ptrs, backend_buft, ehp);
+        } else if (params.ctx_other != nullptr && llama_get_model(params.ctx_other) == &model) {
+            // an MTP draft context of the same model reads the target's VRAM cache, which holds its layer whole
+            expert_handoff_shared = params.ctx_other->get_expert_handoff();
         }
 
         sched_reserve();
@@ -964,6 +967,11 @@ void llama_context::synchronize() {
     const int64_t t_prof_sync = prof_on ? ggml_time_us() : 0;
 
     ggml_backend_sched_synchronize(sched.get());
+
+    // [TAG_EXPERT_HANDOFF] the graphs are done: the host pool stops spinning until the next one
+    if (expert_handoff) {
+        expert_handoff->idle();
+    }
 
     if (prof_on) {
         prof_t_sync += ggml_time_us() - t_prof_sync;
@@ -2895,7 +2903,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
-        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, expert_handoff.get());
+        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, get_expert_handoff());
         hadamard_verified = true;
     }
 
@@ -2935,7 +2943,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.expert_handoff =*/ expert_handoff.get(),
+        /*.expert_handoff =*/ get_expert_handoff(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
@@ -3053,9 +3061,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         // the experts in the expert handoff's VRAM cache are copied from device memory, the others are uploaded
+        const llama_expert_handoff * eh = lctx->get_expert_handoff();
         int64_t next = first;
-        for (int64_t e = first; e <= last && lctx->expert_handoff; ) {
-            const int64_t n = lctx->expert_handoff->copy_experts(backend, src, dst, e, last);
+        for (int64_t e = first; e <= last && eh; ) {
+            const int64_t n = eh->copy_experts(backend, src, dst, e, last);
             if (n == 0) {
                 e++;
                 continue;

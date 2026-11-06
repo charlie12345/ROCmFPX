@@ -247,6 +247,11 @@ private:
     //
 
 public:
+    // [TAG_EXPERT_HANDOFF] this context's expert handoff, or the one of the target it drafts for
+    const llama_expert_handoff * get_expert_handoff() const {
+        return expert_handoff ? expert_handoff.get() : expert_handoff_shared;
+    }
+
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
@@ -310,6 +315,7 @@ private:
 
     llama_memory_ptr memory;
     llama_expert_handoff_ptr expert_handoff; // [TAG_EXPERT_HANDOFF] replaces upstream's MoE cache
+    const llama_expert_handoff * expert_handoff_shared = nullptr; // an MTP draft context: the target's
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

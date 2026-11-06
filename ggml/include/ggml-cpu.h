@@ -192,6 +192,8 @@ extern "C" {
 
     // a graph with handoff layers is about to run: spin for work from now on (the pool sleeps after a quiet spell)
     GGML_BACKEND_API void ggml_expert_handoff_host_wake(ggml_expert_handoff_host_t host);
+    // the graphs are done: stop spinning (one thread keeps looking at the mailbox every millisecond)
+    GGML_BACKEND_API void ggml_expert_handoff_host_idle(ggml_expert_handoff_host_t host);
 
     GGML_BACKEND_API void ggml_expert_handoff_host_get_stats(ggml_expert_handoff_host_t host, struct ggml_expert_handoff_stats * stats);
 

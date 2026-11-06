@@ -224,7 +224,9 @@ struct ggml_expert_handoff_host {
     std::condition_variable cv;
     uint64_t wake_gen = 0; // under mtx
 
-    static constexpr int64_t linger_ns = 250*1000*1000; // spin this long after the last work or wake
+    // spin this long after the last work or wake; the context also calls idle() once a graph's results are in, so the
+    // spinning threads do not take the CPU from whatever runs between graphs (an MTP draft's own CPU work)
+    static constexpr int64_t linger_ns = 20*1000*1000;
 
     uint32_t seq_base = 0; // seq_send when the pool was made
 
@@ -592,6 +594,10 @@ bool ggml_expert_handoff_host_set_layer(ggml_expert_handoff_host_t h, int32_t il
 
 void ggml_expert_handoff_host_wake(ggml_expert_handoff_host_t h) {
     h->wake();
+}
+
+void ggml_expert_handoff_host_idle(ggml_expert_handoff_host_t h) {
+    h->spin_until.store(0, std::memory_order_release);
 }
 
 void ggml_expert_handoff_host_get_stats(ggml_expert_handoff_host_t h, ggml_expert_handoff_stats * st) {

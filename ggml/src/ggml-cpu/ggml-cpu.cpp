@@ -704,6 +704,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_expert_handoff_host_wake") == 0) {
         return (void *)ggml_expert_handoff_host_wake;
     }
+    if (strcmp(name, "ggml_expert_handoff_host_idle") == 0) {
+        return (void *)ggml_expert_handoff_host_idle;
+    }
     if (strcmp(name, "ggml_expert_handoff_host_get_stats") == 0) {
         return (void *)ggml_expert_handoff_host_get_stats;
     }

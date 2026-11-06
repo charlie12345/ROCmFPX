@@ -28,6 +28,7 @@ struct eh_host_api {
     decltype(ggml_expert_handoff_host_free)      * host_free  = nullptr;
     decltype(ggml_expert_handoff_host_set_layer) * set_layer  = nullptr;
     decltype(ggml_expert_handoff_host_wake)      * wake       = nullptr;
+    decltype(ggml_expert_handoff_host_idle)      * idle       = nullptr;
     decltype(ggml_expert_handoff_host_get_stats) * get_stats  = nullptr;
     decltype(ggml_expert_handoff_host_counts)    * counts     = nullptr;
 
@@ -40,9 +41,10 @@ struct eh_host_api {
         host_free = (decltype(host_free)) ggml_backend_reg_get_proc_address(reg, "ggml_expert_handoff_host_free");
         set_layer = (decltype(set_layer)) ggml_backend_reg_get_proc_address(reg, "ggml_expert_handoff_host_set_layer");
         wake      = (decltype(wake))      ggml_backend_reg_get_proc_address(reg, "ggml_expert_handoff_host_wake");
+        idle      = (decltype(idle))      ggml_backend_reg_get_proc_address(reg, "ggml_expert_handoff_host_idle");
         get_stats = (decltype(get_stats)) ggml_backend_reg_get_proc_address(reg, "ggml_expert_handoff_host_get_stats");
         counts    = (decltype(counts))    ggml_backend_reg_get_proc_address(reg, "ggml_expert_handoff_host_counts");
-        return host_new && host_free && set_layer && wake && get_stats && counts;
+        return host_new && host_free && set_layer && wake && idle && get_stats && counts;
     }
 };
 
@@ -132,6 +134,7 @@ struct llama_expert_handoff::impl {
 
     std::vector<group> groups;
     std::vector<layer> layers;
+    int32_t il_nextn = 0; // the first MTP draft layer (cached whole), the layer count if none
     std::unordered_map<const ggml_tensor *, binding> bindings;
 
     ggml_context_ptr ctx;
@@ -244,12 +247,22 @@ struct llama_expert_handoff::impl {
 
         // each group caches the same share of its experts; two extra slots per bank: the miss slot and padding
         // (MMQ reads past the last expert)
+        // the MTP draft layers (the last n_layer_nextn) are always cached whole: their draft context, which shares
+        // this cache, then never needs the host
+        const int32_t n_nextn = (int32_t) model.hparams.n_layer_nextn;
+        il_nextn = n_nextn > 0 ? (int32_t) model.layers.size() - n_nextn : (int32_t) model.layers.size();
+
         size_t n_tensors = 0;
         for (group & g : groups) {
             const int32_t max_slots = (int32_t) g.layers.size()*g.n_expert;
             const size_t  g_budget  = host_bytes_total > 0 ? (size_t) ((double) budget*g.host_bytes/host_bytes_total) : 0;
             const size_t  fit       = g_budget / g.slot_bytes;
             g.n_slots = (int32_t) std::min<size_t>(max_slots, fit > 2 ? fit - 2 : 0);
+            const int32_t forced = (int32_t) std::count_if(g.layers.begin(), g.layers.end(), [&](int32_t il) { return il >= il_nextn; })*g.n_expert;
+            if (g.n_slots < forced) {
+                LLAMA_LOG_WARN("%s: the expert cache is smaller than the MTP draft layer; it gets %d slots anyway\n", __func__, forced);
+                g.n_slots = forced;
+            }
             n_tensors += g.ref.size()*(1 + g.layers.size()) + g.layers.size();
         }
 
@@ -309,10 +322,12 @@ struct llama_expert_handoff::impl {
         dims.max_tokens = (int32_t) params.max_tokens;
         dims.max_embd   = (int32_t) model.hparams.n_embd;
         dims.max_used   = (int32_t) model.hparams.n_expert_used_max();
+        // a dual-channel DDR5 host is bandwidth-bound well before its cores run out: 6 workers beat 11 on a
+        // 12-core Ryzen (Gemma 4 26B-A4B, half the experts cached: 67-74 vs 61-71 t/s), so one per 4 logical CPUs
         int32_t n_workers = params.n_workers;
         if (n_workers <= 0) {
             const int32_t hw = (int32_t) std::thread::hardware_concurrency();
-            n_workers = std::max(1, (hw > 4 ? hw/2 : hw) - 1);
+            n_workers = std::max(2, hw/4);
         }
         if (model.hparams.no_alloc) {
             // a model loaded only to measure memory: the graphs are built, never run
@@ -376,11 +391,23 @@ struct llama_expert_handoff::impl {
     void fill() {
         for (group & g : groups) {
             std::vector<std::pair<int32_t, int32_t>> chosen; // (il, e)
+            // the MTP draft layers first, whole
+            std::vector<int32_t> rest;
+            for (int32_t il : g.layers) {
+                if (il >= il_nextn) {
+                    for (int32_t e = 0; e < g.n_expert; ++e) {
+                        chosen.emplace_back(il, e);
+                    }
+                } else {
+                    rest.push_back(il);
+                }
+            }
+            const int32_t n_free = g.n_slots - (int32_t) chosen.size();
             if (!profile_counts.empty()) {
                 // most routed first; equal counts (a short profile leaves most at zero) go round-robin over the
                 // layers by their rank within the layer, so no layer is left out
                 std::vector<std::tuple<uint64_t, int32_t, int32_t, int32_t>> rank; // count, rank in layer, il, e
-                for (int32_t il : g.layers) {
+                for (int32_t il : rest) {
                     const auto & c = (size_t) il < profile_counts.size() ? profile_counts[il] : std::vector<uint64_t>();
                     std::vector<int32_t> order(g.n_expert);
                     for (int32_t e = 0; e < g.n_expert; ++e) {
@@ -395,15 +422,15 @@ struct llama_expert_handoff::impl {
                 std::stable_sort(rank.begin(), rank.end(), [](const auto & a, const auto & b) {
                     return std::get<0>(a) != std::get<0>(b) ? std::get<0>(a) > std::get<0>(b) : std::get<1>(a) < std::get<1>(b);
                 });
-                for (int32_t i = 0; i < g.n_slots && i < (int32_t) rank.size(); ++i) {
+                for (int32_t i = 0; i < n_free && i < (int32_t) rank.size(); ++i) {
                     chosen.emplace_back(std::get<2>(rank[i]), std::get<3>(rank[i]));
                 }
-            } else {
-                const int32_t nl = (int32_t) g.layers.size();
+            } else if (!rest.empty()) {
+                const int32_t nl = (int32_t) rest.size();
                 for (int32_t i = 0; i < nl; ++i) {
-                    const int32_t n = g.n_slots/nl + (i < g.n_slots % nl ? 1 : 0);
+                    const int32_t n = n_free/nl + (i < n_free % nl ? 1 : 0);
                     for (int32_t e = 0; e < n && e < g.n_expert; ++e) {
-                        chosen.emplace_back(g.layers[i], e);
+                        chosen.emplace_back(rest[i], e);
                     }
                 }
             }
@@ -664,6 +691,12 @@ int64_t llama_expert_handoff::copy_experts(ggml_backend_t backend, const ggml_te
 void llama_expert_handoff::wake() const {
     if (pimpl->host) {
         pimpl->api.wake(pimpl->host);
+    }
+}
+
+void llama_expert_handoff::idle() const {
+    if (pimpl->host) {
+        pimpl->api.idle(pimpl->host);
     }
 }
 

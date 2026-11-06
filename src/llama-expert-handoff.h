@@ -24,7 +24,7 @@ struct llama_expert_handoff_params {
     int32_t     n_slots          = -1; // expert slots in VRAM in units of the largest expert, -1 = fill the free VRAM
     size_t      budget_bytes     =  0; // instead of n_slots: the VRAM cache size in bytes (--moe-cache-mib)
     int32_t     vram_reserve_mib = -1; // VRAM the automatic size leaves free, -1 = default
-    int32_t     n_workers        =  0; // host threads, 0 = one per physical core but one
+    int32_t     n_workers        =  0; // host threads, 0 = one per 4 logical CPUs
     uint32_t    max_tokens       = 32; // largest batch the layers are split for
     std::string profile;               // routing counts to fill the cache from
     std::string profile_save;          // where to write the routing counts at exit
@@ -51,7 +51,8 @@ public:
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) const;
 
     void wake()  const; // a graph that may hand off experts is about to run
-    void check() const; // after a graph: report joins that timed out
+    void idle()  const; // the graphs are done: the host pool stops spinning
+    void check() const; // before a graph: report joins that timed out, the periodic hit-rate line
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
