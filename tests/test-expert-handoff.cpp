@@ -611,6 +611,68 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--gpu") == 0) { use_gpu = true; }
         if (strcmp(argv[i], "-v") == 0)    { verbose = true; }
+        if (strcmp(argv[i], "--check-dots") == 0) {
+            // the CPU vec_dot of the ROCmFPX types against dequantize + float dot: random raw blocks (every code,
+            // valid scales) and quantized random rows, rows of 1, 2, 3 and 80 blocks
+            ggml_backend_load_all();
+            struct fmt { ggml_type t; int n_scales; };
+            const fmt fmts[] = {
+                { GGML_TYPE_Q2_0_ROCMFPX, 2 }, { GGML_TYPE_Q3_0_ROCMFPX, 2 }, { GGML_TYPE_Q5_0_ROCMFPX, 2 },
+                { GGML_TYPE_Q6_0_ROCMFPX, 2 }, { GGML_TYPE_Q7_0_ROCMFPX, 2 }, { GGML_TYPE_Q8_0_ROCMFPX, 1 },
+                { GGML_TYPE_Q4_0_ROCMI4, 1 },  { GGML_TYPE_Q4_0_ROCMFP4, 0 }, { GGML_TYPE_Q4_0_ROCMFP4_FAST, 0 },
+                { GGML_TYPE_Q4_0, 0 },
+            };
+            std::mt19937 rng(11);
+            std::normal_distribution<float> nd(0.0f, 1.0f);
+            int n_fail = 0;
+            for (const fmt & f : fmts) {
+                const auto * tr   = ggml_get_type_traits_cpu(f.t);
+                const auto * base = ggml_get_type_traits(f.t);
+                const auto * q8   = ggml_get_type_traits(GGML_TYPE_Q8_0);
+                double worst = 0.0;
+                for (int raw = 0; raw < 2; ++raw) {
+                    if (raw && f.n_scales == 0) {
+                        continue; // only quantized rows for the formats whose scales this test does not know
+                    }
+                    for (int64_t n : { 32, 64, 96, 2560 }) {
+                        for (int rep = 0; rep < 50; ++rep) {
+                            const size_t row = ggml_row_size(f.t, n);
+                            std::vector<uint8_t> xq(row);
+                            std::vector<float> xf(n), yf(n);
+                            for (auto & v : yf) { v = nd(rng); }
+                            if (raw) {
+                                for (auto & b : xq) { b = (uint8_t) rng(); }
+                                const size_t bsz = ggml_type_size(f.t);
+                                for (size_t o = 0; o < row; o += bsz) {
+                                    for (int k = 0; k < f.n_scales; ++k) {
+                                        xq[o + bsz - f.n_scales + k] = (uint8_t) (rng() % 0x7f);
+                                    }
+                                }
+                            } else {
+                                for (auto & v : xf) { v = nd(rng); }
+                                tr->from_float(xf.data(), xq.data(), n);
+                            }
+                            std::vector<uint8_t> yq(ggml_row_size(GGML_TYPE_Q8_0, n));
+                            ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float(yf.data(), yq.data(), n);
+                            std::vector<float> xd(n), yd(n);
+                            base->to_float(xq.data(), xd.data(), n);
+                            q8->to_float(yq.data(), yd.data(), n);
+                            double ref = 0.0, mag = 0.0;
+                            for (int64_t j = 0; j < n; ++j) { ref += (double) xd[j]*yd[j]; mag += fabs((double) xd[j]*yd[j]); }
+                            float got = 0.0f;
+                            tr->vec_dot((int) n, &got, 0, xq.data(), 0, yq.data(), 0, 1);
+                            const double err = fabs(got - ref)/(mag + 1e-30);
+                            worst = std::max(worst, err);
+                        }
+                    }
+                }
+                const bool ok = worst < 1e-5;
+                n_fail += !ok;
+                printf("  %-20s worst relative error %.2e  %s\n", ggml_type_name(f.t), worst, ok ? "OK" : "FAIL");
+            }
+            printf("%s\n", n_fail == 0 ? "all passed" : "FAILED");
+            return n_fail == 0 ? 0 : 1;
+        }
         if (strcmp(argv[i], "--bench-gpu") == 0) {
             // the round trip on the device: 48 layers of send -> join in one graph, Flash-Next's expert shape, the
             // host computing 0, 1 or 2 missed experts per layer from RAM; time per layer against the host's own time

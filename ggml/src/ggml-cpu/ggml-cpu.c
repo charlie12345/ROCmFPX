@@ -214,9 +214,9 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
-// Portable CPU fallbacks for ROCmFPX block types. These are intentionally
-// simple: the performance kernels live in the GPU backends, but every type
-// still needs a valid CPU vec_dot for graph fragments a backend cannot offload.
+// CPU dots of the ROCmFPX block types: AVX2 integer kernels below (the expert handoff computes MoE experts on the
+// CPU with them), else portable fallbacks that dequantize to floats.
+#if !defined(__AVX2__)
 typedef void (*ggml_rocmfpx_dequantize_t)(const void * GGML_RESTRICT, float * GGML_RESTRICT, int64_t);
 
 static void ggml_vec_dot_rocmfpx_q8_0(
@@ -259,6 +259,297 @@ static void ggml_vec_dot_rocmfpx_q8_0(
         ggml_vec_dot_rocmfpx_q8_0(n, s, bs, vx, bx, vy, by, nrc, sizeof(block_type),      \
                 (ggml_rocmfpx_dequantize_t) dequantize_fn);                               \
     }
+#endif
+
+#if defined(__AVX2__)
+
+// ROCmFPX [TAG_ROCMFPX_CPU_DOT] AVX2 dots of the ROCmFPX formats against Q8_0. Every format decodes to small
+// integers times a UE4M3 scale (one per 16 weights for FP2-FP7, one per 32 for FP8 and I4), so a block is unpacked
+// to 32 int8 values and multiplied with the Q8_0 block in int32, exactly; only the scaling is float. The expert
+// handoff computes MoE experts the VRAM cache misses with these dots (docs/expert-handoff.md).
+
+// UE4M3 as rocmfpx_scale_lookup: (8 + M) * 2^(E - 11), M * 2^-10 for E == 0, 0 past 0x7e; a table, since a branch
+// on the scale byte mispredicts on every block whose scales vary
+#define RFX_P2(k)  ((k) >= 0 ? (float) (1u << ((k) & 31)) : 1.0f / (float) (1u << ((-(k)) & 31)))
+#define RFX_SC(e)  ((e) > 126 ? 0.0f : (e) < 8 ? (float) (e) * (1.0f/1024.0f) : (float) (8 + ((e) & 7)) * RFX_P2(((e) >> 3) - 11))
+#define RFX_S4(e)  RFX_SC(e), RFX_SC((e) + 1), RFX_SC((e) + 2), RFX_SC((e) + 3)
+#define RFX_S16(e) RFX_S4(e), RFX_S4((e) + 4), RFX_S4((e) + 8), RFX_S4((e) + 12)
+#define RFX_S64(e) RFX_S16(e), RFX_S16((e) + 16), RFX_S16((e) + 32), RFX_S16((e) + 48)
+static const float rocmfpx_cpu_scales[256] = { RFX_S64(0), RFX_S64(64), RFX_S64(128), RFX_S64(192) };
+#undef RFX_P2
+#undef RFX_SC
+#undef RFX_S4
+#undef RFX_S16
+#undef RFX_S64
+
+static inline float rocmfpx_cpu_scale(uint8_t e) {
+    return rocmfpx_cpu_scales[e];
+}
+
+static inline float rocmfpx_cpu_hsum(const __m256 v) {
+    __m128 r = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    r = _mm_add_ps(r, _mm_movehl_ps(r, r));
+    r = _mm_add_ss(r, _mm_movehdup_ps(r));
+    return _mm_cvtss_f32(r);
+}
+
+// 32 int8 weights x 32 int8 activations -> 8 int32 sums of 4 (lanes 0-3: weights 0-15, lanes 4-7: 16-31), scaled
+// per lane and accumulated. |x| <= 128, so the u8 x s8 pair sums of maddubs stay inside int16.
+static inline __m256 rocmfpx_cpu_acc(const __m256i x, const int8_t * qy, const __m256 sc, const __m256 acc) {
+    const __m256i y  = _mm256_loadu_si256((const __m256i *) qy);
+    const __m256i ax = _mm256_sign_epi8(x, x);
+    const __m256i sy = _mm256_sign_epi8(y, x);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    const __m256i p = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ax, sy);
+#elif defined(__AVXVNNI__)
+    const __m256i p = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), ax, sy);
+#else
+    const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(ax, sy), _mm256_set1_epi16(1));
+#endif
+#if defined(__FMA__)
+    return _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), sc, acc);
+#else
+    return _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(p), sc));
+#endif
+}
+
+// the scales of a block with one scale per half
+static inline __m256 rocmfpx_cpu_scales2(const uint8_t * e, const ggml_half dy16) {
+    const float dy = GGML_CPU_FP16_TO_FP32(dy16);
+    return _mm256_set_m128(_mm_set1_ps(dy*rocmfpx_cpu_scale(e[1])), _mm_set1_ps(dy*rocmfpx_cpu_scale(e[0])));
+}
+
+// Codes of b bits packed LSB first, each 16-code half starting on a byte (2*b bytes per half). Every code lies in
+// the two bytes from (j*b)/8 on: a byte shuffle places them in 16-bit lane j, a multiply by 2^(7 - (j*b)%8) and a
+// shift right by 7 move the code to bit 0 (the bits the multiply pushes out are above the code).
+#define RFX_K(j, b)    (((j)*(b)) >> 3)
+#define RFX_PAIR(j, b) RFX_K(j, b), RFX_K(j, b) + 1
+#define RFX_CTL(b) { \
+    RFX_PAIR( 0, b), RFX_PAIR( 1, b), RFX_PAIR( 2, b), RFX_PAIR( 3, b), RFX_PAIR( 4, b), RFX_PAIR( 5, b), RFX_PAIR( 6, b), RFX_PAIR( 7, b), \
+    RFX_PAIR( 8, b), RFX_PAIR( 9, b), RFX_PAIR(10, b), RFX_PAIR(11, b), RFX_PAIR(12, b), RFX_PAIR(13, b), RFX_PAIR(14, b), RFX_PAIR(15, b) }
+#define RFX_M(j, b) (1 << (7 - (((j)*(b)) & 7)))
+#define RFX_MUL(b) { \
+    RFX_M( 0, b), RFX_M( 1, b), RFX_M( 2, b), RFX_M( 3, b), RFX_M( 4, b), RFX_M( 5, b), RFX_M( 6, b), RFX_M( 7, b), \
+    RFX_M( 8, b), RFX_M( 9, b), RFX_M(10, b), RFX_M(11, b), RFX_M(12, b), RFX_M(13, b), RFX_M(14, b), RFX_M(15, b) }
+
+static const int8_t  rocmfpx_ctl3[32] = RFX_CTL(3);
+static const int8_t  rocmfpx_ctl5[32] = RFX_CTL(5);
+static const int8_t  rocmfpx_ctl6[32] = RFX_CTL(6);
+static const int8_t  rocmfpx_ctl7[32] = RFX_CTL(7);
+static const int16_t rocmfpx_mul3[16] = RFX_MUL(3);
+static const int16_t rocmfpx_mul5[16] = RFX_MUL(5);
+static const int16_t rocmfpx_mul6[16] = RFX_MUL(6);
+static const int16_t rocmfpx_mul7[16] = RFX_MUL(7);
+
+#undef RFX_K
+#undef RFX_PAIR
+#undef RFX_CTL
+#undef RFX_M
+#undef RFX_MUL
+
+static inline __m256i rocmfpx_cpu_half16(const uint8_t * p, const __m256i ctl, const __m256i mul, const __m256i mask) {
+    const __m256i x = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) p));
+    __m256i v = _mm256_shuffle_epi8(x, ctl);
+    v = _mm256_mullo_epi16(v, mul);
+    v = _mm256_srli_epi16(v, 7);
+    return _mm256_and_si256(v, mask);
+}
+
+// the 32 codes of a block as bytes, in order. The 16-byte loads of the halves read up to 8 bytes past the block's
+// payload: fine inside a row, where the next block follows; the last block of a row is copied first (it can end
+// its buffer).
+static inline __m256i rocmfpx_cpu_codes32(const uint8_t * qs, const int b, const __m256i ctl, const __m256i mul, const __m256i mask) {
+    const __m256i lo = rocmfpx_cpu_half16(qs,       ctl, mul, mask);
+    const __m256i hi = rocmfpx_cpu_half16(qs + 2*b, ctl, mul, mask);
+    return _mm256_permute4x64_epi64(_mm256_packus_epi16(lo, hi), 0xD8);
+}
+
+static inline __m256i rocmfpx_cpu_codes32_last(const uint8_t * qs, const int b, const __m256i ctl, const __m256i mul, const __m256i mask) {
+    uint8_t buf[48] = { 0 };
+    memcpy(buf, qs, 4*b);
+    return rocmfpx_cpu_codes32(buf, b, ctl, mul, mask);
+}
+
+// b-bit sign-magnitude codes (FP5, FP6, FP7): the sign bit with a zero magnitude is -2^(b-1)
+static inline __m256i rocmfpx_cpu_signmag(const __m256i c, const int b) {
+    const __m256i S    = _mm256_set1_epi8((char) (1 << (b - 1)));
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i mag  = _mm256_and_si256(c, _mm256_set1_epi8((char) ((1 << (b - 1)) - 1)));
+    const __m256i neg  = _mm256_cmpeq_epi8(_mm256_and_si256(c, S), S);
+    const __m256i t    = _mm256_or_si256(mag, _mm256_and_si256(_mm256_cmpeq_epi8(mag, zero), S));
+    return _mm256_blendv_epi8(mag, _mm256_sub_epi8(zero, t), neg);
+}
+
+#define ROCMFPX_CPU_DOT_BEGIN(block_type)                       \
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by);          \
+    assert(nrc == 1); GGML_UNUSED(nrc);                         \
+    assert(n % QK8_0 == 0);                                     \
+    const block_type * GGML_RESTRICT x = (const block_type *) vx; \
+    const block_q8_0 * GGML_RESTRICT y = (const block_q8_0 *) vy; \
+    const int nb = n / QK8_0;                                   \
+    __m256 acc0 = _mm256_setzero_ps();                          \
+    __m256 acc1 = _mm256_setzero_ps();
+
+#define ROCMFPX_CPU_DOT_END()                                   \
+    *s = rocmfpx_cpu_hsum(_mm256_add_ps(acc0, acc1));
+
+// a bit-packed format: decode(c) maps the 32 codes to int8 values
+#define ROCMFPX_CPU_DOT_PACKED(name, block_type, B, CTL, MUL, DECODE)                                     \
+static void name(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx,    \
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {                                              \
+    ROCMFPX_CPU_DOT_BEGIN(block_type)                                                                     \
+    const __m256i ctl  = _mm256_loadu_si256((const __m256i *) CTL);                                       \
+    const __m256i muls = _mm256_loadu_si256((const __m256i *) MUL);                                       \
+    const __m256i mask = _mm256_set1_epi16((1 << (B)) - 1);                                               \
+    int ib = 0;                                                                                           \
+    for (; ib + 2 < nb; ib += 2) {                                                                        \
+        const __m256i c0 = rocmfpx_cpu_codes32(x[ib + 0].qs, B, ctl, muls, mask);                         \
+        const __m256i c1 = rocmfpx_cpu_codes32(x[ib + 1].qs, B, ctl, muls, mask);                         \
+        acc0 = rocmfpx_cpu_acc(DECODE(c0), y[ib + 0].qs, rocmfpx_cpu_scales2(x[ib + 0].e, y[ib + 0].d), acc0); \
+        acc1 = rocmfpx_cpu_acc(DECODE(c1), y[ib + 1].qs, rocmfpx_cpu_scales2(x[ib + 1].e, y[ib + 1].d), acc1); \
+    }                                                                                                     \
+    for (; ib < nb; ++ib) {                                                                               \
+        const __m256i c0 = ib + 1 < nb ? rocmfpx_cpu_codes32(x[ib].qs, B, ctl, muls, mask)               \
+                                       : rocmfpx_cpu_codes32_last(x[ib].qs, B, ctl, muls, mask);         \
+        acc0 = rocmfpx_cpu_acc(DECODE(c0), y[ib].qs, rocmfpx_cpu_scales2(x[ib].e, y[ib].d), acc0);        \
+    }                                                                                                     \
+    ROCMFPX_CPU_DOT_END()                                                                                 \
+}
+
+// FP3: sign bit 2, magnitudes {0, 1, 2, 4}
+static inline __m256i rocmfpx_cpu_decode_fp3(const __m256i c) {
+    const __m256i lut = _mm256_setr_epi8(0, 1, 2, 4, 0, -1, -2, -4, 0, 0, 0, 0, 0, 0, 0, 0,
+                                         0, 1, 2, 4, 0, -1, -2, -4, 0, 0, 0, 0, 0, 0, 0, 0);
+    return _mm256_shuffle_epi8(lut, c);
+}
+static inline __m256i rocmfpx_cpu_decode_fp5(const __m256i c) { return rocmfpx_cpu_signmag(c, 5); }
+static inline __m256i rocmfpx_cpu_decode_fp6(const __m256i c) { return rocmfpx_cpu_signmag(c, 6); }
+static inline __m256i rocmfpx_cpu_decode_fp7(const __m256i c) { return rocmfpx_cpu_signmag(c, 7); }
+
+ROCMFPX_CPU_DOT_PACKED(ggml_vec_dot_rocmfpx_fp3_q8_0, block_rocmfp3, 3, rocmfpx_ctl3, rocmfpx_mul3, rocmfpx_cpu_decode_fp3)
+ROCMFPX_CPU_DOT_PACKED(ggml_vec_dot_rocmfpx_fp5_q8_0, block_rocmfp5, 5, rocmfpx_ctl5, rocmfpx_mul5, rocmfpx_cpu_decode_fp5)
+ROCMFPX_CPU_DOT_PACKED(ggml_vec_dot_rocmfpx_fp6_q8_0, block_rocmfp6, 6, rocmfpx_ctl6, rocmfpx_mul6, rocmfpx_cpu_decode_fp6)
+ROCMFPX_CPU_DOT_PACKED(ggml_vec_dot_rocmfpx_fp7_q8_0, block_rocmfp7, 7, rocmfpx_ctl7, rocmfpx_mul7, rocmfpx_cpu_decode_fp7)
+
+#undef ROCMFPX_CPU_DOT_PACKED
+
+// FP2: four codes per byte, weight j of a half in byte j/4 at bit 2*(j%4), values {-4, -1, 1, 4}
+static inline __m256i rocmfpx_cpu_fp2_values(const uint8_t * qs) {
+    __m256i v = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *) qs));
+    v = _mm256_or_si256(v, _mm256_slli_epi32(v, 12));
+    v = _mm256_or_si256(v, _mm256_slli_epi32(v,  6));
+    v = _mm256_and_si256(v, _mm256_set1_epi32(0x03030303));
+    const __m256i lut = _mm256_setr_epi8(-4, -1, 1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                         -4, -1, 1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    return _mm256_shuffle_epi8(lut, v);
+}
+
+static void ggml_vec_dot_rocmfpx_fp2_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    ROCMFPX_CPU_DOT_BEGIN(block_rocmfp2)
+    int ib = 0;
+    for (; ib + 1 < nb; ib += 2) {
+        acc0 = rocmfpx_cpu_acc(rocmfpx_cpu_fp2_values(x[ib + 0].qs), y[ib + 0].qs, rocmfpx_cpu_scales2(x[ib + 0].e, y[ib + 0].d), acc0);
+        acc1 = rocmfpx_cpu_acc(rocmfpx_cpu_fp2_values(x[ib + 1].qs), y[ib + 1].qs, rocmfpx_cpu_scales2(x[ib + 1].e, y[ib + 1].d), acc1);
+    }
+    if (ib < nb) {
+        acc0 = rocmfpx_cpu_acc(rocmfpx_cpu_fp2_values(x[ib].qs), y[ib].qs, rocmfpx_cpu_scales2(x[ib].e, y[ib].d), acc0);
+    }
+    ROCMFPX_CPU_DOT_END()
+}
+
+// FP8: the codes are the int8 values
+static void ggml_vec_dot_rocmfpx_fp8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    ROCMFPX_CPU_DOT_BEGIN(block_rocmfp8)
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m256 sc = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib].d)*rocmfpx_cpu_scale(x[ib].e));
+        const __m256i v = _mm256_loadu_si256((const __m256i *) x[ib].qs);
+        if (ib & 1) {
+            acc1 = rocmfpx_cpu_acc(v, y[ib].qs, sc, acc1);
+        } else {
+            acc0 = rocmfpx_cpu_acc(v, y[ib].qs, sc, acc0);
+        }
+    }
+    ROCMFPX_CPU_DOT_END()
+}
+
+// I4: weights 0-15 in the low nibbles, 16-31 in the high ones, two's complement
+static inline __m256i rocmfpx_cpu_i4_values(const uint8_t * qs) {
+    const __m128i q  = _mm_loadu_si128((const __m128i *) qs);
+    const __m128i m  = _mm_set1_epi8(0x0f);
+    const __m256i c  = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q, 4), m), _mm_and_si128(q, m));
+    const __m256i lut = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1,
+                                         0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1);
+    return _mm256_shuffle_epi8(lut, c);
+}
+
+static void ggml_vec_dot_rocmi4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    ROCMFPX_CPU_DOT_BEGIN(block_rocmi4)
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m256 sc = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib].d)*rocmfpx_cpu_scale(x[ib].e));
+        const __m256i v = rocmfpx_cpu_i4_values(x[ib].qs);
+        if (ib & 1) {
+            acc1 = rocmfpx_cpu_acc(v, y[ib].qs, sc, acc1);
+        } else {
+            acc0 = rocmfpx_cpu_acc(v, y[ib].qs, sc, acc0);
+        }
+    }
+    ROCMFPX_CPU_DOT_END()
+}
+
+// ROCmFP4 (ggml/rocmfp4): weights 0-15 in the low nibbles, 16-31 in the high ones, codebook {0, 1, 2, 3, 4, 6, 8, 10}
+// with a sign bit, at the same UE4M3 scale values; one scale per half, or one per block in the fast layout. Its own
+// dot in ggml-base cannot assume more than SSE2 and sums every block horizontally.
+static inline __m256i rocmfpx_cpu_fp4_values(const uint8_t * qs) {
+    const __m128i q  = _mm_loadu_si128((const __m128i *) qs);
+    const __m128i m  = _mm_set1_epi8(0x0f);
+    const __m256i c  = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q, 4), m), _mm_and_si128(q, m));
+    const __m256i lut = _mm256_setr_epi8(0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10,
+                                         0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10);
+    return _mm256_shuffle_epi8(lut, c);
+}
+
+static void ggml_vec_dot_rocmfp4_q8_0_cpu(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    ROCMFPX_CPU_DOT_BEGIN(block_rocmfp4)
+    int ib = 0;
+    for (; ib + 1 < nb; ib += 2) {
+        acc0 = rocmfpx_cpu_acc(rocmfpx_cpu_fp4_values(x[ib + 0].qs), y[ib + 0].qs, rocmfpx_cpu_scales2(x[ib + 0].e, y[ib + 0].d), acc0);
+        acc1 = rocmfpx_cpu_acc(rocmfpx_cpu_fp4_values(x[ib + 1].qs), y[ib + 1].qs, rocmfpx_cpu_scales2(x[ib + 1].e, y[ib + 1].d), acc1);
+    }
+    if (ib < nb) {
+        acc0 = rocmfpx_cpu_acc(rocmfpx_cpu_fp4_values(x[ib].qs), y[ib].qs, rocmfpx_cpu_scales2(x[ib].e, y[ib].d), acc0);
+    }
+    ROCMFPX_CPU_DOT_END()
+}
+
+static void ggml_vec_dot_rocmfp4_fast_q8_0_cpu(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+        size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    ROCMFPX_CPU_DOT_BEGIN(block_rocmfp4_fast)
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m256 sc = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib].d)*rocmfpx_cpu_scale(x[ib].e));
+        const __m256i v = rocmfpx_cpu_fp4_values(x[ib].qs);
+        if (ib & 1) {
+            acc1 = rocmfpx_cpu_acc(v, y[ib].qs, sc, acc1);
+        } else {
+            acc0 = rocmfpx_cpu_acc(v, y[ib].qs, sc, acc0);
+        }
+    }
+    ROCMFPX_CPU_DOT_END()
+}
+
+#define ROCMFP4_CPU_VEC_DOT      ggml_vec_dot_rocmfp4_q8_0_cpu
+#define ROCMFP4_FAST_CPU_VEC_DOT ggml_vec_dot_rocmfp4_fast_q8_0_cpu
+
+#undef ROCMFPX_CPU_DOT_BEGIN
+#undef ROCMFPX_CPU_DOT_END
+
+#else
+
+#define ROCMFP4_CPU_VEC_DOT      rocmfp4_vec_dot_q4_0_q8_0
+#define ROCMFP4_FAST_CPU_VEC_DOT rocmfp4_vec_dot_q4_0_fast_q8_0
 
 GGML_ROCMFPX_CPU_VEC_DOT(ggml_vec_dot_rocmfpx_fp2_q8_0, block_rocmfp2, rocmfpx_dequantize_row_fp2)
 GGML_ROCMFPX_CPU_VEC_DOT(ggml_vec_dot_rocmfpx_fp3_q8_0, block_rocmfp3, rocmfpx_dequantize_row_fp3)
@@ -267,6 +558,8 @@ GGML_ROCMFPX_CPU_VEC_DOT(ggml_vec_dot_rocmfpx_fp6_q8_0, block_rocmfp6, rocmfpx_d
 GGML_ROCMFPX_CPU_VEC_DOT(ggml_vec_dot_rocmfpx_fp7_q8_0, block_rocmfp7, rocmfpx_dequantize_row_fp7)
 GGML_ROCMFPX_CPU_VEC_DOT(ggml_vec_dot_rocmfpx_fp8_q8_0, block_rocmfp8, rocmfpx_dequantize_row_fp8)
 GGML_ROCMFPX_CPU_VEC_DOT(ggml_vec_dot_rocmi4_q8_0,      block_rocmi4,  rocmfpx_dequantize_row_i4)
+
+#endif // __AVX2__
 
 #undef GGML_ROCMFPX_CPU_VEC_DOT
 
@@ -307,13 +600,13 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_Q4_0_ROCMFP4] = {
         .from_float               = rocmfp4_quantize_row_q4_0,
-        .vec_dot                  = rocmfp4_vec_dot_q4_0_q8_0,
+        .vec_dot                  = ROCMFP4_CPU_VEC_DOT,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q4_0_ROCMFP4_FAST] = {
         .from_float               = rocmfp4_quantize_row_q4_0_fast,
-        .vec_dot                  = rocmfp4_vec_dot_q4_0_fast_q8_0,
+        .vec_dot                  = ROCMFP4_FAST_CPU_VEC_DOT,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
