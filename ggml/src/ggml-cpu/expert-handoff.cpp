@@ -48,10 +48,14 @@ static ggml_expert_handoff_dims eh_dims(const ggml_tensor * dst) {
     return d;
 }
 
+static void * eh_ptr(const ggml_tensor * dst, int lo_i, int hi_i) {
+    const uint64_t lo = (uint32_t) ggml_get_op_params_i32(dst, lo_i);
+    const uint64_t hi = (uint32_t) ggml_get_op_params_i32(dst, hi_i);
+    return (void *) (uintptr_t) (lo | (hi << 32));
+}
+
 static uint8_t * eh_mailbox(const ggml_tensor * dst) {
-    const uint64_t lo = (uint32_t) ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_PTR_LO);
-    const uint64_t hi = (uint32_t) ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_PTR_HI);
-    return (uint8_t *) (uintptr_t) (lo | (hi << 32));
+    return (uint8_t *) eh_ptr(dst, GGML_EXPERT_HANDOFF_P_PTR_LO, GGML_EXPERT_HANDOFF_P_PTR_HI);
 }
 
 //
@@ -66,6 +70,8 @@ void ggml_compute_forward_expert_handoff(const ggml_compute_params * params, ggm
     uint8_t * mb = eh_mailbox(dst);
     const ggml_expert_handoff_dims d = eh_dims(dst);
     auto * hdr = (ggml_expert_handoff_header *) mb;
+    const int32_t layer = ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_LAYER);
+    int32_t * flags = (int32_t *) eh_ptr(dst, GGML_EXPERT_HANDOFF_P_FLAGS_LO, GGML_EXPERT_HANDOFF_P_FLAGS_HI);
 
     if (ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_MODE) == GGML_EXPERT_HANDOFF_SEND) {
         const ggml_tensor * x     = dst->src[0];
@@ -76,6 +82,24 @@ void ggml_compute_forward_expert_handoff(const ggml_compute_params * params, ggm
         const int64_t n_embd   = x->ne[0];
         const int64_t n_tokens = ggml_nrows(x);
         const int64_t n_used   = ids->ne[0];
+
+        // the misses, and the routing counts
+        const int32_t miss_slot = ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_MISS_SLOT);
+        int32_t * counts = (int32_t *) eh_ptr(dst, GGML_EXPERT_HANDOFF_P_COUNTS_LO, GGML_EXPERT_HANDOFF_P_COUNTS_HI);
+        const int64_t stride = ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_COUNTS_STRIDE);
+        int32_t n_miss = 0;
+        for (int64_t i = 0; i < n_used*n_tokens; ++i) {
+            n_miss += ((const int32_t *) slots->data)[i] == miss_slot;
+            const int32_t e = ((const int32_t *) ids->data)[i];
+            if (counts && e >= 0 && e < stride) {
+                counts[layer*stride + e]++;
+            }
+        }
+        flags[layer] = n_miss;
+        memcpy(dst->data, slots->data, ggml_nbytes(slots));
+        if (n_miss == 0) {
+            return;
+        }
 
         float   * mx = (float   *) (mb + ggml_expert_handoff_off_x(d));
         int32_t * mi = (int32_t *) (mb + ggml_expert_handoff_off_ids(d));
@@ -88,12 +112,10 @@ void ggml_compute_forward_expert_handoff(const ggml_compute_params * params, ggm
             memcpy(ms + t*d.max_used, (const int32_t *) slots->data + t*n_used, n_used*sizeof(int32_t));
             memcpy(mw + t*d.max_used, (const float   *) w->data     + t*n_used, n_used*sizeof(float));
         }
-        hdr->layer    = ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_LAYER);
+        hdr->layer    = layer;
         hdr->n_tokens = (int32_t) n_tokens;
         hdr->n_embd   = (int32_t) n_embd;
         hdr->n_used   = (int32_t) n_used;
-
-        memcpy(dst->data, slots->data, ggml_nbytes(slots));
 
         eh_store(&hdr->seq_send, eh_load(&hdr->seq_send) + 1);
         return;
@@ -103,6 +125,12 @@ void ggml_compute_forward_expert_handoff(const ggml_compute_params * params, ggm
     const ggml_tensor * y = dst->src[0];
     const int64_t n_embd   = y->ne[0];
     const int64_t n_tokens = ggml_nrows(y);
+
+    if (flags[layer] == 0) {
+        // nothing was sent
+        memcpy(dst->data, y->data, ggml_nbytes(y));
+        return;
+    }
 
     const uint32_t want = eh_load(&hdr->seq_send);
     const int64_t timeout_ns = (int64_t) ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_TIMEOUT_MS)*1000000;

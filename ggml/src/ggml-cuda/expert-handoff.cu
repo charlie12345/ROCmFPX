@@ -57,11 +57,37 @@ static __device__ __forceinline__ void eh_dev_pause() {
 #endif
 }
 
-// one block: every thread fences its own writes before thread 0 rings, so the host sees all of them with the ring
+// one block: count the misses (flags[layer], read by the join) and the routing (counts); with misses, copy the
+// selection into the mailbox, every thread fences its own writes and thread 0 rings, so the host sees all of them
 static __global__ void k_expert_handoff_send(
         const float * __restrict__ x, const int32_t * __restrict__ ids, const int32_t * __restrict__ slots,
         const float * __restrict__ w, int32_t * __restrict__ slots_out, uint8_t * mb, const eh_offsets off,
-        const int n_embd, const int n_tokens, const int n_used, const int layer, const int max_embd, const int max_used) {
+        const int n_embd, const int n_tokens, const int n_used, const int layer, const int max_embd, const int max_used,
+        const int miss_slot, int32_t * flags, int32_t * counts, const int counts_stride) {
+    __shared__ int n_miss;
+    if (threadIdx.x == 0) {
+        n_miss = 0;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_tokens*n_used; i += blockDim.x) {
+        const int32_t s = slots[i];
+        slots_out[i] = s;
+        if (s == miss_slot) {
+            atomicAdd(&n_miss, 1);
+        }
+        const int32_t e = ids[i];
+        if (counts != nullptr && e >= 0 && e < counts_stride) {
+            atomicAdd(&counts[layer*counts_stride + e], 1);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        flags[layer] = n_miss;
+    }
+    if (n_miss == 0) {
+        return;
+    }
+
     float   * mx = (float   *) (mb + off.x);
     int32_t * mi = (int32_t *) (mb + off.ids);
     int32_t * ms = (int32_t *) (mb + off.slots);
@@ -75,11 +101,9 @@ static __global__ void k_expert_handoff_send(
     for (int i = threadIdx.x; i < n_tokens*n_used; i += blockDim.x) {
         const int t = i / n_used;
         const int k = i - t*n_used;
-        const int32_t s = slots[i];
         mi[t*max_used + k] = ids[i];
-        ms[t*max_used + k] = s;
+        ms[t*max_used + k] = slots[i];
         mw[t*max_used + k] = w[i];
-        slots_out[i] = s;
     }
 
     ggml_expert_handoff_header * hdr = (ggml_expert_handoff_header *) mb;
@@ -98,7 +122,15 @@ static __global__ void k_expert_handoff_send(
 
 static __global__ void k_expert_handoff_join(
         const float * __restrict__ y, float * __restrict__ dst, uint8_t * mb, const size_t off_y,
-        const int n_embd, const int n, const int max_embd, const uint64_t timeout_ticks) {
+        const int n_embd, const int n, const int max_embd, const uint64_t timeout_ticks,
+        const int32_t * __restrict__ flags, const int layer) {
+    if (flags[layer] == 0) {
+        // nothing was sent: no host experts to add
+        for (int i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += gridDim.x*blockDim.x) {
+            dst[i] = y[i];
+        }
+        return;
+    }
     ggml_expert_handoff_header * hdr = (ggml_expert_handoff_header *) mb;
     __shared__ int ok;
     if (threadIdx.x == 0) {
@@ -151,12 +183,19 @@ static uint64_t eh_ticks_per_ms(const int device) {
 #endif
 }
 
+static void * eh_param_ptr(const ggml_tensor * dst, int lo_i, int hi_i) {
+    const uint64_t lo = (uint32_t) ggml_get_op_params_i32(dst, lo_i);
+    const uint64_t hi = (uint32_t) ggml_get_op_params_i32(dst, hi_i);
+    return (void *) (uintptr_t) (lo | (hi << 32));
+}
+
 void ggml_cuda_op_expert_handoff(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
 
-    const uint64_t lo = (uint32_t) ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_PTR_LO);
-    const uint64_t hi = (uint32_t) ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_PTR_HI);
-    uint8_t * mb = (uint8_t *) (uintptr_t) (lo | (hi << 32));
+    uint8_t * mb     = (uint8_t *) eh_param_ptr(dst, GGML_EXPERT_HANDOFF_P_PTR_LO,    GGML_EXPERT_HANDOFF_P_PTR_HI);
+    int32_t * flags  = (int32_t *) eh_param_ptr(dst, GGML_EXPERT_HANDOFF_P_FLAGS_LO,  GGML_EXPERT_HANDOFF_P_FLAGS_HI);
+    int32_t * counts = (int32_t *) eh_param_ptr(dst, GGML_EXPERT_HANDOFF_P_COUNTS_LO, GGML_EXPERT_HANDOFF_P_COUNTS_HI);
+    const int layer  = ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_LAYER);
 
     ggml_expert_handoff_dims d;
     d.max_tokens = ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_MAX_TOKENS);
@@ -177,8 +216,9 @@ void ggml_cuda_op_expert_handoff(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         k_expert_handoff_send<<<1, 1024, 0, stream>>>(
             (const float *) x->data, (const int32_t *) ids->data, (const int32_t *) slots->data, (const float *) w->data,
-            (int32_t *) dst->data, mb, off, n_embd, n_tokens, n_used, ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_LAYER),
-            d.max_embd, d.max_used);
+            (int32_t *) dst->data, mb, off, n_embd, n_tokens, n_used, layer, d.max_embd, d.max_used,
+            ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_MISS_SLOT), flags, counts,
+            ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_COUNTS_STRIDE));
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -191,7 +231,7 @@ void ggml_cuda_op_expert_handoff(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int threads = 256;
     const int blocks  = std::max(1, std::min((n + threads - 1)/threads, 32));
     k_expert_handoff_join<<<blocks, threads, 0, stream>>>(
-        (const float *) y->data, (float *) dst->data, mb, off.y, n_embd, n, d.max_embd, timeout);
+        (const float *) y->data, (float *) dst->data, mb, off.y, n_embd, n, d.max_embd, timeout, flags, layer);
     CUDA_CHECK(cudaGetLastError());
 }
 

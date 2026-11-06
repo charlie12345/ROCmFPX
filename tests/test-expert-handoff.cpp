@@ -193,6 +193,8 @@ static bool run_case(ggml_backend_t be, ggml_backend_t cpu, const mailbox_alloc 
     ggml_tensor * dgs = gate_s ? ggml_new_tensor_1d(ctx_dev, GGML_TYPE_F32, c.n_expert) : nullptr;
     ggml_tensor * dus = up_s   ? ggml_new_tensor_1d(ctx_dev, GGML_TYPE_F32, c.n_expert) : nullptr;
     ggml_tensor * dds = down_s ? ggml_new_tensor_1d(ctx_dev, GGML_TYPE_F32, c.n_expert) : nullptr;
+    ggml_tensor * dflags  = ggml_new_tensor_1d(ctx_dev, GGML_TYPE_I32, 1);
+    ggml_tensor * dcounts = ggml_new_tensor_1d(ctx_dev, GGML_TYPE_I32, c.n_expert);
     ggml_backend_buffer_t buf_dev = ggml_backend_alloc_ctx_tensors(ctx_dev, be);
     ggml_backend_buffer_clear(buf_dev, 0);
     for (size_t i = 0; i < host_t.size(); ++i) {
@@ -238,15 +240,27 @@ static bool run_case(ggml_backend_t be, ggml_backend_t cpu, const mailbox_alloc 
     }
 
     // the handoff graph on the tested backend, run three times (the sequence numbers must advance)
+    ggml_expert_handoff_params ehp = {};
+    ehp.mailbox       = mb;
+    ehp.layer         = 0;
+    ehp.max_tokens    = dims.max_tokens;
+    ehp.max_embd      = dims.max_embd;
+    ehp.max_used      = dims.max_used;
+    ehp.miss_slot     = (int32_t) c.n_slots;
+    ehp.flags         = (int32_t *) dflags->data;
+    ehp.counts        = (int32_t *) dcounts->data;
+    ehp.counts_stride = (int32_t) c.n_expert;
+    ehp.timeout_ms    = 2000;
+    const int n_rep = 3;
     std::vector<float> got(c.n_embd*c.n_tokens);
     bool ok = true;
     double nmse = 0.0;
-    for (int rep = 0; rep < 3 && ok; ++rep) {
+    for (int rep = 0; rep < n_rep && ok; ++rep) {
         ggml_init_params gp = { 256*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
         ggml_context * ctx = ggml_init(gp);
         ggml_tensor * sl = ggml_get_rows(ctx, slot_map, ggml_reshape_1d(ctx, dids, c.n_used*c.n_tokens));
         sl = ggml_reshape_2d(ctx, sl, c.n_used, c.n_tokens);
-        ggml_tensor * sent = ggml_expert_handoff_send(ctx, dx, dids, sl, dw, mb, 0, dims.max_tokens, dims.max_embd, dims.max_used);
+        ggml_tensor * sent = ggml_expert_handoff_send(ctx, dx, dids, sl, dw, &ehp);
         std::vector<ggml_tensor *> views;
         for (ggml_tensor * b : bank_t) {
             views.push_back(ggml_view_3d(ctx, b, b->ne[0], b->ne[1], c.n_slots + 1, b->nb[1], b->nb[2], 0));
@@ -257,7 +271,7 @@ static bool run_case(ggml_backend_t be, ggml_backend_t cpu, const mailbox_alloc 
         ggml_tensor * vgu = c.merged ? views[iv++] : nullptr;
         ggml_tensor * vd  = views[iv++];
         ggml_tensor * out = moe_graph(ctx, c, vg, vu, vgu, vd, dgs, dus, dds, dx, dids, sent, dw);
-        out = ggml_expert_handoff_join(ctx, out, mb, 0, dims.max_tokens, dims.max_embd, dims.max_used, 2000);
+        out = ggml_expert_handoff_join(ctx, out, &ehp);
         ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
         ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
@@ -288,6 +302,30 @@ static bool run_case(ggml_backend_t be, ggml_backend_t cpu, const mailbox_alloc 
     ggml_expert_handoff_host_free(host);
     if (timeouts != 0) {
         ok = false;
+    }
+
+    // the device counted every routed expert of every run; a run without misses never reached the host
+    {
+        std::vector<int32_t> cnt(c.n_expert), want(c.n_expert, 0), iv(c.n_used*c.n_tokens), sv(c.n_used*c.n_tokens);
+        ggml_backend_tensor_get(dcounts, cnt.data(), 0, cnt.size()*sizeof(int32_t));
+        ggml_backend_tensor_get(ids, iv.data(), 0, iv.size()*sizeof(int32_t));
+        int64_t n_miss = 0;
+        for (int32_t e : iv) {
+            want[e] += n_rep;
+            n_miss += slot_of[e] == c.n_slots;
+        }
+        if (cnt != want) {
+            printf("  routing counts differ\n");
+            ok = false;
+        }
+        if (n_miss == 0 && st.n_layers != 0) {
+            printf("  a run without misses was sent to the host\n");
+            ok = false;
+        }
+        if (n_miss > 0 && st.n_host != (uint64_t) (n_miss*n_rep)) {
+            printf("  the host computed %llu experts, expected %lld\n", (unsigned long long) st.n_host, (long long) (n_miss*n_rep));
+            ok = false;
+        }
     }
 
     printf("  %-7s/%-7s %s %-4s embd %4lld ff %4lld experts %3lld used %2lld tokens %2lld cached %3lld%s: nmse %.2e, host %llu/%llu, timeouts %u  %s\n",

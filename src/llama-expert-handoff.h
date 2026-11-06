@@ -22,6 +22,7 @@ struct llama_model;
 
 struct llama_expert_handoff_params {
     int32_t     n_slots          = -1; // expert slots in VRAM in units of the largest expert, -1 = fill the free VRAM
+    size_t      budget_bytes     =  0; // instead of n_slots: the VRAM cache size in bytes (--moe-cache-mib)
     int32_t     vram_reserve_mib = -1; // VRAM the automatic size leaves free, -1 = default
     int32_t     n_workers        =  0; // host threads, 0 = one per physical core but one
     uint32_t    max_tokens       = 32; // largest batch the layers are split for
@@ -43,11 +44,8 @@ public:
     ggml_tensor *  slot_map(int32_t il) const;                // I32 [1, n_expert] on the device
     ggml_tensor *  get_experts(const ggml_tensor * w) const;  // the cache view used in place of the host experts w
 
-    void *  mailbox()    const;
-    int32_t max_tokens() const;
-    int32_t max_embd()   const;
-    int32_t max_used()   const;
-    int32_t timeout_ms() const;
+    // what the send and join ops of layer il need
+    ggml_expert_handoff_params params(int32_t il) const;
 
     // large batches: copy the cached experts in [e, last] of w from the banks, returns how many consecutive ones
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) const;

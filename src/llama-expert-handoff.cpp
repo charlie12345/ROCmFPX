@@ -138,6 +138,11 @@ struct llama_expert_handoff::impl {
     ggml_backend_buffer_ptr buf;
     mutable ggml_context_ptr ctx_views; // copy_experts (the scheduler's thread)
 
+    // on the device: the misses of each layer's last send (the join skips layers without), the routing counts
+    ggml_tensor * flags  = nullptr; // I32 [n_layer]
+    ggml_tensor * counts = nullptr; // I32 [counts_stride, n_layer]
+    int32_t counts_stride = 0;
+
     // the mailbox and the host pool
     eh_host_api api;
     eh_mapped_free_t mapped_free = nullptr;
@@ -222,11 +227,11 @@ struct llama_expert_handoff::impl {
             size_t free = 0, total = 0;
             ggml_backend_dev_memory(dev, &free, &total);
             const size_t reserve = (size_t) (params.vram_reserve_mib >= 0 ? params.vram_reserve_mib : 2048)*1024*1024;
-            if (params.n_slots >= 0) {
-                budget = (size_t) params.n_slots*max_blob;
+            if (params.n_slots >= 0 || params.budget_bytes > 0) {
+                budget = params.n_slots >= 0 ? (size_t) params.n_slots*max_blob : params.budget_bytes;
                 if (budget + reserve > free) {
-                    LLAMA_LOG_WARN("%s: --expert-cache %d (%.0f MiB) leaves %.0f MiB of the %.0f MiB free VRAM, less than the reserve of %.0f MiB\n",
-                        __func__, params.n_slots, budget/1048576.0, free > budget ? (free - budget)/1048576.0 : 0.0, free/1048576.0, reserve/1048576.0);
+                    LLAMA_LOG_WARN("%s: an expert cache of %.0f MiB leaves %.0f MiB of the %.0f MiB free VRAM, less than the reserve of %.0f MiB\n",
+                        __func__, budget/1048576.0, free > budget ? (free - budget)/1048576.0 : 0.0, free/1048576.0, reserve/1048576.0);
                 }
             } else {
                 budget = free > reserve ? free - reserve : 0;
@@ -246,11 +251,18 @@ struct llama_expert_handoff::impl {
             n_tensors += g.ref.size()*(1 + g.layers.size()) + g.layers.size();
         }
 
-        ggml_init_params ip = { n_tensors*ggml_tensor_overhead(), nullptr, true };
+        ggml_init_params ip = { (n_tensors + 2)*ggml_tensor_overhead(), nullptr, true };
         ctx.reset(ggml_init(ip));
         if (!ctx) {
             throw std::runtime_error("expert handoff: failed to create the context");
         }
+        for (const group & g : groups) {
+            counts_stride = std::max(counts_stride, g.n_expert);
+        }
+        flags  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, (int64_t) model.layers.size());
+        counts = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, counts_stride, (int64_t) model.layers.size());
+        ggml_set_name(flags,  "expert_cache.flags");
+        ggml_set_name(counts, "expert_cache.counts");
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             group & g = groups[ig];
             for (const ggml_tensor * t : g.ref) {
@@ -326,14 +338,29 @@ struct llama_expert_handoff::impl {
             n_workers, dims.max_tokens);
     }
 
+    // the device's routing counts [il][e] since the start (decode batches; hits and misses)
+    std::vector<int32_t> device_counts() const {
+        std::vector<int32_t> res;
+        if (counts != nullptr && counts->data != nullptr) {
+            res.resize(ggml_nelements(counts));
+            ggml_backend_tensor_get(counts, res.data(), 0, ggml_nbytes(counts));
+        }
+        return res;
+    }
+
     ~impl() {
         if (host) {
             ggml_expert_handoff_stats st = {};
             api.get_stats(host, &st);
-            if (st.n_layers > 0) {
-                LLAMA_LOG_INFO("llama_expert_handoff: %" PRIu64 " layers answered, %" PRIu64 " of %" PRIu64 " routed experts on the host (VRAM hit rate %.2f%%), %.1f us per layer\n",
-                    st.n_layers, st.n_host, st.n_routed, st.n_routed ? 100.0*(1.0 - (double) st.n_host/st.n_routed) : 0.0,
-                    st.busy_ns/1000.0/st.n_layers);
+            uint64_t n_routed = 0;
+            for (int32_t c : device_counts()) {
+                n_routed += (uint32_t) c;
+            }
+            if (n_routed > 0) {
+                LLAMA_LOG_INFO("llama_expert_handoff: %" PRIu64 " routed experts, %" PRIu64 " computed on the host (VRAM hit rate %.2f%%); "
+                    "%" PRIu64 " layers sent to the host, %.1f us each\n",
+                    n_routed, st.n_host, 100.0*(1.0 - (double) st.n_host/n_routed), st.n_layers,
+                    st.n_layers ? st.busy_ns/1000.0/st.n_layers : 0.0);
             }
             save_profile();
             api.host_free(host);
@@ -449,15 +476,16 @@ struct llama_expert_handoff::impl {
             return;
         }
         fprintf(f, "# expert handoff routing counts, arch %s, %zu layers\n", llm_arch_name(model.arch), model.layers.size());
+        const std::vector<int32_t> dc = device_counts();
         for (size_t il = 0; il < layers.size(); ++il) {
             if (layers[il].ig < 0) {
                 continue;
             }
             const int32_t n = groups[layers[il].ig].n_expert;
-            const uint64_t * c = api.counts(host, (int32_t) il);
             fprintf(f, "layer %zu %d", il, n);
             for (int32_t e = 0; e < n; ++e) {
-                uint64_t v = c ? c[e] : 0;
+                const size_t ic = il*counts_stride + e;
+                uint64_t v = ic < dc.size() ? (uint32_t) dc[ic] : 0;
                 if (il < profile_counts.size() && e < (int32_t) profile_counts[il].size()) {
                     v += profile_counts[il][e];
                 }
@@ -577,14 +605,22 @@ ggml_tensor * llama_expert_handoff::get_experts(const ggml_tensor * w) const {
     return it != pimpl->bindings.end() ? it->second.cached : nullptr;
 }
 
-void * llama_expert_handoff::mailbox() const {
-    return pimpl->mailbox;
+ggml_expert_handoff_params llama_expert_handoff::params(int32_t il) const {
+    const auto & p = *pimpl;
+    ggml_expert_handoff_params res = {};
+    res.mailbox       = p.mailbox;
+    res.layer         = il;
+    res.max_tokens    = p.dims.max_tokens;
+    res.max_embd      = p.dims.max_embd;
+    res.max_used      = p.dims.max_used;
+    res.miss_slot     = p.layers[il].ig >= 0 ? p.groups[p.layers[il].ig].n_slots : 0;
+    // a model loaded only to measure memory has no data: any address does, the graph never runs
+    res.flags         = p.flags->data  ? (int32_t *) p.flags->data  : (int32_t *) p.mailbox;
+    res.counts        = p.counts->data ? (int32_t *) p.counts->data : nullptr;
+    res.counts_stride = p.counts_stride;
+    res.timeout_ms    = p.timeout_ms;
+    return res;
 }
-
-int32_t llama_expert_handoff::max_tokens() const { return pimpl->dims.max_tokens; }
-int32_t llama_expert_handoff::max_embd()   const { return pimpl->dims.max_embd; }
-int32_t llama_expert_handoff::max_used()   const { return pimpl->dims.max_used; }
-int32_t llama_expert_handoff::timeout_ms() const { return pimpl->timeout_ms; }
 
 int64_t llama_expert_handoff::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) const {
     return pimpl->copy_experts(backend, w, dst, e, last);

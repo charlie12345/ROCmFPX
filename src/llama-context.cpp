@@ -13,7 +13,6 @@
 #include "llama-kv-cache.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
-#include "llama-moe-cache.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -36,11 +35,11 @@ static void llama_verify_hadamard_graph(
         ggml_cgraph * gf,
         const llama_hadamard_rotations & rotations,
         const llama_hadamard_rotations & inverses,
-        const llama_moe_cache * moe_cache) {
-    // the MoE cache gives the matmul a copy of the expert weights, so the copy also needs the transform of its source
+        const llama_expert_handoff * expert_handoff) {
+    // the expert handoff's VRAM cache gives the matmul a copy of the expert weights, so the copy also needs the transform of its source
     llama_hadamard_rotations forward = rotations;
     for (const auto & [w, t] : rotations) {
-        if (const ggml_tensor * cached = moe_cache ? moe_cache->get_experts(w) : nullptr) {
+        if (const ggml_tensor * cached = expert_handoff ? expert_handoff->get_experts(w) : nullptr) {
             forward.emplace(cached, t);
         }
     }
@@ -595,8 +594,8 @@ llama_context::llama_context(
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides() &&
-            cparams.moe_cache_size == 0 && // not supported by the MoE cache
-            cparams.expert_cache == 0;     // nor by the expert handoff (one mailbox, one stream)
+            cparams.moe_cache_size == 0 && // not supported by the expert handoff (one mailbox, one stream)
+            cparams.expert_cache == 0;
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -624,17 +623,12 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
-        }
-
-        // [TAG_EXPERT_HANDOFF]
-        if (cparams.expert_cache != 0) {
-            if (moe_cache) {
-                throw std::runtime_error("the expert handoff (--expert-cache) and the MoE cache (--moe-cache-mib) exclude each other");
-            }
+        // [TAG_EXPERT_HANDOFF] replaces upstream's MoE cache: moe_cache_size (--moe-cache-mib) sizes the handoff's
+        // VRAM cache in bytes, expert_cache (--expert-cache) in experts or auto; the expert slots win
+        if (cparams.expert_cache != 0 || cparams.moe_cache_size > 0) {
             llama_expert_handoff_params ehp;
-            ehp.n_slots          = cparams.expert_cache;
+            ehp.n_slots          = cparams.expert_cache != 0 ? cparams.expert_cache : -1;
+            ehp.budget_bytes     = cparams.expert_cache != 0 ? 0 : cparams.moe_cache_size;
             ehp.vram_reserve_mib = cparams.vram_reserve_mib;
             ehp.n_workers        = cparams.pool_workers;
             ehp.profile          = cparams.expert_profile;
@@ -2901,7 +2895,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
-        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
+        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, expert_handoff.get());
         hadamard_verified = true;
     }
 
@@ -2941,7 +2935,6 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.moe_cache   =*/ moe_cache.get(),
         /*.expert_handoff =*/ expert_handoff.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
@@ -3012,11 +3005,6 @@ ggml_status llama_context::graph_compute(
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
-    // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
-        return true;
-    }
-
     auto & st = lctx->copy_experts;
 
     // the ids must be computed before the split starts, so only the first node of the split is considered
@@ -3064,11 +3052,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             last++;
         }
 
-        // the experts in the MoE cache (or the expert handoff's VRAM cache) are copied from device memory, the others are uploaded
+        // the experts in the expert handoff's VRAM cache are copied from device memory, the others are uploaded
         int64_t next = first;
-        for (int64_t e = first; e <= last && (lctx->moe_cache || lctx->expert_handoff); ) {
-            const int64_t n = lctx->moe_cache ? lctx->moe_cache->copy_experts(backend, src, dst, e, last)
-                                              : lctx->expert_handoff->copy_experts(backend, src, dst, e, last);
+        for (int64_t e = first; e <= last && lctx->expert_handoff; ) {
+            const int64_t n = lctx->expert_handoff->copy_experts(backend, src, dst, e, last);
             if (n == 0) {
                 e++;
                 continue;
@@ -3962,11 +3949,6 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     }
     if (memory) {
         for (const auto & [buft, size] : memory->memory_breakdown()) {
-            ret[buft].context += size;
-        }
-    }
-    if (moe_cache) {
-        for (const auto & [buft, size] : moe_cache->memory_breakdown()) {
             ret[buft].context += size;
         }
     }

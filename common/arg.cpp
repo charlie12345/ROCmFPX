@@ -945,7 +945,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // ROCmFPX [TAG_EXPERT_HANDOFF] the expert handoff reads the routed experts in place from host memory: keep all of
     // them there unless an override already places them (--cpu-moe, --n-cpu-moe, -ot), and do not repack them
-    if (params.expert_cache != 0) {
+    if (params.expert_cache != 0 || params.moe_cache_size > 0) {
         const bool placed = std::any_of(params.tensor_buft_overrides.begin(), params.tensor_buft_overrides.end(),
             [](const llama_model_tensor_buft_override & o) { return o.pattern && strstr(o.pattern, "exps") != nullptr; });
         if (!placed) {
@@ -2881,7 +2881,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
+        "expert handoff (see --expert-cache) with a VRAM expert cache of N MiB (default: 0, disabled)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

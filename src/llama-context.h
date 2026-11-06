@@ -7,7 +7,6 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
-#include "llama-moe-cache.h"
 #include "llama-expert-handoff.h"
 
 #include "ggml-cpp.h"
@@ -19,7 +18,6 @@
 
 struct llama_model;
 class llama_batch_allocr;
-class llama_moe_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -311,8 +309,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
-    llama_moe_cache_ptr moe_cache;
-    llama_expert_handoff_ptr expert_handoff; // [TAG_EXPERT_HANDOFF]
+    llama_expert_handoff_ptr expert_handoff; // [TAG_EXPERT_HANDOFF] replaces upstream's MoE cache
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

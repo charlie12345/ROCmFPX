@@ -76,7 +76,17 @@ enum ggml_expert_handoff_param {
     GGML_EXPERT_HANDOFF_P_MAX_EMBD   = 5,
     GGML_EXPERT_HANDOFF_P_MAX_USED   = 6,
     GGML_EXPERT_HANDOFF_P_TIMEOUT_MS = 7, // join: give up after this long (the GPU watchdog must never see a stuck kernel)
+    GGML_EXPERT_HANDOFF_P_MISS_SLOT  = 8, // send: the slot of the experts the host computes
+    GGML_EXPERT_HANDOFF_P_FLAGS_LO   = 9, // device memory [n_layer] int32: the misses of each layer's last send
+    GGML_EXPERT_HANDOFF_P_FLAGS_HI   = 10,
+    GGML_EXPERT_HANDOFF_P_COUNTS_LO  = 11, // device memory [n_layer][stride] int32 or NULL: routing counts
+    GGML_EXPERT_HANDOFF_P_COUNTS_HI  = 12,
+    GGML_EXPERT_HANDOFF_P_COUNTS_STRIDE = 13,
 };
+
+// A send whose selection has no miss writes nothing to the mailbox and does not ring it, and its join returns y
+// without waiting: the host is only involved in layers it has experts to compute for. The device counts the
+// misses into flags[layer] (the join reads it) and every routed expert into counts (for routing profiles).
 
 enum ggml_expert_handoff_mode {
     GGML_EXPERT_HANDOFF_SEND = 0,
