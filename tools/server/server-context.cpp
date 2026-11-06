@@ -425,6 +425,10 @@ struct server_slot {
     int64_t t_held_ms    = 0; // finished stretches
     int32_t n_trickle    = 0; // passes taken while held
 
+    // [TAG_KV_POOL] [TAG_REQUEST_PRIORITY] a low request that gives its room in the shared KV pool to a waiting
+    // xhigh one: it ends at its next token like a request that reached its context limit
+    bool    pool_yield   = false;
+
     int32_t priority() const {
         return task ? task->params.priority : (int32_t) SERVER_TASK_PRIORITY_DEFAULT;
     }
@@ -491,6 +495,7 @@ struct server_slot {
 
         // [TAG_REQUEST_PRIORITY]
         held         = false;
+        pool_yield   = false;
         t_hold_start = 0;
         t_held_ms    = 0;
         n_trickle    = 0;
@@ -2199,6 +2204,76 @@ private:
         return true;
     }
 
+    // [TAG_KV_POOL] [TAG_REQUEST_PRIORITY] an xhigh request that waits for room in the pool has the first claim
+    // on it: running default and high requests finish first, then their cells go to the xhigh request and not
+    // to a request of a lower level that arrives meanwhile and would still fit. So while an xhigh request waits,
+    // every request below xhigh waits too.
+    bool kv_pool_xhigh_waiting() {
+        if (!kv_pool_shared()) {
+            return false;
+        }
+
+        return queue_tasks.queue_tasks_deferred_count([](const server_task & task) {
+            return task.params.priority >= SERVER_TASK_PRIORITY_XHIGH;
+        }) > 0;
+    }
+
+    // [TAG_KV_POOL] [TAG_REQUEST_PRIORITY] an xhigh request that does not fit beside the running requests takes
+    // the room of running low requests at once: they end at their next token like a request that reached its
+    // context limit (truncated "length" finish), the least output lost first. Only when that is enough for the
+    // xhigh request to start; while default or high requests leave too little room, the xhigh request waits for
+    // them and the low requests carry on.
+    void kv_pool_yield_low(const server_task & task) {
+        if (!kv_pool_shared() || task.params.priority < SERVER_TASK_PRIORITY_XHIGH) {
+            return;
+        }
+
+        int32_t n_keep = 0; // cells the running requests at default or above hold, with their room to generate
+
+        std::vector<server_slot *> lows;
+
+        for (auto & slot : slots) {
+            if (!slot.is_processing() || slot.pool_yield) {
+                continue; // a low request that already yields counts as gone
+            }
+
+            if (slot.priority() <= SERVER_TASK_PRIORITY_LOW) {
+                lows.push_back(&slot);
+            } else {
+                n_keep += kv_pool_claim(slot) + kv_pool_reserve(slot);
+            }
+        }
+
+        const int32_t n_need = task.n_tokens() + kv_pool_reserve(task) + KV_POOL_MARGIN;
+
+        if (lows.empty() || n_keep + n_need > kv_pool_size()) {
+            return;
+        }
+
+        std::sort(lows.begin(), lows.end(), [](const server_slot * a, const server_slot * b) {
+            return a->stats.n_gen < b->stats.n_gen;
+        });
+
+        int32_t n_lows = 0;
+        for (const auto * slot : lows) {
+            n_lows += kv_pool_claim(*slot) + kv_pool_reserve(*slot);
+        }
+
+        for (auto * slot : lows) {
+            if (n_keep + n_lows + n_need <= kv_pool_size()) {
+                break;
+            }
+
+            n_lows -= kv_pool_claim(*slot) + kv_pool_reserve(*slot);
+
+            slot->pool_yield = true;
+
+            SLT_INF(*slot, "gives its room in the shared KV pool to xhigh request %d: ends at its next token "
+                    "(this one is low and %s, %d tokens)\n", task.id,
+                    slot->state == SLOT_STATE_GENERATING ? "generating" : "reading its prompt", kv_pool_claim(*slot));
+        }
+    }
+
     // save an idle slot to the prompt cache and give its cells back to the pool
     void kv_pool_evict(server_slot & slot) {
         GGML_ASSERT(!slot.is_processing());
@@ -2297,8 +2372,8 @@ private:
     }
 
     // true if `slot` should stop generating because the running requests are about to fill the
-    // pool. Of the generating slots the one with the least output so far is chosen: least is lost,
-    // and its client gets a regular truncated ("length") finish instead of an error.
+    // pool. Of the generating slots a low one goes first [TAG_REQUEST_PRIORITY], then the one with the least
+    // output so far: least is lost, and its client gets a regular truncated ("length") finish instead of an error.
     bool kv_pool_should_stop(const server_slot & slot) const {
         if (!kv_pool_shared()) {
             return false;
@@ -2317,7 +2392,14 @@ private:
             n_busy++;
             n_held += kv_pool_claim(other);
 
-            if (other.state == SLOT_STATE_GENERATING && (victim == nullptr || other.stats.n_gen < victim->stats.n_gen)) {
+            if (other.state != SLOT_STATE_GENERATING) {
+                continue;
+            }
+
+            const bool low        = other.priority()   <= SERVER_TASK_PRIORITY_LOW;
+            const bool victim_low = victim != nullptr && victim->priority() <= SERVER_TASK_PRIORITY_LOW;
+
+            if (victim == nullptr || (low != victim_low ? low : other.stats.n_gen < victim->stats.n_gen)) {
                 victim = &other;
             }
         }
@@ -2757,6 +2839,16 @@ private:
 
             SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx = %d\n",
                     slot.prompt.n_tokens(), slot.task->n_tokens(), (int) slot.stats.n_gen, slot.n_ctx);
+        }
+
+        // [TAG_KV_POOL] [TAG_REQUEST_PRIORITY] a low request that gives its room to a waiting xhigh one
+        if (slot.has_next_token && slot.pool_yield) {
+            slot.truncated      = true;
+            slot.stop           = STOP_TYPE_LIMIT;
+            slot.has_next_token = false;
+
+            SLT_WRN(slot, "stopped: an xhigh request needs its room in the shared KV pool, prompt.n_tokens() = %d, n_gen = %d\n",
+                    slot.prompt.n_tokens(), (int) slot.stats.n_gen);
         }
 
         // [TAG_KV_POOL] the same for the pool that the slots share
@@ -3564,9 +3656,18 @@ private:
                         break;
                     }
 
+                    // [TAG_KV_POOL] [TAG_REQUEST_PRIORITY] the room an xhigh request waits for is not taken by
+                    // a request below xhigh that arrives meanwhile
+                    if (task.params.priority < SERVER_TASK_PRIORITY_XHIGH && kv_pool_xhigh_waiting()) {
+                        SRV_INF("request waits behind a waiting xhigh request, id_task = %d\n", id_task);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
                     // [TAG_KV_POOL] checked before a slot is picked: picking one already saves,
                     // restores and clears prompt cache state for the task
                     if (kv_pool_must_wait(task)) {
+                        kv_pool_yield_low(task); // [TAG_REQUEST_PRIORITY] an xhigh request takes the room of low ones
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -3629,6 +3730,18 @@ private:
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
                                 }
+                            }
+                        }
+                    }
+
+                    // [TAG_KV_POOL] [TAG_REQUEST_PRIORITY] requests below xhigh wait behind a waiting xhigh one even
+                    // while a slot is free, and a release starts only one waiting request: once a request has
+                    // started, the next waiting one gets a look while a slot is still idle
+                    if (kv_pool_shared() && queue_tasks.queue_tasks_deferred_size() > 0) {
+                        for (auto & other : slots) {
+                            if (!other.is_processing()) {
+                                other.callback_on_release(other.id);
+                                break;
                             }
                         }
                     }
@@ -4376,8 +4489,9 @@ private:
                 return;
             }
 
-            // [TAG_REQUEST_PRIORITY] a held request sits this pass out, unless it is the trickle pass
-            if (slot.held) {
+            // [TAG_REQUEST_PRIORITY] a held request sits this pass out, unless it is the trickle pass; one that
+            // gives its pool room to an xhigh request takes this pass to end
+            if (slot.held && !slot.pool_yield) {
                 if (!hold_trickle) {
                     return;
                 }
