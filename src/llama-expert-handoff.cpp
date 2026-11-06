@@ -142,6 +142,8 @@ struct llama_expert_handoff::impl {
     eh_host_api api;
     eh_mapped_free_t mapped_free = nullptr;
     void * mailbox = nullptr;
+    bool   mailbox_mapped = false;
+    std::vector<uint8_t> mailbox_dummy; // no_alloc models
     ggml_expert_handoff_dims dims = {};
     ggml_expert_handoff_host_t host = nullptr;
     int32_t timeout_ms = 1000;
@@ -293,16 +295,23 @@ struct llama_expert_handoff::impl {
         dims.max_tokens = (int32_t) params.max_tokens;
         dims.max_embd   = (int32_t) model.hparams.n_embd;
         dims.max_used   = (int32_t) model.hparams.n_expert_used_max();
-        mailbox = mapped_alloc(ggml_expert_handoff_size(dims));
-        if (mailbox == nullptr) {
-            throw std::runtime_error("expert handoff: failed to allocate the mailbox");
-        }
         int32_t n_workers = params.n_workers;
         if (n_workers <= 0) {
             const int32_t hw = (int32_t) std::thread::hardware_concurrency();
             n_workers = std::max(1, (hw > 4 ? hw/2 : hw) - 1);
         }
-        host = api.host_new(mailbox, dims.max_tokens, dims.max_embd, dims.max_used, (int32_t) model.layers.size(), n_workers);
+        if (model.hparams.no_alloc) {
+            // a model loaded only to measure memory: the graphs are built, never run
+            mailbox_dummy.assign(ggml_expert_handoff_size(dims) + GGML_EXPERT_HANDOFF_ALIGN, 0);
+            mailbox = (void *) (((uintptr_t) mailbox_dummy.data() + GGML_EXPERT_HANDOFF_ALIGN - 1) & ~(uintptr_t) (GGML_EXPERT_HANDOFF_ALIGN - 1));
+        } else {
+            mailbox = mapped_alloc(ggml_expert_handoff_size(dims));
+            if (mailbox == nullptr) {
+                throw std::runtime_error("expert handoff: failed to allocate the mailbox");
+            }
+            mailbox_mapped = true;
+            host = api.host_new(mailbox, dims.max_tokens, dims.max_embd, dims.max_used, (int32_t) model.layers.size(), n_workers);
+        }
 
         size_t n_cached = 0, n_all = 0;
         for (const group & g : groups) {
@@ -329,7 +338,7 @@ struct llama_expert_handoff::impl {
             save_profile();
             api.host_free(host);
         }
-        if (mailbox) {
+        if (mailbox && mailbox_mapped) {
             mapped_free(mailbox);
         }
     }
@@ -339,16 +348,26 @@ struct llama_expert_handoff::impl {
         for (group & g : groups) {
             std::vector<std::pair<int32_t, int32_t>> chosen; // (il, e)
             if (!profile_counts.empty()) {
-                std::vector<std::tuple<uint64_t, int32_t, int32_t>> rank;
+                // most routed first; equal counts (a short profile leaves most at zero) go round-robin over the
+                // layers by their rank within the layer, so no layer is left out
+                std::vector<std::tuple<uint64_t, int32_t, int32_t, int32_t>> rank; // count, rank in layer, il, e
                 for (int32_t il : g.layers) {
                     const auto & c = (size_t) il < profile_counts.size() ? profile_counts[il] : std::vector<uint64_t>();
+                    std::vector<int32_t> order(g.n_expert);
                     for (int32_t e = 0; e < g.n_expert; ++e) {
-                        rank.emplace_back(e < (int32_t) c.size() ? c[e] : 0, il, e);
+                        order[e] = e;
+                    }
+                    auto cnt = [&](int32_t e) { return e < (int32_t) c.size() ? c[e] : (uint64_t) 0; };
+                    std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return cnt(a) > cnt(b); });
+                    for (int32_t r = 0; r < g.n_expert; ++r) {
+                        rank.emplace_back(cnt(order[r]), r, il, order[r]);
                     }
                 }
-                std::stable_sort(rank.begin(), rank.end(), [](const auto & a, const auto & b) { return std::get<0>(a) > std::get<0>(b); });
+                std::stable_sort(rank.begin(), rank.end(), [](const auto & a, const auto & b) {
+                    return std::get<0>(a) != std::get<0>(b) ? std::get<0>(a) > std::get<0>(b) : std::get<1>(a) < std::get<1>(b);
+                });
                 for (int32_t i = 0; i < g.n_slots && i < (int32_t) rank.size(); ++i) {
-                    chosen.emplace_back(std::get<1>(rank[i]), std::get<2>(rank[i]));
+                    chosen.emplace_back(std::get<2>(rank[i]), std::get<3>(rank[i]));
                 }
             } else {
                 const int32_t nl = (int32_t) g.layers.size();
@@ -451,7 +470,14 @@ struct llama_expert_handoff::impl {
     }
 
     bool use(int32_t il, int64_t n_tokens, int32_t act) const {
-        if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || n_tokens <= 0 || n_tokens > dims.max_tokens || host == nullptr) {
+        if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || n_tokens <= 0 || n_tokens > dims.max_tokens) {
+            return false;
+        }
+        if (model.hparams.no_alloc) {
+            // measuring only: the same graph, nothing read from the weights
+            return act == GGML_EXPERT_HANDOFF_ACT_SILU || act == GGML_EXPERT_HANDOFF_ACT_GELU;
+        }
+        if (host == nullptr) {
             return false;
         }
         const layer & l = layers[il];

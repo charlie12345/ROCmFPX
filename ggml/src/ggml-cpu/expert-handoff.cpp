@@ -230,8 +230,10 @@ struct ggml_expert_handoff_host {
         cv.notify_all();
     }
 
-    // wait for a new send; false if the pool stops
-    bool wait_work(uint32_t seen, uint64_t & my_gen, uint32_t & s) {
+    // wait for a new send; false if the pool stops. After a quiet spell the workers sleep, but worker 0 keeps looking
+    // at the mailbox every millisecond and wakes them: a send can come long after the wake (the first kernels of a
+    // cold device load for hundreds of milliseconds), and the device cannot wake a sleeping pool itself
+    bool wait_work(int iw, uint32_t seen, uint64_t & my_gen, uint32_t & s) {
         for (;;) {
             s = eh_load(&hdr->seq_send);
             if (s != seen) {
@@ -241,9 +243,22 @@ struct ggml_expert_handoff_host {
                 return false;
             }
             if (eh_now_ns() > spin_until.load(std::memory_order_acquire)) {
-                std::unique_lock<std::mutex> lk(mtx);
-                cv.wait(lk, [&] { return stop.load() || wake_gen != my_gen; });
-                my_gen = wake_gen;
+                if (iw == 0) {
+                    {
+                        std::unique_lock<std::mutex> lk(mtx);
+                        cv.wait_for(lk, std::chrono::milliseconds(1), [&] { return stop.load() || wake_gen != my_gen; });
+                        my_gen = wake_gen;
+                    }
+                    if (eh_load(&hdr->seq_send) != seen) {
+                        wake();
+                        std::lock_guard<std::mutex> lk(mtx);
+                        my_gen = wake_gen;
+                    }
+                } else {
+                    std::unique_lock<std::mutex> lk(mtx);
+                    cv.wait(lk, [&] { return stop.load() || wake_gen != my_gen; });
+                    my_gen = wake_gen;
+                }
                 continue;
             }
             for (int i = 0; i < 64; ++i) {
@@ -437,7 +452,7 @@ struct ggml_expert_handoff_host {
         uint64_t my_gen = 0;
         for (;;) {
             uint32_t s = 0;
-            if (!wait_work(seen, my_gen, s)) {
+            if (!wait_work(iw, seen, my_gen, s)) {
                 return;
             }
             // every worker saw a new send; worker 0 reads it, the others wait
