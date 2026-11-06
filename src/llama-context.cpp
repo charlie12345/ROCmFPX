@@ -395,6 +395,9 @@ llama_context::llama_context(
     cparams.pool_workers        = params.pool_workers;
     cparams.expert_profile      = params.expert_profile      ? params.expert_profile      : "";
     cparams.expert_profile_save = params.expert_profile_save ? params.expert_profile_save : "";
+    cparams.adapt_every         = params.adapt_every;
+    cparams.adapt_swaps         = params.adapt_swaps;
+    cparams.adapt_decay         = params.adapt_decay;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -633,6 +636,9 @@ llama_context::llama_context(
             ehp.n_workers        = cparams.pool_workers;
             ehp.profile          = cparams.expert_profile;
             ehp.profile_save     = cparams.expert_profile_save;
+            ehp.adapt_every      = cparams.adapt_every;
+            ehp.adapt_swaps      = cparams.adapt_swaps;
+            ehp.adapt_decay      = cparams.adapt_decay;
             expert_handoff = std::make_unique<llama_expert_handoff>(model, backend_ptrs, backend_buft, ehp);
         } else if (params.ctx_other != nullptr && llama_get_model(params.ctx_other) == &model) {
             // an MTP draft context of the same model reads the target's VRAM cache, which holds its layer whole
@@ -1674,6 +1680,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     prof_lap(prof_t_inputs);
+
+    // [TAG_EXPERT_HANDOFF] the adaptive cache's swaps, between decode graphs
+    if (expert_handoff) {
+        expert_handoff->adapt(ubatch.n_tokens);
+    }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
@@ -4261,6 +4272,9 @@ llama_context_params llama_context_default_params() {
         /*.pool_workers                =*/ 0,
         /*.expert_profile              =*/ nullptr,
         /*.expert_profile_save         =*/ nullptr,
+        /*.adapt_every                 =*/ 4,
+        /*.adapt_swaps                 =*/ 96,
+        /*.adapt_decay                 =*/ 0.7f,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

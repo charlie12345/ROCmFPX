@@ -2919,7 +2919,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_VRAM_RESERVE_MIB"));
     add_opt(common_arg(
         {"--pool-workers"}, "N",
-        "expert handoff: CPU threads computing the experts the VRAM cache misses (default: 0 = one per physical core but one)",
+        "expert handoff: CPU threads computing the experts the VRAM cache misses (default: 0 = one per 4 logical CPUs, at least 2)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
@@ -2941,6 +2941,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.expert_profile_save = value;
         }
     ).set_env("LLAMA_ARG_EXPERT_PROFILE_SAVE"));
+    add_opt(common_arg(
+        {"--adapt-every"}, "N",
+        "expert handoff: every N decode steps, swap the most routed experts the VRAM cache misses in for the least "
+        "routed ones it holds (default: 4, 0 = the cache keeps what the profile put there)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.adapt_every = value;
+        }
+    ).set_env("LLAMA_ARG_ADAPT_EVERY"));
+    add_opt(common_arg(
+        {"--adapt-swaps"}, "N",
+        "expert handoff: most experts swapped into the VRAM cache per round (default: 96, 0 = none)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.adapt_swaps = value;
+        }
+    ).set_env("LLAMA_ARG_ADAPT_SWAPS"));
+    add_opt(common_arg(
+        {"--adapt-decay"}, "F",
+        "expert handoff: the routing counts behind the swaps are multiplied by F after each round (default: 0.7)",
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (!(f >= 0.0f && f <= 1.0f)) {
+                throw std::invalid_argument("invalid value: between 0 and 1");
+            }
+            params.adapt_decay = f;
+        }
+    ).set_env("LLAMA_ARG_ADAPT_DECAY"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

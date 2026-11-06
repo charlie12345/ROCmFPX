@@ -367,7 +367,8 @@ static bool run_case(ggml_backend_t be, ggml_backend_t cpu, const mailbox_alloc 
     std::vector<float> got(c.n_embd*c.n_tokens);
     bool ok = true;
     double nmse = 0.0;
-    for (int rep = 0; rep < n_rep && ok; ++rep) {
+    int rep = 0;
+    for (; rep < n_rep && ok; ++rep) {
         ggml_init_params gp = { 256*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
         ggml_context * ctx = ggml_init(gp);
         ggml_tensor * sl = ggml_get_rows(ctx, slot_map, ggml_reshape_1d(ctx, dids, c.n_used*c.n_tokens));
@@ -418,8 +419,8 @@ static bool run_case(ggml_backend_t be, ggml_backend_t cpu, const mailbox_alloc 
     }
 
     // the device counted every routed expert of every run; a run without misses never reached the host; the host
-    // computed the misses among the counted experts
-    {
+    // computed the misses among the counted experts (after all runs; a failed run already says why)
+    if (ok && rep == n_rep) {
         std::vector<int32_t> cnt(c.n_expert), want(c.n_expert, 0);
         ggml_backend_tensor_get(dcounts, cnt.data(), 0, cnt.size()*sizeof(int32_t));
         int64_t n_miss_all = 0, n_miss = 0;
@@ -523,13 +524,14 @@ int main(int argc, char ** argv) {
         test_case * c = add({ GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 256, 128, 16, 4, 2, 5, true, SILU, true });
         c->biases = true;
     }
-    {   // DeepSeek V4 / GLM-5 style clamp
+    {   // DeepSeek V4 / GLM-5 style clamp (a limit inside the test's value range, so it clamps; on the GPU the
+        // device's own activation rounding then shows a little more)
         test_case * c = add({ GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 512, 256, 32, 8, 3, 12, false, GGML_EXPERT_HANDOFF_ACT_SILU_CLAMP, false });
-        c->limit = 0.05f;
+        c->limit = 0.15f;
     }
     {   // the other clamp: silu limited, up clamped
         test_case * c = add({ GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 256, 128, 16, 4, 3, 6, false, GGML_EXPERT_HANDOFF_ACT_SILU_LIMIT, false });
-        c->limit = 0.05f;
+        c->limit = 0.15f;
     }
     {   // Kimi K3: situ
         test_case * c = add({ GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 256, 128, 16, 4, 2, 6, false, GGML_EXPERT_HANDOFF_ACT_SITU, false });

@@ -31,7 +31,11 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
   [Swift 1.5 IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf),
   UkisAI's Qwen3.8-27B fine-tune, our recommended model. For slightly faster
   prompts, our ROCmFPX-optimised quant of the same model:
-  [ROCmFP4-FP6 recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md)
+  [ROCmFP4-FP6 recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md).
+  Mixture-of-experts models bigger than the card, such as Qwen3.6-35B-A3B and
+  Qwen3.8-Flash-Next, run with their experts split between VRAM and system
+  RAM: Qwen3.6-35B-A3B writes at 104 t/s, 50% faster than the usual CPU
+  offload. [Expert handoff](docs/expert-handoff.md)
 
 - **Switching conversations costs seconds, not minutes.** Conversations are
   saved to SSD and restored when they come back, in about 3 s instead of a

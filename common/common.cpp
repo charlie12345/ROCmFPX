@@ -1777,6 +1777,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.pool_workers        = params.pool_workers;
     cparams.expert_profile      = params.expert_profile.empty()      ? nullptr : params.expert_profile.c_str();
     cparams.expert_profile_save = params.expert_profile_save.empty() ? nullptr : params.expert_profile_save.c_str();
+    cparams.adapt_every         = params.adapt_every;
+    cparams.adapt_swaps         = params.adapt_swaps;
+    cparams.adapt_decay         = params.adapt_decay;
 
     return cparams;
 }

@@ -28,6 +28,9 @@ struct llama_expert_handoff_params {
     uint32_t    max_tokens       = 32; // largest batch the layers are split for
     std::string profile;               // routing counts to fill the cache from
     std::string profile_save;          // where to write the routing counts at exit
+    int32_t     adapt_every      =  4; // the adaptive cache: a round every N decode graphs, 0 = off
+    int32_t     adapt_swaps      = 96; // most swaps per round
+    float       adapt_decay      = 0.7f; // the usage counts are multiplied by this after each round
 };
 
 // how a layer's routed experts are computed, as build_moe_ffn does it (the host pool repeats it)
@@ -70,6 +73,10 @@ public:
     void wake()  const; // a graph that may hand off experts is about to run
     void idle()  const; // the graphs are done: the host pool stops spinning
     void check() const; // before a graph: report joins that timed out, the periodic hit-rate line
+
+    // before a graph of n_tokens: every adapt_every decode graphs, the most routed experts the cache misses replace
+    // the least routed ones it holds; their copies run on a helper thread, and they serve once they have landed
+    void adapt(int64_t n_tokens) const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

@@ -9,7 +9,9 @@
 #include "ggml-expert-handoff.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -135,7 +137,7 @@ struct llama_expert_handoff::impl {
     struct layer {
         int32_t ig = -1;
         ggml_tensor * slot_map = nullptr;           // device I32 [1, n_expert]
-        std::vector<int32_t> slots;                 // host copy, miss slot for the experts not cached
+        mutable std::vector<int32_t> slots;         // host copy, miss slot for the experts not cached (adapt() changes it)
         std::vector<ggml_tensor *> experts;         // host experts in the order of the banks
         // registration with the host pool (first use)
         mutable int32_t state = 0;                  // 0 = not yet, 1 = ok, -1 = the host cannot compute it
@@ -187,6 +189,24 @@ struct llama_expert_handoff::impl {
     std::vector<std::vector<uint64_t>> profile_counts;
 
     mutable std::mutex mtx;
+
+    // the adaptive cache (adapt()): decayed routing counts, the swaps in flight and the helper thread copying them
+    struct swap {
+        int32_t il;
+        int32_t in;    // the expert copied in
+        int32_t slot;  // the slot it lands in (that of the expert evicted)
+    };
+    mutable int64_t n_rounds = 0;                 // decode graphs seen
+    mutable std::vector<float>   usage;           // [il*counts_stride + e]
+    mutable std::vector<int32_t> counts_seen;     // the device counts at the last round
+    mutable std::vector<swap>    in_flight;       // evicted, copying (the helper reads the list while busy)
+    mutable std::thread          helper;
+    mutable std::mutex           helper_mtx;
+    mutable std::condition_variable helper_cv;
+    mutable bool                 helper_job  = false;
+    mutable bool                 helper_stop = false;
+    mutable std::atomic<bool>    helper_busy{false};
+    mutable uint64_t n_swaps = 0, n_swaps_reported = 0;
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends,
             const std::vector<ggml_backend_buffer_type_t> & bufts, const llama_expert_handoff_params & params) :
@@ -394,6 +414,14 @@ struct llama_expert_handoff::impl {
     }
 
     ~impl() {
+        if (helper.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(helper_mtx);
+                helper_stop = true;
+            }
+            helper_cv.notify_all();
+            helper.join();
+        }
         if (host) {
             ggml_expert_handoff_stats st = {};
             api.get_stats(host, &st);
@@ -650,6 +678,153 @@ struct llama_expert_handoff::impl {
         return n;
     }
 
+    // the helper thread: copies the experts of in_flight from host memory into their slots. The copies go through
+    // the device's per-thread stream (ggml_backend_tensor_set), beside the graphs; nothing reads those slots
+    // until adapt() admits them.
+    void helper_main() const {
+        std::unique_lock<std::mutex> lk(helper_mtx);
+        while (true) {
+            helper_cv.wait(lk, [&] { return helper_job || helper_stop; });
+            if (helper_stop) {
+                return;
+            }
+            helper_job = false;
+            lk.unlock();
+            for (const swap & s : in_flight) {
+                const layer & l = layers[s.il];
+                const group & g = groups[l.ig];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t es = eh_expert_stride(w);
+                    ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + (size_t) s.in*es, (size_t) s.slot*es, es);
+                }
+            }
+            helper_busy.store(false, std::memory_order_release);
+            lk.lock();
+        }
+    }
+
+    void upload_slot_maps(std::vector<int32_t> & touched) const {
+        std::sort(touched.begin(), touched.end());
+        touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+        for (int32_t il : touched) {
+            const layer & l = layers[il];
+            ggml_backend_tensor_set(l.slot_map, l.slots.data(), 0, l.slots.size()*sizeof(int32_t));
+        }
+    }
+
+    // Every adapt_every decode graphs: the routing counts since the last round are added to the decayed usage; in
+    // each layer, the most used experts the cache misses (used at least twice) replace the least used ones it holds
+    // while the gain is at least 1.5 uses; the best adapt_swaps of all layers go. The evicted experts leave the slot
+    // maps at once, so the graphs from here on send them to the host, and the device finishes the graphs that may
+    // still read their slots; then the helper copies the new experts in. A later call admits them once copied.
+    void adapt(int64_t n_tokens) const {
+        if (params.adapt_every <= 0 || params.adapt_swaps <= 0 || host == nullptr ||
+            n_tokens <= 0 || n_tokens > dims.max_tokens) {
+            return;
+        }
+        n_rounds++;
+
+        // the last round's copies have landed: they serve from the next graph on
+        if (!in_flight.empty()) {
+            if (helper_busy.load(std::memory_order_acquire)) {
+                return;
+            }
+            std::lock_guard<std::mutex> lk(mtx);
+            std::vector<int32_t> touched;
+            for (const swap & s : in_flight) {
+                layers[s.il].slots[s.in] = s.slot;
+                touched.push_back(s.il);
+            }
+            upload_slot_maps(touched);
+            n_swaps += in_flight.size();
+            in_flight.clear();
+        }
+        if (n_rounds % params.adapt_every != 0) {
+            return;
+        }
+
+        const std::vector<int32_t> dc = device_counts();
+        if (dc.empty()) {
+            return;
+        }
+        if (usage.empty()) {
+            usage.assign(dc.size(), 0.0f);
+            counts_seen.assign(dc.size(), 0);
+        }
+        for (size_t i = 0; i < dc.size(); ++i) {
+            usage[i] += (float) (uint32_t) (dc[i] - counts_seen[i]);
+            counts_seen[i] = dc[i];
+        }
+
+        struct cand { float gain; int32_t il, in, out; };
+        std::vector<cand> swaps;
+        std::vector<std::pair<float, int32_t>> miss, held;
+        const float min_gain = 1.5f;
+        for (int32_t il = 0; il < il_nextn && il < (int32_t) layers.size(); ++il) {
+            const layer & l = layers[il];
+            if (l.ig < 0 || l.state != 1) {
+                continue;
+            }
+            const group & g = groups[l.ig];
+            const float * u = usage.data() + (size_t) il*counts_stride;
+            miss.clear();
+            held.clear();
+            for (int32_t e = 0; e < g.n_expert; ++e) {
+                if (l.slots[e] >= g.n_slots) {
+                    if (u[e] >= 2.0f) {
+                        miss.emplace_back(u[e], e);
+                    }
+                } else {
+                    held.emplace_back(u[e], e);
+                }
+            }
+            if (miss.empty() || held.empty()) {
+                continue;
+            }
+            const size_t n = std::min(miss.size(), held.size());
+            std::partial_sort(miss.begin(), miss.begin() + n, miss.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+            std::partial_sort(held.begin(), held.begin() + n, held.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+            for (size_t i = 0; i < n && miss[i].first >= held[i].first + min_gain; ++i) {
+                swaps.push_back({ miss[i].first - held[i].first, il, miss[i].second, held[i].second });
+            }
+        }
+        for (float & v : usage) {
+            v *= params.adapt_decay;
+        }
+        if (swaps.empty()) {
+            return;
+        }
+        std::sort(swaps.begin(), swaps.end(), [](const cand & a, const cand & b) { return a.gain > b.gain; });
+        if ((int32_t) swaps.size() > params.adapt_swaps) {
+            swaps.resize(params.adapt_swaps);
+        }
+
+        // evict: the victims go to the miss slot in the maps; the graphs queued before may still read their slots
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            std::vector<int32_t> touched;
+            for (const cand & c : swaps) {
+                const layer & l = layers[c.il];
+                in_flight.push_back({ c.il, c.in, l.slots[c.out] });
+                l.slots[c.out] = groups[l.ig].n_slots;
+                touched.push_back(c.il);
+            }
+            upload_slot_maps(touched);
+        }
+        ggml_backend_synchronize(backend);
+
+        if (!helper.joinable()) {
+            helper = std::thread([this] { helper_main(); });
+        }
+        helper_busy.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(helper_mtx);
+            helper_job = true;
+        }
+        helper_cv.notify_one();
+    }
+
     void check() const {
         if (mailbox == nullptr) {
             return;
@@ -675,9 +850,12 @@ struct llama_expert_handoff::impl {
             const uint64_t d_layers = st.n_layers - last.n_layers;
             const uint64_t d_busy   = st.busy_ns - last.busy_ns;
             if (d_routed > 0) {
-                LLAMA_LOG_INFO("%s: %" PRIu64 " routed experts, VRAM hit rate %.1f%%, %" PRIu64 " layers sent to the host, %.0f us each\n",
-                    __func__, d_routed, 100.0*(1.0 - (double) d_host/d_routed), d_layers, d_layers ? d_busy/1000.0/d_layers : 0.0);
+                LLAMA_LOG_INFO("%s: %" PRIu64 " routed experts, VRAM hit rate %.1f%%, %" PRIu64 " layers sent to the host, %.0f us each, "
+                    "%" PRIu64 " experts swapped in\n",
+                    __func__, d_routed, 100.0*(1.0 - (double) d_host/d_routed), d_layers, d_layers ? d_busy/1000.0/d_layers : 0.0,
+                    n_swaps - n_swaps_reported);
             }
+            n_swaps_reported = n_swaps;
             last = st;
             last.n_routed = n_routed;
             t_report = now;
@@ -746,6 +924,10 @@ void llama_expert_handoff::idle() const {
 
 void llama_expert_handoff::check() const {
     pimpl->check();
+}
+
+void llama_expert_handoff::adapt(int64_t n_tokens) const {
+    pimpl->adapt(n_tokens);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_expert_handoff::memory_breakdown() const {

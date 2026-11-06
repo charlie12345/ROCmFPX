@@ -607,6 +607,9 @@ struct common_params {
     int32_t     pool_workers     =  0; // 0 = auto
     std::string expert_profile;        // NOLINT
     std::string expert_profile_save;   // NOLINT
+    int32_t     adapt_every      =  4;   // 0 = off
+    int32_t     adapt_swaps      = 96;
+    float       adapt_decay      = 0.7f;
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

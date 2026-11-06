@@ -433,6 +433,9 @@ extern "C" {
         int32_t      pool_workers;        // host threads computing the experts the cache misses, 0 = auto
         const char * expert_profile;      // routing counts to fill the cache from, NULL = none
         const char * expert_profile_save; // file to write the routing counts to at exit, NULL = none
+        int32_t      adapt_every;         // swap hot experts into the cache every N decode graphs, 0 = the profile's cache stays (default 4)
+        int32_t      adapt_swaps;         // most swaps per round (default 96)
+        float        adapt_decay;         // the routing counts behind the swaps are multiplied by this after each round (default 0.7)
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
