@@ -429,7 +429,7 @@ extern "C" {
         // It replaces upstream's MoE cache: moe_cache_size keeps its name and now sizes the handoff's cache.
         size_t       moe_cache_size;      // VRAM cache size in bytes, 0 = off (unless expert_cache is set)
         int32_t      expert_cache;        // VRAM cache size in units of the largest expert, -1 = fill the free VRAM, 0 = off (wins over moe_cache_size)
-        int32_t      vram_reserve_mib;    // VRAM the automatic cache size leaves free, -1 = default (2048)
+        int32_t      vram_reserve_mib;    // VRAM the automatic cache size leaves free beyond the compute buffers, -1 = default (1024)
         int32_t      pool_workers;        // host threads computing the experts the cache misses, 0 = auto
         const char * expert_profile;      // routing counts to fill the cache from, NULL = none
         const char * expert_profile_save; // file to write the routing counts to at exit, NULL = none

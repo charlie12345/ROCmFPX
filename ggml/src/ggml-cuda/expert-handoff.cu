@@ -60,7 +60,7 @@ static __device__ __forceinline__ void eh_dev_pause() {
 // one block: count the misses (flags[layer], read by the join) and the routing (counts); with misses, copy the
 // selection into the mailbox, every thread fences its own writes and thread 0 rings, so the host sees all of them
 static __global__ void k_expert_handoff_send(
-        const float * __restrict__ x, const int32_t * __restrict__ ids, const int32_t * __restrict__ slots,
+        const float * __restrict__ x, const int32_t * __restrict__ ids, const int32_t * __restrict__ slot_map, const int n_map,
         const float * __restrict__ w, int32_t * __restrict__ slots_out, uint8_t * mb, const eh_offsets off,
         const int n_embd, const int n_tokens, const int n_used, const int layer, const int max_embd, const int max_used,
         const int miss_slot, int32_t * flags, int32_t * counts, const int counts_stride) {
@@ -69,13 +69,14 @@ static __global__ void k_expert_handoff_send(
         n_miss = 0;
     }
     __syncthreads();
+    // each thread looks up the slots of its selections (the second loop below takes the same ones)
     for (int i = threadIdx.x; i < n_tokens*n_used; i += blockDim.x) {
-        const int32_t s = slots[i];
+        const int32_t e = ids[i];
+        const int32_t s = e >= 0 && e < n_map ? slot_map[e] : miss_slot;
         slots_out[i] = s;
         if (s == miss_slot) {
             atomicAdd(&n_miss, 1);
         }
-        const int32_t e = ids[i];
         if (counts != nullptr && e >= 0 && e < counts_stride) {
             atomicAdd(&counts[layer*counts_stride + e], 1);
         }
@@ -102,7 +103,7 @@ static __global__ void k_expert_handoff_send(
         const int t = i / n_used;
         const int k = i - t*n_used;
         mi[t*max_used + k] = ids[i];
-        ms[t*max_used + k] = slots[i];
+        ms[t*max_used + k] = slots_out[i];
         mw[t*max_used + k] = w[i];
     }
 
@@ -206,7 +207,7 @@ void ggml_cuda_op_expert_handoff(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_MODE) == GGML_EXPERT_HANDOFF_SEND) {
         const ggml_tensor * x     = dst->src[0];
         const ggml_tensor * ids   = dst->src[1];
-        const ggml_tensor * slots = dst->src[2];
+        const ggml_tensor * map   = dst->src[2];
         const ggml_tensor * w     = dst->src[3];
 
         const int n_embd   = (int) x->ne[0];
@@ -215,7 +216,7 @@ void ggml_cuda_op_expert_handoff(ggml_backend_cuda_context & ctx, ggml_tensor * 
         GGML_ASSERT(n_tokens <= d.max_tokens && n_embd <= d.max_embd && n_used <= d.max_used);
 
         k_expert_handoff_send<<<1, 1024, 0, stream>>>(
-            (const float *) x->data, (const int32_t *) ids->data, (const int32_t *) slots->data, (const float *) w->data,
+            (const float *) x->data, (const int32_t *) ids->data, (const int32_t *) map->data, (int) ggml_nelements(map), (const float *) w->data,
             (int32_t *) dst->data, mb, off, n_embd, n_tokens, n_used, layer, d.max_embd, d.max_used,
             ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_MISS_SLOT), flags, counts,
             ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_COUNTS_STRIDE));
@@ -247,14 +248,22 @@ void * ggml_cuda_host_mapped_alloc(size_t size) {
         GGML_LOG_ERROR("%s: failed to allocate %.2f KiB of mapped host memory: %s\n", __func__, size/1024.0, cudaGetErrorString(err));
         return nullptr;
     }
-    void * dev = nullptr;
-    err = cudaHostGetDevicePointer(&dev, ptr, 0);
-    if (err != cudaSuccess || dev != ptr) {
-        (void) cudaGetLastError();
-        GGML_LOG_ERROR("%s: the mapped host memory has another address on the device (%p vs %p)\n", __func__, dev, ptr);
-        CUDA_CHECK(cudaFreeHost(ptr));
-        return nullptr;
+    // every device reads and writes it at the host's address (the ops take one pointer, whichever GPU runs them)
+    int cur = 0;
+    CUDA_CHECK(cudaGetDevice(&cur));
+    for (int id = 0; id < ggml_cuda_info().device_count; ++id) {
+        ggml_cuda_set_device(id);
+        void * dev = nullptr;
+        err = cudaHostGetDevicePointer(&dev, ptr, 0);
+        if (err != cudaSuccess || dev != ptr) {
+            (void) cudaGetLastError();
+            GGML_LOG_ERROR("%s: the mapped host memory has another address on device %d (%p vs %p)\n", __func__, id, dev, ptr);
+            ggml_cuda_set_device(cur);
+            CUDA_CHECK(cudaFreeHost(ptr));
+            return nullptr;
+        }
     }
+    ggml_cuda_set_device(cur);
     memset(ptr, 0, size);
     return ptr;
 }

@@ -17,10 +17,12 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -628,7 +630,16 @@ llama_context::llama_context(
 
         // [TAG_EXPERT_HANDOFF] replaces upstream's MoE cache: moe_cache_size (--moe-cache-mib) sizes the handoff's
         // VRAM cache in bytes, expert_cache (--expert-cache) in experts or auto; the expert slots win
-        if (cparams.expert_cache != 0 || cparams.moe_cache_size > 0) {
+        if ((cparams.expert_cache != 0 || cparams.moe_cache_size > 0) && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+            // tensor parallelism splits every layer over the GPUs; the handoff follows the layer split
+            LLAMA_LOG_WARN("%s: expert handoff does not work with --split-mode tensor; the experts stay where they are\n", __func__);
+        } else if (cparams.expert_cache != 0 || cparams.moe_cache_size > 0) {
+            // the compute buffers first, so the cache takes the VRAM they leave: a large ubatch needs several GB of
+            // them (prompts of that size take the usual path, which the reserve graph already is without a cache)
+            if (!model.hparams.no_alloc) {
+                sched_reserve();
+                sched_need_reserve = true;
+            }
             llama_expert_handoff_params ehp;
             ehp.n_slots          = cparams.expert_cache != 0 ? cparams.expert_cache : -1;
             ehp.budget_bytes     = cparams.expert_cache != 0 ? 0 : cparams.moe_cache_size;
@@ -636,6 +647,8 @@ llama_context::llama_context(
             ehp.n_workers        = cparams.pool_workers;
             ehp.profile          = cparams.expert_profile;
             ehp.profile_save     = cparams.expert_profile_save;
+            // the mailbox holds a whole ubatch up to 512 tokens: prompts that small may go to the host
+            ehp.max_tokens       = std::max<uint32_t>(32, std::min<uint32_t>(cparams.n_ubatch, 512));
             ehp.adapt_every      = cparams.adapt_every;
             ehp.adapt_swaps      = cparams.adapt_swaps;
             ehp.adapt_decay      = cparams.adapt_decay;
@@ -1662,6 +1675,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        // [TAG_DECODE_PROFILE] LLAMA_GRAPH_OPS=1: the ops of the first single-token graph, by count (views and
+        // reshapes are free and left out)
+        static const bool graph_ops = getenv("LLAMA_GRAPH_OPS") && atoi(getenv("LLAMA_GRAPH_OPS")) != 0;
+        static bool graph_ops_done = false;
+        if (graph_ops && !graph_ops_done && ubatch.n_tokens == 1 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            graph_ops_done = true;
+            std::map<std::string, int> hist;
+            int n_real = 0;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                const ggml_tensor * t = ggml_graph_node(gf, i);
+                if (ggml_is_empty(t) || t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE ||
+                    t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) {
+                    continue;
+                }
+                hist[ggml_op_desc(t)]++;
+                n_real++;
+            }
+            std::vector<std::pair<int, std::string>> v;
+            for (const auto & [k, n] : hist) {
+                v.emplace_back(n, k);
+            }
+            std::sort(v.rbegin(), v.rend());
+            std::string s;
+            for (const auto & [n, k] : v) {
+                s += " " + k + " " + std::to_string(n);
+            }
+            LLAMA_LOG_WARN("graph ops: %d nodes, %d that run:%s\n", ggml_graph_n_nodes(gf), n_real, s.c_str());
         }
 
         gf_res_prev_active = res;

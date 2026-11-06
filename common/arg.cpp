@@ -2909,7 +2909,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_EXPERT_CACHE"));
     add_opt(common_arg(
         {"--vram-reserve-mib"}, "N",
-        "expert handoff: VRAM that --expert-cache auto leaves free (default: 2048)",
+        "expert handoff: VRAM that --expert-cache auto leaves free beyond the compute buffers (default: 1024)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

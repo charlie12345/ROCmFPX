@@ -8,6 +8,7 @@
 // the selection.
 //
 // usage: test-expert-handoff [--gpu] [-v]
+//        test-expert-handoff --bench [type] [workers,...]   (the host pool's speed, CPU only)
 //   without --gpu the handoff graph runs on the CPU backend (the protocol and the pool, no device involved)
 
 #include "ggml.h"
@@ -17,12 +18,15 @@
 #include "ggml-expert-handoff.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct test_case {
@@ -371,9 +375,7 @@ static bool run_case(ggml_backend_t be, ggml_backend_t cpu, const mailbox_alloc 
     for (; rep < n_rep && ok; ++rep) {
         ggml_init_params gp = { 256*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
         ggml_context * ctx = ggml_init(gp);
-        ggml_tensor * sl = ggml_get_rows(ctx, slot_map, ggml_reshape_1d(ctx, dids, c.n_used*c.n_tokens));
-        sl = ggml_reshape_2d(ctx, sl, c.n_used, c.n_tokens);
-        ggml_tensor * sent = ggml_expert_handoff_send(ctx, dx, dids, sl, dw, &ehp);
+        ggml_tensor * sent = ggml_expert_handoff_send(ctx, dx, dids, slot_map, dw, &ehp);
         auto view = [&](ggml_tensor * b) -> ggml_tensor * {
             if (b == nullptr) {
                 return nullptr;
@@ -468,6 +470,140 @@ static bool run_case(ggml_backend_t be, ggml_backend_t cpu, const mailbox_alloc 
     return ok;
 }
 
+// --bench: the host pool's speed with the experts in RAM, the device's side of the mailbox played by this thread.
+// Random experts of several layers (more than the caches hold), so every expert comes from DRAM. Next to it, the
+// read bandwidth of the same threads on a plain buffer.
+static double bench_read_gbps(int n_threads, size_t bytes) {
+    std::vector<uint64_t> buf(bytes/8);
+    for (size_t i = 0; i < buf.size(); ++i) { buf[i] = i; }
+    double best = 0.0;
+    for (int rep = 0; rep < 3; ++rep) {
+        std::vector<std::thread> th;
+        std::vector<uint64_t> sums(n_threads*8);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int t = 0; t < n_threads; ++t) {
+            th.emplace_back([&, t] {
+                const size_t i0 = buf.size()*t/n_threads, i1 = buf.size()*(t + 1)/n_threads;
+                uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                for (size_t i = i0; i + 3 < i1; i += 4) { s0 += buf[i]; s1 += buf[i+1]; s2 += buf[i+2]; s3 += buf[i+3]; }
+                sums[t*8] = s0 + s1 + s2 + s3;
+            });
+        }
+        for (auto & x : th) { x.join(); }
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        best = std::max(best, bytes/s/1e9);
+    }
+    return best;
+}
+
+static void bench_fill(ggml_tensor * t, std::mt19937 & rng) {
+    // random quants with a small scale in front of every block (the types benched here start with an f16 scale)
+    uint8_t * p = (uint8_t *) t->data;
+    const size_t n = ggml_nbytes(t);
+    for (size_t i = 0; i + 4 <= n; i += 4) { const uint32_t r = rng(); memcpy(p + i, &r, 4); }
+    const size_t bs = ggml_type_size(t->type);
+    const ggml_fp16_t d = ggml_fp32_to_fp16(0.01f);
+    for (size_t i = 0; i + bs <= n; i += bs) { memcpy(p + i, &d, sizeof(d)); }
+}
+
+static int run_bench(ggml_type type, int64_t n_embd, int64_t n_ff, int64_t n_expert, int n_layer,
+        const std::vector<int> & workers, const std::vector<int> & miss_list, const std::vector<int> & token_list) {
+    printf("bench: %s experts %lld x %lld, %lld per layer, %d layers (%.2f MiB per expert, %.1f GiB)\n",
+        ggml_type_name(type), (long long) n_embd, (long long) n_ff, (long long) n_expert, n_layer,
+        3.0*ggml_row_size(type, n_embd)*n_ff/1048576.0, 3.0*ggml_row_size(type, n_embd)*n_ff*n_expert*n_layer/1073741824.0);
+    std::mt19937 rng(42);
+    ggml_init_params ip = { (size_t) (3*n_layer + 4)*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    std::vector<std::vector<uint8_t>> mem;
+    std::vector<ggml_expert_handoff_layer> hls(n_layer);
+    for (int il = 0; il < n_layer; ++il) {
+        ggml_tensor * g = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_expert);
+        ggml_tensor * u = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_expert);
+        ggml_tensor * d = ggml_new_tensor_3d(ctx, type, n_ff, n_embd, n_expert);
+        for (ggml_tensor * t : { g, u, d }) {
+            mem.emplace_back(ggml_nbytes(t) + 64);
+            t->data = (void *) (((uintptr_t) mem.back().data() + 63) & ~(uintptr_t) 63);
+            bench_fill(t, rng);
+        }
+        ggml_expert_handoff_layer & hl = hls[il];
+        hl = {};
+        hl.gate = g; hl.up = u; hl.down = d;
+        hl.act = GGML_EXPERT_HANDOFF_ACT_SILU;
+        hl.miss_slot = 0;
+    }
+    const int max_used = *std::max_element(miss_list.begin(), miss_list.end());
+    const int max_tok  = *std::max_element(token_list.begin(), token_list.end());
+    const ggml_expert_handoff_dims dims = { 32, (int32_t) n_embd, (int32_t) max_used };
+    std::vector<uint8_t> mb_mem(ggml_expert_handoff_size(dims) + 256, 0);
+    uint8_t * mb = (uint8_t *) (((uintptr_t) mb_mem.data() + 255) & ~(uintptr_t) 255);
+    auto * hdr = (ggml_expert_handoff_header *) mb;
+    auto sq_load  = [](const uint32_t * p) { return reinterpret_cast<const std::atomic<uint32_t> *>(p)->load(std::memory_order_acquire); };
+    auto sq_store = [](uint32_t * p, uint32_t v) { reinterpret_cast<std::atomic<uint32_t> *>(p)->store(v, std::memory_order_release); };
+    {
+        float * x = (float *) (mb + ggml_expert_handoff_off_x(dims));
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        for (int64_t i = 0; i < (int64_t) max_tok*n_embd; ++i) { x[i] = nd(rng); }
+    }
+    const size_t expert_bytes = 3*ggml_row_size(type, n_embd)*n_ff;
+    for (int nw : workers) {
+        printf("  %2d workers, reading a plain buffer: %.1f GB/s\n", nw, bench_read_gbps(nw, (size_t) 2 << 30));
+        ggml_expert_handoff_host_t host = ggml_expert_handoff_host_new(mb, dims.max_tokens, dims.max_embd, dims.max_used, n_layer, nw);
+        for (int il = 0; il < n_layer; ++il) {
+            ggml_expert_handoff_host_set_layer(host, il, &hls[il]);
+        }
+        for (int nt : token_list) {
+          for (int shared = 0; shared <= (nt > 1 ? 1 : 0); ++shared) {
+            for (int nm : miss_list) {
+                const int n_iter = 400;
+                double t_sum = 0.0, t_min = 1e9;
+                size_t bytes = 0;
+                int32_t * ids   = (int32_t *) (mb + ggml_expert_handoff_off_ids(dims));
+                int32_t * slots = (int32_t *) (mb + ggml_expert_handoff_off_slots(dims));
+                float   * w     = (float   *) (mb + ggml_expert_handoff_off_weights(dims));
+                std::vector<int32_t> perm(n_expert);
+                for (int it = -20; it < n_iter; ++it) {
+                    const int il = (int) (rng() % n_layer);
+                    std::vector<char> seen(n_expert, 0);
+                    size_t uniq = 0;
+                    for (int t = 0; t < nt; ++t) {
+                        // shared: every token misses the same experts (a batch's tokens often route alike)
+                        if (t == 0 || !shared) {
+                            for (int64_t e = 0; e < n_expert; ++e) { perm[e] = (int32_t) e; }
+                            for (int k = 0; k < nm; ++k) {
+                                std::swap(perm[k], perm[k + rng() % (n_expert - k)]);
+                            }
+                        }
+                        for (int k = 0; k < nm; ++k) {
+                            ids[t*dims.max_used + k] = perm[k];
+                            slots[t*dims.max_used + k] = 0;
+                            w[t*dims.max_used + k] = 1.0f/nm;
+                            uniq += !seen[perm[k]];
+                            seen[perm[k]] = 1;
+                        }
+                    }
+                    hdr->layer = il; hdr->n_tokens = nt; hdr->n_embd = (int32_t) n_embd; hdr->n_used = nm;
+                    ggml_expert_handoff_host_wake(host);
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const uint32_t s = sq_load(&hdr->seq_send) + 1;
+                    sq_store(&hdr->seq_send, s);
+                    while (sq_load(&hdr->seq_done) != s) { }
+                    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                    if (it >= 0) {
+                        t_sum += us; t_min = std::min(t_min, us); bytes += uniq*expert_bytes;
+                    }
+                }
+                const double t_avg = t_sum/n_iter;
+                printf("    %2d tokens x %2d misses%s: %8.1f us per layer (min %7.1f), %6.1f us per expert read, %5.1f GB/s\n",
+                    nt, nm, shared ? " (shared)" : "         ", t_avg, t_min, t_sum/(bytes/(double) expert_bytes), bytes/(t_sum*1e-6)/1e9);
+            }
+          }
+        }
+        ggml_expert_handoff_host_free(host);
+    }
+    ggml_free(ctx);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     bool use_gpu = false;
@@ -475,6 +611,167 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--gpu") == 0) { use_gpu = true; }
         if (strcmp(argv[i], "-v") == 0)    { verbose = true; }
+        if (strcmp(argv[i], "--bench-gpu") == 0) {
+            // the round trip on the device: 48 layers of send -> join in one graph, Flash-Next's expert shape, the
+            // host computing 0, 1 or 2 missed experts per layer from RAM; time per layer against the host's own time
+            ggml_backend_load_all();
+            ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+            if (gpu == nullptr) { fprintf(stderr, "no GPU backend\n"); return 1; }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu));
+            auto mb_alloc = (void * (*)(size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_mapped_alloc");
+            auto mb_free  = (void   (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_mapped_free");
+            const int n_layer = 48, n_data = 4, n_used = 10, n_workers = i + 1 < argc ? atoi(argv[i + 1]) : 6;
+            const int64_t n_embd = 2560, n_ff = 640, n_expert = 512;
+            std::mt19937 rng(3);
+            ggml_init_params hp = { (size_t) (3*n_data + 4)*ggml_tensor_overhead(), nullptr, true };
+            ggml_context * hctx = ggml_init(hp);
+            std::vector<std::vector<uint8_t>> mem;
+            std::vector<ggml_expert_handoff_layer> hls(n_data);
+            for (int il = 0; il < n_data; ++il) {
+                ggml_tensor * g = ggml_new_tensor_3d(hctx, GGML_TYPE_Q2_0, n_embd, n_ff, n_expert);
+                ggml_tensor * u = ggml_new_tensor_3d(hctx, GGML_TYPE_Q2_0, n_embd, n_ff, n_expert);
+                ggml_tensor * d = ggml_new_tensor_3d(hctx, GGML_TYPE_Q2_0, n_ff, n_embd, n_expert);
+                for (ggml_tensor * t : { g, u, d }) {
+                    mem.emplace_back(ggml_nbytes(t) + 64);
+                    t->data = (void *) (((uintptr_t) mem.back().data() + 63) & ~(uintptr_t) 63);
+                    bench_fill(t, rng);
+                }
+                hls[il] = {};
+                hls[il].gate = g; hls[il].up = u; hls[il].down = d;
+                hls[il].act = GGML_EXPERT_HANDOFF_ACT_SILU;
+                hls[il].miss_slot = 1;
+            }
+            const ggml_expert_handoff_dims dims = { 32, (int32_t) n_embd, n_used };
+            void * mb = mb_alloc(ggml_expert_handoff_size(dims));
+            ggml_expert_handoff_host_t host = ggml_expert_handoff_host_new(mb, dims.max_tokens, dims.max_embd, dims.max_used, n_layer, n_workers);
+            for (int il = 0; il < n_layer; ++il) {
+                ggml_expert_handoff_host_set_layer(host, il, &hls[il % n_data]);
+            }
+            ggml_init_params dp = { 16*ggml_tensor_overhead(), nullptr, true };
+            ggml_context * dctx = ggml_init(dp);
+            ggml_tensor * dx     = ggml_new_tensor_2d(dctx, GGML_TYPE_F32, n_embd, 1);
+            ggml_tensor * dids   = ggml_new_tensor_2d(dctx, GGML_TYPE_I32, n_used, 1);
+            ggml_tensor * dw     = ggml_new_tensor_3d(dctx, GGML_TYPE_F32, 1, n_used, 1);
+            ggml_tensor * dmap   = ggml_new_tensor_1d(dctx, GGML_TYPE_I32, n_expert);
+            ggml_tensor * dflags = ggml_new_tensor_1d(dctx, GGML_TYPE_I32, n_layer);
+            ggml_tensor * dcnt   = ggml_new_tensor_1d(dctx, GGML_TYPE_I32, n_layer*n_expert);
+            ggml_backend_buffer_t dbuf = ggml_backend_alloc_ctx_tensors(dctx, gpu);
+            ggml_backend_buffer_clear(dbuf, 0);
+            {
+                std::vector<float> xv(n_embd);
+                for (auto & v : xv) { v = (float) (rng() % 1000)/1000.0f - 0.5f; }
+                ggml_backend_tensor_set(dx, xv.data(), 0, xv.size()*sizeof(float));
+                std::vector<float> wv(n_used, 0.1f);
+                ggml_backend_tensor_set(dw, wv.data(), 0, wv.size()*sizeof(float));
+            }
+            for (int n_miss : { 0, 1, 2 }) {
+                // experts 0..9 selected; the first n_miss of them at the miss slot
+                std::vector<int32_t> iv(n_used), map(n_expert, 0);
+                for (int k = 0; k < n_used; ++k) { iv[k] = (int32_t) (rng() % n_expert); }
+                for (int k = 0; k < n_miss; ++k) { map[iv[k]] = 1; }
+                ggml_backend_tensor_set(dids, iv.data(), 0, iv.size()*sizeof(int32_t));
+                ggml_backend_tensor_set(dmap, map.data(), 0, map.size()*sizeof(int32_t));
+                ggml_init_params gp = { (size_t) (4*n_layer + 8)*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+                ggml_context * gctx = ggml_init(gp);
+                ggml_cgraph * gf = ggml_new_graph(gctx);
+                ggml_tensor * cur = dx;
+                for (int il = 0; il < n_layer; ++il) {
+                    ggml_expert_handoff_params ehp = {};
+                    ehp.mailbox = mb; ehp.layer = il; ehp.max_tokens = dims.max_tokens; ehp.max_embd = dims.max_embd;
+                    ehp.max_used = dims.max_used; ehp.miss_slot = 1; ehp.flags = (int32_t *) dflags->data;
+                    ehp.counts = (int32_t *) dcnt->data; ehp.counts_stride = (int32_t) n_expert; ehp.timeout_ms = 1000;
+                    ggml_tensor * s = ggml_expert_handoff_send(gctx, cur, dids, dmap, dw, &ehp);
+                    ggml_build_forward_expand(gf, s);
+                    cur = ggml_expert_handoff_join(gctx, cur, &ehp);
+                    ggml_build_forward_expand(gf, cur);
+                }
+                ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu));
+                ggml_gallocr_alloc_graph(ga, gf);
+                ggml_expert_handoff_stats st0 = {}, st1 = {};
+                const int n_iter = 50;
+                double best = 1e9, sum = 0.0;
+                for (int it = -5; it < n_iter; ++it) {
+                    if (it == 0) { ggml_expert_handoff_host_get_stats(host, &st0); }
+                    ggml_expert_handoff_host_wake(host);
+                    const auto t0 = std::chrono::steady_clock::now();
+                    ggml_backend_graph_compute(gpu, gf);
+                    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                    if (it >= 0) { sum += us; best = std::min(best, us); }
+                }
+                ggml_expert_handoff_host_get_stats(host, &st1);
+                const double host_us = st1.n_layers > st0.n_layers ? (st1.busy_ns - st0.busy_ns)*1e-3/(st1.n_layers - st0.n_layers) : 0.0;
+                printf("%d workers, %d of %d experts missed per layer: %7.1f us per layer (best %7.1f); the host %6.1f us of it per sent layer\n",
+                    n_workers, n_miss, n_used, sum/n_iter/n_layer, best/n_layer, host_us);
+                ggml_gallocr_free(ga);
+                ggml_free(gctx);
+            }
+            const uint32_t to = ((ggml_expert_handoff_header *) mb)->n_timeouts;
+            printf("timeouts: %u\n", to);
+            ggml_expert_handoff_host_free(host);
+            mb_free(mb);
+            ggml_backend_buffer_free(dbuf);
+            ggml_free(dctx);
+            ggml_free(hctx);
+            ggml_backend_free(gpu);
+            return 0;
+        }
+        if (strcmp(argv[i], "--bench-dot") == 0) {
+            // one thread, one vec_dot type: rows of 2560 (gate/up) and 640 (down) from L1/L2, then from DRAM
+            ggml_backend_load_all();
+            ggml_type type = GGML_TYPE_Q2_0;
+            if (i + 1 < argc) {
+                for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+                    const char * n = ggml_type_name((ggml_type) t);
+                    if (n && strcmp(n, argv[i + 1]) == 0) { type = (ggml_type) t; }
+                }
+            }
+            const auto * tr = ggml_get_type_traits_cpu(type);
+            std::mt19937 rng(7);
+            for (int64_t n : { 2560, 640 }) {
+                for (size_t span : { (size_t) 64 << 10, (size_t) 1 << 30 }) {
+                    const size_t row = ggml_row_size(type, n);
+                    const size_t n_rows = std::max<size_t>(1, span/row);
+                    std::vector<uint8_t> w(n_rows*row + 64);
+                    for (auto & b : w) { b = (uint8_t) rng(); }
+                    const size_t bs = ggml_type_size(type);
+                    const ggml_fp16_t d = ggml_fp32_to_fp16(0.01f);
+                    for (size_t k = 0; k + bs <= w.size() - 64; k += bs) { memcpy(w.data() + k, &d, sizeof(d)); }
+                    std::vector<float> xf(n);
+                    for (auto & v : xf) { v = (float) (rng() % 1000)/500.0f - 1.0f; }
+                    std::vector<uint8_t> xq(ggml_row_size(tr->vec_dot_type, n));
+                    ggml_get_type_traits_cpu(tr->vec_dot_type)->from_float(xf.data(), xq.data(), n);
+                    float acc = 0.0f;
+                    const size_t n_calls = span < ((size_t) 1 << 20) ? 2000000 : n_rows;
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (size_t c = 0; c < n_calls; ++c) {
+                        float s;
+                        tr->vec_dot((int) n, &s, 0, w.data() + (c % n_rows)*row, 0, xq.data(), 0, 1);
+                        acc += s;
+                    }
+                    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    printf("%s rows of %4lld from %s: %6.1f ns per row, %5.1f GB/s (%g)\n", ggml_type_name(type), (long long) n,
+                        span < ((size_t) 1 << 20) ? "cache" : "DRAM ", sec*1e9/n_calls, n_calls*row/sec/1e9, acc);
+                }
+            }
+            return 0;
+        }
+        if (strcmp(argv[i], "--bench") == 0) {
+            // --bench [type] [workers,...]: Flash-Next's expert shape (2560 x 640, 512 per layer)
+            ggml_backend_load_all();
+            ggml_type type = GGML_TYPE_Q2_0;
+            std::vector<int> workers = { 2, 4, 6, 8, 11 };
+            if (i + 1 < argc) {
+                for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+                    const char * n = ggml_type_name((ggml_type) t);
+                    if (n && strcmp(n, argv[i + 1]) == 0) { type = (ggml_type) t; }
+                }
+            }
+            if (i + 2 < argc) {
+                workers.clear();
+                for (const char * p = argv[i + 2]; *p; ) { workers.push_back(atoi(p)); while (*p && *p != ',') { ++p; } if (*p) { ++p; } }
+            }
+            return run_bench(type, 2560, 640, 512, 4, workers, { 1, 2, 4, 10 }, { 1, 4 });
+        }
     }
 
     ggml_backend_load_all();
@@ -510,6 +807,8 @@ int main(int argc, char ** argv) {
         { GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0,    256, 128, 16, 8,  2,  6, true,  GELU, true  }, // gate_up, gelu, scales
         { GGML_TYPE_Q4_K,   GGML_TYPE_Q4_K,    512, 256, 32, 8, 16, 10, false, GELU, true  },
         { GGML_TYPE_F32,    GGML_TYPE_F32,     128,  64,  8, 2,  1,  3, false, SILU, false },
+        { GGML_TYPE_Q2_0,   GGML_TYPE_Q2_0,    512, 128, 32, 8,  4, 12, false, SILU, false }, // Flash-Next's experts
+        { GGML_TYPE_Q2_0,   GGML_TYPE_Q2_0,    512, 128, 32, 8, 12,  4, false, SILU, false }, // tokens sharing misses
     };
     auto add = [&](test_case c) { cases.push_back(c); return &cases.back(); };
     {   // gpt-oss: swiglu_oai with biases on every projection

@@ -23,9 +23,11 @@ struct llama_model;
 struct llama_expert_handoff_params {
     int32_t     n_slots          = -1; // expert slots in VRAM in units of the largest expert, -1 = fill the free VRAM
     size_t      budget_bytes     =  0; // instead of n_slots: the VRAM cache size in bytes (--moe-cache-mib)
-    int32_t     vram_reserve_mib = -1; // VRAM the automatic size leaves free, -1 = default
+    int32_t     vram_reserve_mib = -1; // VRAM the automatic size leaves free beyond the compute buffers, -1 = default
     int32_t     n_workers        =  0; // host threads, 0 = one per 4 logical CPUs
-    uint32_t    max_tokens       = 32; // largest batch the layers are split for
+    uint32_t    max_tokens       = 32; // largest batch the layers can be split for (the mailbox's capacity); batches
+                                       // above 32 tokens are split only where the host computes their misses sooner
+                                       // than the device could upload the experts it does not hold
     std::string profile;               // routing counts to fill the cache from
     std::string profile_save;          // where to write the routing counts at exit
     int32_t     adapt_every      =  4; // the adaptive cache: a round every N decode graphs, 0 = off
@@ -59,8 +61,8 @@ public:
     // layer registers its experts with the host pool
     bool use(int32_t il, int64_t n_tokens, const llama_expert_handoff_form & form) const;
 
-    ggml_backend_t backend() const;
-    ggml_tensor *  slot_map(int32_t il) const;                // I32 [1, n_expert] on the device
+    ggml_backend_dev_t device(int32_t il) const;            // the GPU that caches layer il's experts, NULL if none
+    ggml_tensor *  slot_map(int32_t il) const;                // I32 [1, n_expert] on that GPU
     ggml_tensor *  get_experts(const ggml_tensor * w) const;  // the cache view used in place of the host experts w
                                                               // (also of their biases: [n, n_slots + 1], zeros at the miss slot)
 

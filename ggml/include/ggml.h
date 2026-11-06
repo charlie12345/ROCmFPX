@@ -2721,13 +2721,15 @@ extern "C" {
             int64_t               K);
 
     // ROCmFPX [TAG_EXPERT_HANDOFF] expert handoff (layout and protocol in ggml-expert-handoff.h)
-    // send: writes the routed experts' input and selection to the mailbox and rings it, so the host can compute the
-    //       experts the device does not hold while the device computes the others. Returns slots unchanged: the
-    //       expert matmuls read their slots from it, which orders the send before them.
-    //   x       : [n_embd, n_tokens]          F32
-    //   ids     : [n_used, n_tokens]          I32 the selected experts
-    //   slots   : [n_used, n_tokens]          I32 their cache slots, the layer's miss slot for the host's experts
-    //   weights : [1, n_used, n_tokens]       F32 the routing weights
+    // send: looks up the selected experts' cache slots, writes the routed experts' input and selection to the
+    //       mailbox and rings it, so the host can compute the experts the device does not hold while the device
+    //       computes the others. Returns the slots [n_used, n_tokens] I32: the expert matmuls read their slots from
+    //       it, which orders the send before them.
+    //   x        : [n_embd, n_tokens]          F32
+    //   ids      : [n_used, n_tokens]          I32 the selected experts
+    //   slot_map : [n_expert] (any shape)      I32 each expert's cache slot, the layer's miss slot for the host's
+    //                                              experts (an id outside the map counts as a miss)
+    //   weights  : [1, n_used, n_tokens]       F32 the routing weights
     // A selection without a miss is not sent: its join returns y at once (see ggml-expert-handoff.h).
     struct ggml_expert_handoff_params {
         void    * mailbox;       // host memory the device reads and writes in place, at the same address on both
@@ -2747,7 +2749,7 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
             struct ggml_tensor  * ids,
-            struct ggml_tensor  * slots,
+            struct ggml_tensor  * slot_map,
             struct ggml_tensor  * weights,
             const struct ggml_expert_handoff_params * params);
 

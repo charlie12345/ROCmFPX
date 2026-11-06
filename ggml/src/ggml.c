@@ -6643,17 +6643,17 @@ struct ggml_tensor * ggml_expert_handoff_send(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
         struct ggml_tensor  * ids,
-        struct ggml_tensor  * slots,
+        struct ggml_tensor  * slot_map,
         struct ggml_tensor  * weights,
         const struct ggml_expert_handoff_params * p) {
-    GGML_ASSERT(x->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && slots->type == GGML_TYPE_I32 && weights->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(ids) && ggml_is_contiguous(slots) && ggml_is_contiguous(weights));
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && slot_map->type == GGML_TYPE_I32 && weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(ids) && ggml_is_contiguous(slot_map) && ggml_is_contiguous(weights));
 
     const int64_t n_embd   = x->ne[0];
     const int64_t n_tokens = ggml_nrows(x);
     const int64_t n_used   = ids->ne[0];
 
-    GGML_ASSERT(ggml_nelements(ids) == n_used*n_tokens && ggml_nelements(slots) == n_used*n_tokens && ggml_nelements(weights) == n_used*n_tokens);
+    GGML_ASSERT(ggml_nelements(ids) == n_used*n_tokens && ggml_nelements(weights) == n_used*n_tokens);
     GGML_ASSERT(n_tokens <= p->max_tokens && n_embd <= p->max_embd && n_used <= p->max_used);
 
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
@@ -6663,7 +6663,7 @@ struct ggml_tensor * ggml_expert_handoff_send(
     result->op     = GGML_OP_EXPERT_HANDOFF;
     result->src[0] = x;
     result->src[1] = ids;
-    result->src[2] = slots;
+    result->src[2] = slot_map;
     result->src[3] = weights;
 
     return result;

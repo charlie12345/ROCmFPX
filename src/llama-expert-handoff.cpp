@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -124,7 +125,22 @@ std::vector<float> eh_read_scale(const ggml_tensor * s, int64_t n_expert, bool &
 } // namespace
 
 struct llama_expert_handoff::impl {
+    // a GPU holding layers of the model (layer split): its VRAM cache, the misses and routing counts of its layers
+    struct device {
+        ggml_backend_t             backend = nullptr;
+        ggml_backend_dev_t         dev     = nullptr;
+        ggml_backend_buffer_type_t buft    = nullptr;
+        ggml_context_ptr           ctx;
+        ggml_backend_buffer_ptr    buf;
+        ggml_tensor * flags  = nullptr;     // I32 [n_layer]: the misses of each layer's last send
+        ggml_tensor * counts = nullptr;     // I32 [counts_stride, n_layer]: routing counts
+        size_t  host_bytes = 0;             // routed experts of its layers in host memory
+        size_t  budget     = 0;             // its expert cache
+        size_t  n_tensors  = 0;
+    };
+
     struct group {
+        int32_t id = -1;                    // the device
         std::vector<ggml_tensor *> ref;     // expert tensors of the first layer
         std::vector<int32_t> layers;
         std::vector<ggml_tensor *> banks;   // device storage: n_slots real slots, the miss slot (zeros), one padding slot
@@ -154,23 +170,18 @@ struct llama_expert_handoff::impl {
     const llama_model & model;
     llama_expert_handoff_params params;
 
-    ggml_backend_t backend = nullptr;
-    ggml_backend_dev_t dev = nullptr;
-    ggml_backend_buffer_type_t buft = nullptr;
+    std::vector<device> devices;
 
     std::vector<group> groups;
     std::vector<layer> layers;
     int32_t il_nextn = 0; // the first MTP draft layer (cached whole), the layer count if none
     std::unordered_map<const ggml_tensor *, binding> bindings;
 
-    ggml_context_ptr ctx;
-    ggml_backend_buffer_ptr buf;
     mutable ggml_context_ptr ctx_views; // copy_experts (the scheduler's thread)
 
-    // on the device: the misses of each layer's last send (the join skips layers without), the routing counts
-    ggml_tensor * flags  = nullptr; // I32 [n_layer]
-    ggml_tensor * counts = nullptr; // I32 [counts_stride, n_layer]
     int32_t counts_stride = 0;
+
+    const device & dev_of(int32_t il) const { return devices[groups[layers[il].ig].id]; }
 
     // the mailbox and the host pool
     eh_host_api api;
@@ -189,6 +200,13 @@ struct llama_expert_handoff::impl {
     std::vector<std::vector<uint64_t>> profile_counts;
 
     mutable std::mutex mtx;
+
+    // batches of up to n_small tokens are always split; larger ones (prompts) where the host's estimated time beats
+    // uploading the layer's uncached experts. The estimates learn from the run: the share of routed experts the
+    // host computes (check() refreshes it) and the host's throughput (its stats)
+    static constexpr int64_t n_small = 32;
+    static constexpr double  upload_bps_default = 12e9;  // pageable host memory to the device over PCIe 4.0 x16
+    mutable double est_miss = -1.0;                      // < 0: not yet measured
 
     // the adaptive cache (adapt()): decayed routing counts, the swaps in flight and the helper thread copying them
     struct swap {
@@ -211,17 +229,19 @@ struct llama_expert_handoff::impl {
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends,
             const std::vector<ggml_backend_buffer_type_t> & bufts, const llama_expert_handoff_params & params) :
             model(model), params(params), layers(model.layers.size()) {
-        // one device: the first GPU (the mailbox serves one stream)
+        // the GPUs; each layer's experts are cached on the GPU that holds the rest of the layer (layer split). One
+        // mailbox serves them all: a layer's join must finish before the next layer's send, on whichever GPU
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto t = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (t == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                backend = backends[i];
-                buft    = bufts[i];
-                dev     = ggml_backend_get_device(backends[i]);
-                break;
+                device d;
+                d.backend = backends[i];
+                d.dev     = ggml_backend_get_device(backends[i]);
+                d.buft    = bufts[i];
+                devices.push_back(std::move(d));
             }
         }
-        if (backend == nullptr) {
+        if (devices.empty()) {
             throw std::runtime_error("expert handoff requires a GPU backend");
         }
         if (model.hparams.n_expert == 0) {
@@ -230,14 +250,20 @@ struct llama_expert_handoff::impl {
         if (!api.load()) {
             throw std::runtime_error("expert handoff: the CPU backend has no expert handoff pool");
         }
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        // the mailbox comes from the first GPU's backend, mapped into all of its devices at the same address
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devices[0].dev);
         auto mapped_alloc = (eh_mapped_alloc_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_mapped_alloc");
         mapped_free = (eh_mapped_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_mapped_free");
         if (mapped_alloc == nullptr || mapped_free == nullptr) {
-            throw std::runtime_error(std::string("expert handoff: ") + ggml_backend_dev_name(dev) + " cannot map host memory");
+            throw std::runtime_error(std::string("expert handoff: ") + ggml_backend_dev_name(devices[0].dev) + " cannot map host memory");
+        }
+        for (const device & d : devices) {
+            if (ggml_backend_dev_backend_reg(d.dev) != reg) {
+                throw std::runtime_error("expert handoff: the GPUs must use one backend");
+            }
         }
 
-        // the layers whose routed experts are all in plain host memory
+        // the layers whose routed experts are all in plain host memory, and whose other weights are on a GPU
         size_t host_bytes_total = 0;
         size_t max_blob = 0;
         for (size_t il = 0; il < model.layers.size(); ++il) {
@@ -245,10 +271,21 @@ struct llama_expert_handoff::impl {
             if (!eh_valid_experts(experts) || !std::all_of(experts.begin(), experts.end(), eh_is_host_weight)) {
                 continue;
             }
-            auto it = std::find_if(groups.begin(), groups.end(), [&](const group & g) { return eh_same_layout(g.ref, experts); });
+            const ggml_backend_dev_t ldev = model.dev_layer((int) il);
+            int32_t id = -1;
+            for (size_t k = 0; k < devices.size(); ++k) {
+                if (devices[k].dev == ldev) {
+                    id = (int32_t) k;
+                }
+            }
+            if (id < 0) {
+                continue; // a layer on the CPU computes its experts there, as before
+            }
+            auto it = std::find_if(groups.begin(), groups.end(), [&](const group & g) { return g.id == id && eh_same_layout(g.ref, experts); });
             if (it == groups.end()) {
                 groups.emplace_back();
                 it = groups.end() - 1;
+                it->id  = id;
                 it->ref = experts;
                 it->n_expert = (int32_t) eh_n_expert(experts[0]);
                 for (const ggml_tensor * t : experts) {
@@ -260,33 +297,44 @@ struct llama_expert_handoff::impl {
             for (const ggml_tensor * t : experts) {
                 it->host_bytes   += ggml_nbytes(t);
                 host_bytes_total += ggml_nbytes(t);
+                devices[id].host_bytes += ggml_nbytes(t);
             }
             layers[il].experts = experts;
         }
         if (groups.empty()) {
-            throw std::runtime_error("expert handoff: no layer keeps its routed experts in host memory "
+            throw std::runtime_error("expert handoff: no GPU layer keeps its routed experts in host memory "
                     "(keep them there with --cpu-moe, and without weight repacking: --no-repack)");
         }
 
         load_profile();
 
-        // the budget: n_slots of the largest expert, or the free VRAM less the reserve
-        size_t budget = 0;
+        // each GPU's budget: its free VRAM less the reserve, or its share of an explicit size (n_slots of the
+        // largest expert, or bytes) by the experts of its layers
         {
-            size_t free = 0, total = 0;
-            ggml_backend_dev_memory(dev, &free, &total);
-            const size_t reserve = (size_t) (params.vram_reserve_mib >= 0 ? params.vram_reserve_mib : 2048)*1024*1024;
-            if (params.n_slots >= 0 || params.budget_bytes > 0) {
-                budget = params.n_slots >= 0 ? (size_t) params.n_slots*max_blob : params.budget_bytes;
-                if (budget + reserve > free) {
-                    LLAMA_LOG_WARN("%s: an expert cache of %.0f MiB leaves %.0f MiB of the %.0f MiB free VRAM, less than the reserve of %.0f MiB\n",
-                        __func__, budget/1048576.0, free > budget ? (free - budget)/1048576.0 : 0.0, free/1048576.0, reserve/1048576.0);
+            // the context reserves its compute buffers before the cache, so this is only the slack for what comes
+            // later (an MTP draft context's buffers, the backend's temporary pool)
+            const size_t reserve = (size_t) (params.vram_reserve_mib >= 0 ? params.vram_reserve_mib : 1024)*1024*1024;
+            const bool explicit_size = params.n_slots >= 0 || params.budget_bytes > 0;
+            const size_t total_budget = params.n_slots >= 0 ? (size_t) params.n_slots*max_blob : params.budget_bytes;
+            for (device & d : devices) {
+                if (d.host_bytes == 0) {
+                    continue;
                 }
-            } else {
-                budget = free > reserve ? free - reserve : 0;
+                size_t free = 0, total = 0;
+                ggml_backend_dev_memory(d.dev, &free, &total);
+                if (explicit_size) {
+                    d.budget = (size_t) ((double) total_budget*d.host_bytes/host_bytes_total);
+                    if (d.budget + reserve > free) {
+                        LLAMA_LOG_WARN("%s: %s: an expert cache of %.0f MiB leaves %.0f MiB of the %.0f MiB free VRAM, less than the reserve of %.0f MiB\n",
+                            __func__, ggml_backend_dev_name(d.dev), d.budget/1048576.0, free > d.budget ? (free - d.budget)/1048576.0 : 0.0,
+                            free/1048576.0, reserve/1048576.0);
+                    }
+                } else {
+                    d.budget = free > reserve ? free - reserve : 0;
+                }
+                LLAMA_LOG_INFO("%s: %s: %.0f MiB free, %.0f MiB for the expert cache (%.0f MiB of its layers' routed experts in host memory)\n",
+                    __func__, ggml_backend_dev_name(d.dev), free/1048576.0, d.budget/1048576.0, d.host_bytes/1048576.0);
             }
-            LLAMA_LOG_INFO("%s: %s: %.0f MiB free, %.0f MiB for the expert cache (%.0f MiB of routed experts in host memory)\n",
-                __func__, ggml_backend_dev_name(dev), free/1048576.0, budget/1048576.0, host_bytes_total/1048576.0);
         }
 
         // each group caches the same share of its experts; two extra slots per bank: the miss slot and padding
@@ -296,10 +344,10 @@ struct llama_expert_handoff::impl {
         const int32_t n_nextn = (int32_t) model.hparams.n_layer_nextn;
         il_nextn = n_nextn > 0 ? (int32_t) model.layers.size() - n_nextn : (int32_t) model.layers.size();
 
-        size_t n_tensors = 0;
         for (group & g : groups) {
+            const device & d = devices[g.id];
             const int32_t max_slots = (int32_t) g.layers.size()*g.n_expert;
-            const size_t  g_budget  = host_bytes_total > 0 ? (size_t) ((double) budget*g.host_bytes/host_bytes_total) : 0;
+            const size_t  g_budget  = d.host_bytes > 0 ? (size_t) ((double) d.budget*g.host_bytes/d.host_bytes) : 0;
             const size_t  fit       = g_budget / g.slot_bytes;
             g.n_slots = (int32_t) std::min<size_t>(max_slots, fit > 2 ? fit - 2 : 0);
             const int32_t forced = (int32_t) std::count_if(g.layers.begin(), g.layers.end(), [&](int32_t il) { return il >= il_nextn; })*g.n_expert;
@@ -307,27 +355,34 @@ struct llama_expert_handoff::impl {
                 LLAMA_LOG_WARN("%s: the expert cache is smaller than the MTP draft layer; it gets %d slots anyway\n", __func__, forced);
                 g.n_slots = forced;
             }
-            n_tensors += g.ref.size()*(1 + g.layers.size()) + g.layers.size();
+            devices[g.id].n_tensors += g.ref.size()*(1 + g.layers.size()) + g.layers.size();
         }
 
-        ggml_init_params ip = { (n_tensors + 2)*ggml_tensor_overhead(), nullptr, true };
-        ctx.reset(ggml_init(ip));
-        if (!ctx) {
-            throw std::runtime_error("expert handoff: failed to create the context");
-        }
         for (const group & g : groups) {
             counts_stride = std::max(counts_stride, g.n_expert);
         }
-        flags  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, (int64_t) model.layers.size());
-        counts = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, counts_stride, (int64_t) model.layers.size());
-        ggml_set_name(flags,  "expert_cache.flags");
-        ggml_set_name(counts, "expert_cache.counts");
+        for (size_t id = 0; id < devices.size(); ++id) {
+            device & d = devices[id];
+            if (d.host_bytes == 0) {
+                continue;
+            }
+            ggml_init_params ip = { (d.n_tensors + 2)*ggml_tensor_overhead(), nullptr, true };
+            d.ctx.reset(ggml_init(ip));
+            if (!d.ctx) {
+                throw std::runtime_error("expert handoff: failed to create the context");
+            }
+            d.flags  = ggml_new_tensor_1d(d.ctx.get(), GGML_TYPE_I32, (int64_t) model.layers.size());
+            d.counts = ggml_new_tensor_2d(d.ctx.get(), GGML_TYPE_I32, counts_stride, (int64_t) model.layers.size());
+            ggml_format_name(d.flags,  "expert_cache.flags.%zu",  id);
+            ggml_format_name(d.counts, "expert_cache.counts.%zu", id);
+        }
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             group & g = groups[ig];
+            ggml_context * gctx = devices[g.id].ctx.get();
             for (const ggml_tensor * t : g.ref) {
                 ggml_tensor * bank = ggml_n_dims(t) >= 3 ?
-                    ggml_new_tensor_3d(ctx.get(), t->type, t->ne[0], t->ne[1], g.n_slots + 2) :
-                    ggml_new_tensor_2d(ctx.get(), t->type, t->ne[0], g.n_slots + 2);
+                    ggml_new_tensor_3d(gctx, t->type, t->ne[0], t->ne[1], g.n_slots + 2) :
+                    ggml_new_tensor_2d(gctx, t->type, t->ne[0], g.n_slots + 2);
                 GGML_ASSERT(eh_expert_stride(bank) == eh_expert_stride(t));
                 ggml_format_name(bank, "expert_cache.%zu.%s", ig, t->name);
                 g.banks.push_back(bank);
@@ -339,30 +394,37 @@ struct llama_expert_handoff::impl {
                     ggml_tensor * bank = g.banks[ip];
                     // the miss slot is a valid expert index of the view
                     ggml_tensor * cached = ggml_n_dims(l.experts[ip]) >= 3 ?
-                        ggml_view_3d(ctx.get(), bank, bank->ne[0], bank->ne[1], g.n_slots + 1, bank->nb[1], bank->nb[2], 0) :
-                        ggml_view_2d(ctx.get(), bank, bank->ne[0], g.n_slots + 1, bank->nb[1], 0);
+                        ggml_view_3d(gctx, bank, bank->ne[0], bank->ne[1], g.n_slots + 1, bank->nb[1], bank->nb[2], 0) :
+                        ggml_view_2d(gctx, bank, bank->ne[0], g.n_slots + 1, bank->nb[1], 0);
                     ggml_format_name(cached, "expert_cache.%s", l.experts[ip]->name);
                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
                 }
-                l.slot_map = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, g.n_expert);
+                l.slot_map = ggml_new_tensor_2d(gctx, GGML_TYPE_I32, 1, g.n_expert);
                 ggml_format_name(l.slot_map, "expert_cache.slot_map-%d", il);
                 l.slots.assign(g.n_expert, g.n_slots);
             }
         }
 
-        if (model.hparams.no_alloc) {
-            buf.reset(ggml_backend_buft_alloc_buffer(buft, 0));
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-                t->buffer = buf.get();
+        for (device & d : devices) {
+            if (!d.ctx) {
+                continue;
             }
-        } else {
-            buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
-            if (!buf) {
-                throw std::runtime_error("expert handoff: failed to allocate the expert cache");
+            if (model.hparams.no_alloc) {
+                d.buf.reset(ggml_backend_buft_alloc_buffer(d.buft, 0));
+                for (ggml_tensor * t = ggml_get_first_tensor(d.ctx.get()); t != nullptr; t = ggml_get_next_tensor(d.ctx.get(), t)) {
+                    t->buffer = d.buf.get();
+                }
+            } else {
+                d.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(d.ctx.get(), d.buft));
+                if (!d.buf) {
+                    throw std::runtime_error(std::string("expert handoff: failed to allocate the expert cache on ") + ggml_backend_dev_name(d.dev));
+                }
+                ggml_backend_buffer_clear(d.buf.get(), 0);
+                // read by the ops as weights: they run on the device
+                ggml_backend_buffer_set_usage(d.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             }
-            ggml_backend_buffer_clear(buf.get(), 0);
-            // read by the ops as weights: they run on the device
-            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+        if (!model.hparams.no_alloc) {
             fill();
         }
 
@@ -394,21 +456,36 @@ struct llama_expert_handoff::impl {
         for (const group & g : groups) {
             n_cached += g.n_slots;
             n_all    += (size_t) g.layers.size()*g.n_expert;
-            LLAMA_LOG_INFO("%s: %2zu layers, %s: %6d of %6d experts in VRAM (%.1f%%), %.2f MiB each\n", __func__,
-                g.layers.size(), ggml_type_name(g.ref[0]->type), g.n_slots, (int32_t) (g.layers.size()*g.n_expert),
-                100.0*g.n_slots/std::max<size_t>(1, g.layers.size()*g.n_expert), g.slot_bytes/1048576.0);
+            LLAMA_LOG_INFO("%s: %s: %2zu layers, %s: %6d of %6d experts in VRAM (%.1f%%), %.2f MiB each\n", __func__,
+                ggml_backend_dev_name(devices[g.id].dev), g.layers.size(), ggml_type_name(g.ref[0]->type), g.n_slots,
+                (int32_t) (g.layers.size()*g.n_expert), 100.0*g.n_slots/std::max<size_t>(1, g.layers.size()*g.n_expert),
+                g.slot_bytes/1048576.0);
         }
-        LLAMA_LOG_INFO("%s: %zu of %zu experts cached%s, %d host workers, batches up to %d tokens split\n", __func__,
+        LLAMA_LOG_INFO("%s: %zu of %zu experts cached%s, %d host workers, batches up to %d tokens split (above %d where "
+            "the host is sooner than uploading)\n", __func__,
             n_cached, n_all, profile_counts.empty() ? " (no profile: the first experts of each layer)" : " by the profile",
-            n_workers, dims.max_tokens);
+            n_workers, dims.max_tokens, (int) n_small);
     }
 
     // the device's routing counts [il][e] since the start (decode batches; hits and misses)
     std::vector<int32_t> device_counts() const {
         std::vector<int32_t> res;
-        if (counts != nullptr && counts->data != nullptr) {
-            res.resize(ggml_nelements(counts));
-            ggml_backend_tensor_get(counts, res.data(), 0, ggml_nbytes(counts));
+        std::vector<int32_t> tmp;
+        for (size_t id = 0; id < devices.size(); ++id) {
+            const device & d = devices[id];
+            if (d.counts == nullptr || d.counts->data == nullptr) {
+                continue;
+            }
+            if (res.empty()) {
+                res.assign(ggml_nelements(d.counts), 0);
+            }
+            tmp.resize(ggml_nelements(d.counts));
+            ggml_backend_tensor_get(d.counts, tmp.data(), 0, ggml_nbytes(d.counts));
+            for (size_t il = 0; il < layers.size(); ++il) {
+                if (layers[il].ig >= 0 && groups[layers[il].ig].id == (int32_t) id) {
+                    std::copy(tmp.begin() + il*counts_stride, tmp.begin() + (il + 1)*counts_stride, res.begin() + il*counts_stride);
+                }
+            }
         }
         return res;
     }
@@ -607,6 +684,9 @@ struct llama_expert_handoff::impl {
             return false;
         }
         const layer & l = layers[il];
+        if (n_tokens > n_small && !host_sooner(il, n_tokens)) {
+            return false;
+        }
         std::lock_guard<std::mutex> lk(mtx);
         if (l.state == 0) {
             const llama_layer & ml = model.layers[il];
@@ -648,10 +728,40 @@ struct llama_expert_handoff::impl {
         return l.state == 1 && l.form == form;
     }
 
+    // a batch of n_tokens in layer il: the host computing its misses vs the device uploading the experts it lacks
+    // (those the batch routes to, uniform routing assumed), whichever is estimated sooner; the join's wait stays well
+    // inside its timeout
+    bool host_sooner(int32_t il, int64_t n_tokens) const {
+        const layer & l = layers[il];
+        const group & g = groups[l.ig];
+        int64_t n_cached = 0;
+        for (int32_t s : l.slots) {
+            n_cached += s < g.n_slots;
+        }
+        const double n_unc = (double) (g.n_expert - n_cached);
+        if (n_unc <= 0.0) {
+            return true; // nothing to upload, nothing for the host
+        }
+        // the host's throughput as measured so far (its experts may page in from disk); until it has computed some,
+        // the batch takes the usual path
+        ggml_expert_handoff_stats st = {};
+        api.get_stats(host, &st);
+        if (st.n_host < 1000 || st.busy_ns == 0) {
+            return false;
+        }
+        const double host_bps = std::max(1e9, (double) st.n_host*g.slot_bytes/(st.busy_ns*1e-9));
+        const double k    = (double) model.hparams.n_expert_used(il);
+        const double miss = est_miss >= 0.0 ? est_miss : 0.5*n_unc/g.n_expert;
+        const double used = 1.0 - std::pow(1.0 - k/g.n_expert, (double) n_tokens);
+        const double t_host   = (double) n_tokens*k*miss*g.slot_bytes/host_bps;
+        const double t_upload = n_unc*used*g.slot_bytes/upload_bps_default;
+        return t_host < t_upload && t_host < 0.2*timeout_ms*1e-3;
+    }
+
     int64_t copy_experts(ggml_backend_t be, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) const {
         // any backend of the cache's device (an MTP draft context has its own), copying on its stream
         const auto it = bindings.find(w);
-        if (it == bindings.end() || ggml_backend_get_device(be) != dev) {
+        if (it == bindings.end() || ggml_backend_get_device(be) != dev_of(it->second.il).dev) {
             return 0;
         }
         const binding & b = it->second;
@@ -720,7 +830,7 @@ struct llama_expert_handoff::impl {
     // still read their slots; then the helper copies the new experts in. A later call admits them once copied.
     void adapt(int64_t n_tokens) const {
         if (params.adapt_every <= 0 || params.adapt_swaps <= 0 || host == nullptr ||
-            n_tokens <= 0 || n_tokens > dims.max_tokens) {
+            n_tokens <= 0 || n_tokens > n_small) {
             return;
         }
         n_rounds++;
@@ -812,7 +922,11 @@ struct llama_expert_handoff::impl {
             }
             upload_slot_maps(touched);
         }
-        ggml_backend_synchronize(backend);
+        for (const device & d : devices) {
+            if (d.ctx) {
+                ggml_backend_synchronize(d.backend);
+            }
+        }
 
         if (!helper.joinable()) {
             helper = std::thread([this] { helper_main(); });
@@ -856,6 +970,10 @@ struct llama_expert_handoff::impl {
                     n_swaps - n_swaps_reported);
             }
             n_swaps_reported = n_swaps;
+            // the estimates of host_sooner(): the share of routed experts the host computed, its bytes per second
+            if (n_routed > 10000) {
+                est_miss = (double) st.n_host/n_routed;
+            }
             last = st;
             last.n_routed = n_routed;
             t_report = now;
@@ -876,8 +994,9 @@ bool llama_expert_handoff::use(int32_t il, int64_t n_tokens, const llama_expert_
     return pimpl->use(il, n_tokens, form);
 }
 
-ggml_backend_t llama_expert_handoff::backend() const {
-    return pimpl->backend;
+ggml_backend_dev_t llama_expert_handoff::device(int32_t il) const {
+    const auto & p = *pimpl;
+    return il >= 0 && il < (int32_t) p.layers.size() && p.layers[il].ig >= 0 ? p.dev_of(il).dev : nullptr;
 }
 
 ggml_tensor * llama_expert_handoff::slot_map(int32_t il) const {
@@ -899,8 +1018,9 @@ ggml_expert_handoff_params llama_expert_handoff::params(int32_t il) const {
     res.max_used      = p.dims.max_used;
     res.miss_slot     = p.layers[il].ig >= 0 ? p.groups[p.layers[il].ig].n_slots : 0;
     // a model loaded only to measure memory has no data: any address does, the graph never runs
-    res.flags         = p.flags->data  ? (int32_t *) p.flags->data  : (int32_t *) p.mailbox;
-    res.counts        = p.counts->data ? (int32_t *) p.counts->data : nullptr;
+    const auto & d = p.dev_of(il);
+    res.flags         = d.flags->data  ? (int32_t *) d.flags->data  : (int32_t *) p.mailbox;
+    res.counts        = d.counts->data ? (int32_t *) d.counts->data : nullptr;
     res.counts_stride = p.counts_stride;
     res.timeout_ms    = p.timeout_ms;
     return res;
@@ -932,8 +1052,10 @@ void llama_expert_handoff::adapt(int64_t n_tokens) const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_expert_handoff::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> res;
-    if (pimpl->buf) {
-        res[ggml_backend_buffer_get_type(pimpl->buf.get())] += ggml_backend_buffer_get_size(pimpl->buf.get());
+    for (const auto & d : pimpl->devices) {
+        if (d.buf) {
+            res[ggml_backend_buffer_get_type(d.buf.get())] += ggml_backend_buffer_get_size(d.buf.get());
+        }
     }
     return res;
 }

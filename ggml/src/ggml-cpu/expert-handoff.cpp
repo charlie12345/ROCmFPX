@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -76,8 +77,9 @@ void ggml_compute_forward_expert_handoff(const ggml_compute_params * params, ggm
     if (ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_MODE) == GGML_EXPERT_HANDOFF_SEND) {
         const ggml_tensor * x     = dst->src[0];
         const ggml_tensor * ids   = dst->src[1];
-        const ggml_tensor * slots = dst->src[2];
+        const ggml_tensor * map   = dst->src[2];
         const ggml_tensor * w     = dst->src[3];
+        int32_t * slots = (int32_t *) dst->data;
 
         const int64_t n_embd   = x->ne[0];
         const int64_t n_tokens = ggml_nrows(x);
@@ -87,16 +89,17 @@ void ggml_compute_forward_expert_handoff(const ggml_compute_params * params, ggm
         const int32_t miss_slot = ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_MISS_SLOT);
         int32_t * counts = (int32_t *) eh_ptr(dst, GGML_EXPERT_HANDOFF_P_COUNTS_LO, GGML_EXPERT_HANDOFF_P_COUNTS_HI);
         const int64_t stride = ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_COUNTS_STRIDE);
+        const int64_t n_map = ggml_nelements(map);
         int32_t n_miss = 0;
         for (int64_t i = 0; i < n_used*n_tokens; ++i) {
-            n_miss += ((const int32_t *) slots->data)[i] == miss_slot;
             const int32_t e = ((const int32_t *) ids->data)[i];
+            slots[i] = e >= 0 && e < n_map ? ((const int32_t *) map->data)[e] : miss_slot;
+            n_miss += slots[i] == miss_slot;
             if (counts && e >= 0 && e < stride) {
                 counts[layer*stride + e]++;
             }
         }
         flags[layer] = n_miss;
-        memcpy(dst->data, slots->data, ggml_nbytes(slots));
         if (n_miss == 0) {
             return;
         }
@@ -109,7 +112,7 @@ void ggml_compute_forward_expert_handoff(const ggml_compute_params * params, ggm
         for (int64_t t = 0; t < n_tokens; ++t) {
             memcpy(mx + t*d.max_embd, (const float *) x->data + t*n_embd, n_embd*sizeof(float));
             memcpy(mi + t*d.max_used, (const int32_t *) ids->data   + t*n_used, n_used*sizeof(int32_t));
-            memcpy(ms + t*d.max_used, (const int32_t *) slots->data + t*n_used, n_used*sizeof(int32_t));
+            memcpy(ms + t*d.max_used, slots + t*n_used, n_used*sizeof(int32_t));
             memcpy(mw + t*d.max_used, (const float   *) w->data     + t*n_used, n_used*sizeof(float));
         }
         hdr->layer    = layer;
@@ -232,13 +235,24 @@ struct ggml_expert_handoff_host {
 
     uint32_t seq_base = 0; // seq_send when the pool was made
 
+    // measuring aids (environment, read when the pool is made; the answers are wrong with either):
+    // ROCMFPX_EH_SIM_RESIDENT=N reads expert e's weights from expert e % N of the layer, so a model bigger than RAM
+    //   runs with the host's compute and memory traffic of one whose experts all fit in RAM (no page faults);
+    // ROCMFPX_EH_SIM_NOHOST=1 answers every send with zeros at once: the device's side alone
+    int64_t sim_resident = 0;
+    bool    sim_nohost   = false;
+    int64_t de(int32_t e) const { return sim_resident > 0 ? e % sim_resident : e; }
+
     // the job, prepared by worker 0 between barriers
     uint32_t seq = 0;
     const eh_layer * job_layer = nullptr;
     int32_t n_tokens = 0;
     std::vector<eh_miss> misses;
     std::vector<int32_t> miss_tokens;      // the tokens with misses
-    std::vector<int32_t> miss_begin;       // per token: first miss index (misses are sorted by token), n_tokens + 1
+    std::vector<int32_t> uniq;             // the missed experts, each once
+    std::vector<int32_t> uniq_begin;       // per missed expert: its first entry in by_expert, then the end
+    std::vector<int32_t> by_expert;        // miss indices grouped by expert (a batch's tokens share an expert's reads)
+    std::vector<int32_t> uniq_of;          // [n_expert] scratch: index in uniq or -1
     std::vector<uint8_t> xq;               // [max_tokens] rows of the gate/up vec_dot type
     size_t xq_row = 0;
     std::vector<float>   gu;               // [n_miss][2*n_ff] gate then up outputs
@@ -311,7 +325,9 @@ struct ggml_expert_handoff_host {
         job_layer = (il >= 0 && il < (int32_t) layers.size() && layers[il].set) ? &layers[il] : nullptr;
         misses.clear();
         miss_tokens.clear();
-        miss_begin.assign(n_tokens + 1, 0);
+        uniq.clear();
+        uniq_begin.clear();
+        by_expert.clear();
         if (job_layer == nullptr || hdr->n_embd != job_layer->n_embd || n_tokens > dims.max_tokens || n_used > dims.max_used) {
             if (job_layer == nullptr) {
                 GGML_LOG_ERROR("%s: no experts registered for layer %d, answering zero\n", __func__, il);
@@ -329,7 +345,6 @@ struct ggml_expert_handoff_host {
 
         const int32_t n_count = L.l.n_used > 0 ? std::min(n_used, L.l.n_used) : n_used;
         for (int32_t t = 0; t < n_tokens; ++t) {
-            miss_begin[t] = (int32_t) misses.size();
             bool any = false;
             for (int32_t k = 0; k < n_count; ++k) {
                 const int32_t e = ids[t*dims.max_used + k];
@@ -346,7 +361,29 @@ struct ggml_expert_handoff_host {
                 miss_tokens.push_back(t);
             }
         }
-        miss_begin[n_tokens] = (int32_t) misses.size();
+
+        // the misses by expert: each expert's rows are read once for all the tokens that miss it
+        uniq_of.assign(L.n_expert, -1);
+        std::vector<int32_t> cnt;
+        for (const eh_miss & ms : misses) {
+            if (uniq_of[ms.e] < 0) {
+                uniq_of[ms.e] = (int32_t) uniq.size();
+                uniq.push_back(ms.e);
+                cnt.push_back(0);
+            }
+            cnt[uniq_of[ms.e]]++;
+        }
+        uniq_begin.assign(uniq.size() + 1, 0);
+        for (size_t u = 0; u < uniq.size(); ++u) {
+            uniq_begin[u + 1] = uniq_begin[u] + cnt[u];
+        }
+        by_expert.assign(misses.size(), 0);
+        {
+            std::vector<int32_t> fill(uniq_begin.begin(), uniq_begin.end() - 1);
+            for (size_t m = 0; m < misses.size(); ++m) {
+                by_expert[fill[uniq_of[misses[m].e]]++] = (int32_t) m;
+            }
+        }
 
         st_layers.fetch_add(1, std::memory_order_relaxed);
         st_routed.fetch_add((uint64_t) n_tokens*n_used, std::memory_order_relaxed);
@@ -372,16 +409,17 @@ struct ggml_expert_handoff_host {
 
     // gate/up row r (0 .. gu_rows - 1: gate rows first, or the up rows alone without a gate) of expert e
     const uint8_t * gu_row(const eh_layer & J, int32_t e, int64_t r) const {
+        const int64_t ed = de(e);
         if (J.l.gate_up) {
             const ggml_tensor * t = J.l.gate_up;
-            return (const uint8_t *) t->data + e*t->nb[2] + r*t->nb[1];
+            return (const uint8_t *) t->data + ed*t->nb[2] + r*t->nb[1];
         }
         if (!J.has_gate) {
             const ggml_tensor * t = J.l.up;
-            return (const uint8_t *) t->data + e*t->nb[2] + r*t->nb[1];
+            return (const uint8_t *) t->data + ed*t->nb[2] + r*t->nb[1];
         }
         const ggml_tensor * t = r < J.n_ff ? J.l.gate : J.l.up;
-        return (const uint8_t *) t->data + e*t->nb[2] + (r % J.n_ff)*t->nb[1];
+        return (const uint8_t *) t->data + ed*t->nb[2] + (r % J.n_ff)*t->nb[1];
     }
 
     float gu_scale(const eh_layer & J, int32_t e, int64_t r) const {
@@ -471,20 +509,28 @@ struct ggml_expert_handoff_host {
         }
         barrier.wait();
 
-        // 2. gate and up rows of every miss (with weight_before, the routing weight scales the input: it is
-        //    linear up to here, so it scales the dot products)
+        // 2. gate and up rows of every missed expert, each row against all the tokens that miss it while it is in
+        //    the cache (with weight_before, the routing weight scales the input: it is linear up to here, so it
+        //    scales the dot products)
         {
             const int64_t rows  = J.gu_rows;
-            const int64_t total = n_miss*rows;
+            const int64_t total = (int64_t) uniq.size()*rows;
             const int64_t i0 = total*iw/n_workers;
             const int64_t i1 = total*(iw + 1)/n_workers;
             for (int64_t i = i0; i < i1; ++i) {
-                const int64_t m = i / rows;
+                const int64_t u = i / rows;
                 const int64_t r = i % rows;
-                const eh_miss & ms = misses[m];
-                float s;
-                tr_gu->vec_dot((int) n_embd, &s, 0, gu_row(J, ms.e, r), 0, xq.data() + ms.t*xq_row, 0, 1);
-                gu[m*rows + r] = s*gu_scale(J, ms.e, r)*(J.l.weight_before ? ms.w : 1.0f) + gu_bias(J, ms.e, r);
+                const int32_t e = uniq[u];
+                const uint8_t * row = gu_row(J, e, r);
+                const float sc = gu_scale(J, e, r);
+                const float bi = gu_bias(J, e, r);
+                for (int32_t k = uniq_begin[u]; k < uniq_begin[u + 1]; ++k) {
+                    const int32_t m = by_expert[k];
+                    const eh_miss & ms = misses[m];
+                    float s;
+                    tr_gu->vec_dot((int) n_embd, &s, 0, row, 0, xq.data() + ms.t*xq_row, 0, 1);
+                    gu[m*rows + r] = s*sc*(J.l.weight_before ? ms.w : 1.0f) + bi;
+                }
             }
         }
         barrier.wait();
@@ -504,25 +550,31 @@ struct ggml_expert_handoff_host {
         }
         barrier.wait();
 
-        // 4. down rows, summed over each token's misses with their weights; tokens without misses get zeros
+        // 4. down rows: each worker owns a range of output columns for every token (tokens without misses get
+        //    zeros); each missed expert's rows in that range are read once for all the tokens that miss it
         {
             const ggml_tensor * dn = J.l.down;
-            const int64_t total = (int64_t) n_tokens*n_embd;
-            const int64_t i0 = total*iw/n_workers;
-            const int64_t i1 = total*(iw + 1)/n_workers;
-            for (int64_t i = i0; i < i1; ++i) {
-                const int64_t t = i / n_embd;
-                const int64_t c = i % n_embd;
-                float acc = 0.0f;
-                for (int32_t m = miss_begin[t]; m < miss_begin[t + 1]; ++m) {
-                    const eh_miss & ms = misses[m];
-                    float s;
-                    tr_down->vec_dot((int) n_ff, &s, 0, (const uint8_t *) dn->data + ms.e*dn->nb[2] + c*dn->nb[1], 0,
-                            hq.data() + m*hq_row, 0, 1);
-                    s = s*(J.l.down_scale ? J.l.down_scale[ms.e] : 1.0f) + (J.l.down_bias ? J.l.down_bias[ms.e*n_embd + c] : 0.0f);
-                    acc += (J.l.weight_before ? 1.0f : ms.w)*s;
+            const int64_t c0 = n_embd*iw/n_workers;
+            const int64_t c1 = n_embd*(iw + 1)/n_workers;
+            for (int32_t t = 0; t < n_tokens; ++t) {
+                memset(y + (int64_t) t*dims.max_embd + c0, 0, (c1 - c0)*sizeof(float));
+            }
+            for (size_t u = 0; u < uniq.size(); ++u) {
+                const int32_t e = uniq[u];
+                const uint8_t * base = (const uint8_t *) dn->data + de(e)*dn->nb[2];
+                const float sc = J.l.down_scale ? J.l.down_scale[e] : 1.0f;
+                const float * bias = J.l.down_bias ? J.l.down_bias + (int64_t) e*n_embd : nullptr;
+                for (int64_t c = c0; c < c1; ++c) {
+                    const uint8_t * row = base + c*dn->nb[1];
+                    for (int32_t k = uniq_begin[u]; k < uniq_begin[u + 1]; ++k) {
+                        const int32_t m = by_expert[k];
+                        const eh_miss & ms = misses[m];
+                        float s;
+                        tr_down->vec_dot((int) n_ff, &s, 0, row, 0, hq.data() + m*hq_row, 0, 1);
+                        s = s*sc + (bias ? bias[c] : 0.0f);
+                        y[(int64_t) ms.t*dims.max_embd + c] += (J.l.weight_before ? 1.0f : ms.w)*s;
+                    }
                 }
-                y[t*dims.max_embd + c] = acc;
             }
         }
     }
@@ -545,7 +597,7 @@ struct ggml_expert_handoff_host {
                 prepare(eh_load(&hdr->seq_send));
             }
             barrier.wait();
-            if (job_layer != nullptr && !misses.empty()) {
+            if (job_layer != nullptr && !misses.empty() && !sim_nohost) {
                 run(iw);
             } else if (iw == 0) {
                 float * y = (float *) (mb + ggml_expert_handoff_off_y(dims));
@@ -581,6 +633,16 @@ ggml_expert_handoff_host_t ggml_expert_handoff_host_new(
 
     // a fresh mailbox: nothing sent, nothing answered
     h->seq_base = eh_load(&h->hdr->seq_send);
+    if (const char * v = getenv("ROCMFPX_EH_SIM_RESIDENT")) {
+        h->sim_resident = std::max<int64_t>(0, atoll(v));
+    }
+    if (const char * v = getenv("ROCMFPX_EH_SIM_NOHOST")) {
+        h->sim_nohost = atoi(v) != 0;
+    }
+    if (h->sim_resident > 0 || h->sim_nohost) {
+        GGML_LOG_WARN("%s: measuring: %s%s (the answers are wrong)\n", __func__,
+            h->sim_nohost ? "the host answers zeros" : "", h->sim_resident > 0 ? "the host reads the first experts of each layer only" : "");
+    }
     eh_store(&h->hdr->seq_done, h->seq_base);
 
     h->misses.reserve((size_t) max_tokens*max_used);

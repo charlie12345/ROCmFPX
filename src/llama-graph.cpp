@@ -2285,12 +2285,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 ok = ok && (w == nullptr || hdmd->rot.find(w) == hdmd->rot.end());
             }
         }
-        // this scheduler's backend on the handoff's device (an MTP draft context shares the target's handoff, but
-        // has backends of its own)
+        // this scheduler's backend on the GPU that caches the layer (an MTP draft context shares the target's
+        // handoff, but has backends of its own)
         eh_backend = nullptr;
         if (ok) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(expert_handoff->backend());
-            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched) && eh_backend == nullptr; ++i) {
+            ggml_backend_dev_t dev = expert_handoff->device(il);
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched) && eh_backend == nullptr && dev != nullptr; ++i) {
                 ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
                 if (ggml_backend_get_device(b) == dev) {
                     eh_backend = b;
@@ -2300,15 +2300,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         if (ok && expert_handoff->use(il, n_tokens, form)) {
             ggml_tensor * ids = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
-            ggml_tensor * sl  = ggml_get_rows(ctx0, expert_handoff->slot_map(il), ggml_reshape_1d(ctx0, ids, ggml_nelements(ids)));
-            if (ggml_backend_supports_op(eh_backend, sl)) {
-                ggml_backend_sched_set_tensor_backend(sched, sl, eh_backend);
-                sl = ggml_reshape_2d(ctx0, sl, selected_experts->ne[0], selected_experts->ne[1]);
-
-                ggml_tensor * x = ggml_is_contiguous(cur)     ? cur     : ggml_cont(ctx0, cur);
-                ggml_tensor * w = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
-                const ggml_expert_handoff_params ehp = expert_handoff->params(il);
-                slots = ggml_expert_handoff_send(ctx0, x, ids, sl, w, &ehp);
+            ggml_tensor * x   = ggml_is_contiguous(cur)     ? cur     : ggml_cont(ctx0, cur);
+            ggml_tensor * w   = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
+            const ggml_expert_handoff_params ehp = expert_handoff->params(il);
+            // the send looks the slots up in the layer's slot map itself (one kernel less per layer)
+            ggml_tensor * send = ggml_expert_handoff_send(ctx0, x, ids, expert_handoff->slot_map(il), w, &ehp);
+            if (ggml_backend_supports_op(eh_backend, send)) {
+                slots = send;
                 ggml_backend_sched_set_tensor_backend(sched, slots, eh_backend);
                 cb(slots, "ffn_moe_handoff_send", il);
                 ggml_build_forward_expand(gf, slots);
