@@ -1,9 +1,9 @@
-name: ROCmFPX UI
+name: RDNA-FAST UI
 
 # ROCmFPX [TAG_UI_PREBUILT_GH] (RDNA-FAST): the prebuilt web UI that -DLLAMA_USE_PREBUILT_UI=ON (the default) downloads,
 # published as the rolling GitHub release ui-latest (rdna-fast-ui.tar.gz, .sha256, and rdna-fast-ui.tree = the git tree
 # id of tools/ui it was built from). npm runs only when tools/ui changed since that build: otherwise the published
-# archive is reused. Runs on pushes to main that touch tools/ui, by hand, and from rocmfpx-release.yml, whose builds
+# archive is reused. Runs on pushes to main that touch tools/ui, by hand, and from rdna-fast-release.yml, whose builds
 # embed the artifact this uploads (rdna-fast-ui).
 
 on:
@@ -11,7 +11,7 @@ on:
     branches: [main]
     paths:
       - 'tools/ui/**'
-      - '.github/workflows/rocmfpx-ui.yml'
+      - '.github/workflows/rdna-fast-ui.yml'
   workflow_dispatch:
   workflow_call:
 
@@ -22,7 +22,7 @@ jobs:
   ui:
     runs-on: ubuntu-24.04
     concurrency:
-      group: rocmfpx-ui-latest
+      group: rdna-fast-ui-latest
       cancel-in-progress: false
     env:
       GH_TOKEN: ${{ github.token }}

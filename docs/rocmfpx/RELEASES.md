@@ -18,7 +18,7 @@ Release gate:
    attestations, and attach exact build metadata.
 7. Verify `LICENSE`, `NOTICE`, source archive ancestry, and third-party notices.
 
-`.github/workflows/rocmfpx-release.yml` builds a reproducible Linux CPU archive,
+`.github/workflows/rdna-fast-release.yml` builds a reproducible Linux CPU archive,
 publishes `ghcr.io/rocmfpx/rocmfpx:<tag>`, and creates a GitHub prerelease on
 version tags. The package remains private while this repository is private; its
 visibility must be changed deliberately when the project launches. Vulkan/HIP

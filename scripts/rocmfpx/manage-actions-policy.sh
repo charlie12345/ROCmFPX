@@ -54,7 +54,7 @@ private=$(gh repo view "$repo" --json isPrivate --jq .isPrivate)
 declare -A keep=(
     [.github/workflows/check-rocmfpx.yml]=1
     [.github/workflows/rocmfpx-gfx1151.yml]=1
-    [.github/workflows/rocmfpx-release.yml]=1
+    [.github/workflows/rdna-fast-release.yml]=1
     [.github/workflows/rocmfpx-upstream-sync.yml]=1
 )
 declare -A seen=()

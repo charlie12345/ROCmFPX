@@ -6,7 +6,7 @@ Only these workflows remain enabled:
 - `check-rocmfpx.yml`: focused hosted CPU reference, format, plugin ABI, PLE, script, and converter checks for ROCmFPX paths.
 - `rocmfpx-gfx1151.yml`: manual-only Vulkan and HIP qualification on a dedicated self-hosted gfx1151 runner.
 - `rocmfpx-upstream-sync.yml`: weekly and manual upstream merge preparation.
-- `rocmfpx-release.yml`: manual or version-tag release packaging.
+- `rdna-fast-release.yml`: manual or version-tag release packaging.
 
 This policy avoids running the full upstream CPU, Windows, CUDA, server, UI, WebGPU, and cross-platform matrices for every private downstream pull request.
 Disabled workflow source files continue to receive normal upstream merges and can be re-enabled temporarily when a cross-platform qualification is required.

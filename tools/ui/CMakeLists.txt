@@ -3,7 +3,7 @@ set(TARGET llama-ui)
 set(LLAMA_UI_HF_BUCKET "ggml-org/llama-ui" CACHE STRING "Hugging Face bucket name for prebuilt UI assets")
 set(LLAMA_UI_GZIP      ON                  CACHE BOOL   "Apply gzip compress to assets to save bandwidth")
 # ROCmFPX [TAG_UI_PREBUILT_GH] (RDNA-FAST): LLAMA_USE_PREBUILT_UI downloads this repository's UI from its GitHub releases
-# (rdna-fast-ui.tar.gz, attached by .github/workflows/rocmfpx-release.yml); empty = llama.cpp's HF bucket above
+# (rdna-fast-ui.tar.gz, attached by .github/workflows/rdna-fast-release.yml); empty = llama.cpp's HF bucket above
 set(LLAMA_UI_RELEASE_REPO "serrynaimo/RDNA-FAST" CACHE STRING "GitHub repository whose releases carry the prebuilt UI (empty = the HF bucket)")
 set(LLAMA_UI_RELEASE_URL  ""                     CACHE STRING "Release download base URL (default https://github.com/<repo>/releases/download)")
 

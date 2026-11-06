@@ -1,4 +1,4 @@
-name: ROCmFPX release
+name: RDNA-FAST release
 
 on:
   push:
@@ -14,7 +14,7 @@ jobs:
   ui:
     permissions:
       contents: write
-    uses: ./.github/workflows/rocmfpx-ui.yml
+    uses: ./.github/workflows/rdna-fast-ui.yml
 
   linux-cpu:
     needs: ui
@@ -44,12 +44,12 @@ jobs:
           cp LICENSE NOTICE stage/share/rocmfpx/
           cp -a licenses stage/share/rocmfpx/licenses
           cp -a docs/rocmfpx stage/share/rocmfpx/docs
-          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf rocmfpx-linux-x86_64.tar.gz -C stage .
-          sha256sum rocmfpx-linux-x86_64.tar.gz > rocmfpx-linux-x86_64.tar.gz.sha256
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf rdna-fast-linux-x86_64.tar.gz -C stage .
+          sha256sum rdna-fast-linux-x86_64.tar.gz > rdna-fast-linux-x86_64.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
-          name: rocmfpx-linux-x86_64
-          path: rocmfpx-linux-x86_64.tar.gz*
+          name: rdna-fast-linux-x86_64
+          path: rdna-fast-linux-x86_64.tar.gz*
 
   container:
     needs: ui
@@ -111,7 +111,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: rocmfpx-linux-x86_64
+          name: rdna-fast-linux-x86_64
           path: dist
       - uses: actions/download-artifact@v4
         with:
