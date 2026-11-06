@@ -2234,33 +2234,82 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // (the others read the zeroed miss slot), the host pool computes the others meanwhile, the join adds its sum.
     // The send runs before the device's experts because their matmuls take their slots from it.
     bool eh_join = false;
-    if (expert_handoff != nullptr) {
-        int32_t act = -1;
-        if (type_op == LLM_FFN_SILU && (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f)) {
-            act = GGML_EXPERT_HANDOFF_ACT_SILU;
-        } else if (type_op == LLM_FFN_GELU) {
-            act = GGML_EXPERT_HANDOFF_ACT_GELU;
+    ggml_backend_t eh_backend = nullptr;
+    if (expert_handoff != nullptr && il >= 0) {
+        // the expert FFN as the code below computes it, for the host pool
+        llama_expert_handoff_form form;
+        const bool  gated = gate_exps || gate_up_exps;
+        const float limit = hparams.swiglu_clamp_exp[il];
+        switch (type_op) {
+            case LLM_FFN_SILU:
+                if (!gated) {
+                    form.act = GGML_EXPERT_HANDOFF_ACT_UP_SILU;
+                } else if (gate_exps && limit > 1e-6f) {
+                    const bool fused = arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT ||
+                        (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4;
+                    form.act   = fused ? GGML_EXPERT_HANDOFF_ACT_SILU_CLAMP : GGML_EXPERT_HANDOFF_ACT_SILU_LIMIT;
+                    form.limit = limit;
+                } else {
+                    form.act = GGML_EXPERT_HANDOFF_ACT_SILU;
+                }
+                break;
+            case LLM_FFN_GELU:
+                form.act = gated ? GGML_EXPERT_HANDOFF_ACT_GELU : GGML_EXPERT_HANDOFF_ACT_UP_GELU;
+                break;
+            case LLM_FFN_RELU:
+                form.act = gated ? GGML_EXPERT_HANDOFF_ACT_RELU : GGML_EXPERT_HANDOFF_ACT_UP_RELU;
+                break;
+            case LLM_FFN_RELU_SQR:
+                form.act = gated ? -1 : GGML_EXPERT_HANDOFF_ACT_UP_RELU_SQR;
+                break;
+            case LLM_FFN_SWIGLU_OAI_MOE:
+                form.act   = GGML_EXPERT_HANDOFF_ACT_SWIGLU_OAI;
+                form.alpha = 1.702f; // as in the case below
+                form.limit = 7.0f;
+                break;
+            case LLM_FFN_SITU:
+                form.act  = gated ? GGML_EXPERT_HANDOFF_ACT_SITU : -1;
+                form.beta = hparams.situ_beta;
+                form.lb   = hparams.situ_linear_beta;
+                break;
+            default:
+                break;
         }
-        bool ok = act >= 0 && (gate_exps || gate_up_exps) && !weight_before_ffn && arch != LLM_ARCH_GROVEMOE &&
-            !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b &&
-            il >= 0 && selected_experts->ne[0] == (int64_t) hparams.n_expert_used(il);
+        form.weight_before = weight_before_ffn;
+        if ((int64_t) hparams.n_expert_used(il) != selected_experts->ne[0]) {
+            form.n_used = (int32_t) hparams.n_expert_used(il);
+        }
+        bool ok = form.act >= 0 && arch != LLM_ARCH_GROVEMOE;
         if (ok && hdmd) {
             for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
                 ok = ok && (w == nullptr || hdmd->rot.find(w) == hdmd->rot.end());
             }
         }
-        if (ok && expert_handoff->use(il, n_tokens, act)) {
+        // this scheduler's backend on the handoff's device (an MTP draft context shares the target's handoff, but
+        // has backends of its own)
+        eh_backend = nullptr;
+        if (ok) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(expert_handoff->backend());
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched) && eh_backend == nullptr; ++i) {
+                ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+                if (ggml_backend_get_device(b) == dev) {
+                    eh_backend = b;
+                }
+            }
+            ok = eh_backend != nullptr;
+        }
+        if (ok && expert_handoff->use(il, n_tokens, form)) {
             ggml_tensor * ids = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
             ggml_tensor * sl  = ggml_get_rows(ctx0, expert_handoff->slot_map(il), ggml_reshape_1d(ctx0, ids, ggml_nelements(ids)));
-            if (ggml_backend_supports_op(expert_handoff->backend(), sl)) {
-                ggml_backend_sched_set_tensor_backend(sched, sl, expert_handoff->backend());
+            if (ggml_backend_supports_op(eh_backend, sl)) {
+                ggml_backend_sched_set_tensor_backend(sched, sl, eh_backend);
                 sl = ggml_reshape_2d(ctx0, sl, selected_experts->ne[0], selected_experts->ne[1]);
 
                 ggml_tensor * x = ggml_is_contiguous(cur)     ? cur     : ggml_cont(ctx0, cur);
                 ggml_tensor * w = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
                 const ggml_expert_handoff_params ehp = expert_handoff->params(il);
                 slots = ggml_expert_handoff_send(ctx0, x, ids, sl, w, &ehp);
-                ggml_backend_sched_set_tensor_backend(sched, slots, expert_handoff->backend());
+                ggml_backend_sched_set_tensor_backend(sched, slots, eh_backend);
                 cb(slots, "ffn_moe_handoff_send", il);
                 ggml_build_forward_expand(gf, slots);
                 eh_join = true;
@@ -2290,7 +2339,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_up_exps_b) {
-            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
+            gate_up = slots ? ggml_add_id(ctx0, gate_up, build_cached_experts(gate_up_exps_b), slots) // [TAG_EXPERT_HANDOFF] zero at the miss slot
+                          : ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
             cb(gate_up, "ffn_moe_gate_up_biased", il);
         }
 
@@ -2309,7 +2359,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (up_exps_b) {
-            up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
+            up = slots ? ggml_add_id(ctx0, up, build_cached_experts(up_exps_b), slots) // [TAG_EXPERT_HANDOFF] zero at the miss slot
+                          : ggml_add_id(ctx0, up, up_exps_b, selected_experts);
             cb(up, "ffn_moe_up_biased", il);
         }
 
@@ -2325,7 +2376,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps_b) {
-            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
+            cur = slots ? ggml_add_id(ctx0, cur, build_cached_experts(gate_exps_b), slots) // [TAG_EXPERT_HANDOFF] zero at the miss slot
+                          : ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
             cb(cur, "ffn_moe_gate_biased", il);
         }
     }
@@ -2427,7 +2479,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (down_exps_b) {
-        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+        experts = slots ? ggml_add_id(ctx0, experts, build_cached_experts(down_exps_b), slots) // [TAG_EXPERT_HANDOFF] zero at the miss slot
+                          : ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
     }
 
@@ -2474,7 +2527,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         const ggml_expert_handoff_params ehp = expert_handoff->params(il);
         moe_out = ggml_expert_handoff_join(ctx0, moe_out, &ehp);
-        ggml_backend_sched_set_tensor_backend(sched, moe_out, expert_handoff->backend());
+        ggml_backend_sched_set_tensor_backend(sched, moe_out, eh_backend);
         cb(moe_out, "ffn_moe_handoff_join", il);
     }
 

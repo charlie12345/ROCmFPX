@@ -30,19 +30,36 @@ struct llama_expert_handoff_params {
     std::string profile_save;          // where to write the routing counts at exit
 };
 
+// how a layer's routed experts are computed, as build_moe_ffn does it (the host pool repeats it)
+struct llama_expert_handoff_form {
+    int32_t act           = -1;    // ggml_expert_handoff_act
+    float   alpha         = 0.0f;
+    float   limit         = 0.0f;
+    float   beta          = 0.0f;
+    float   lb            = 0.0f;
+    bool    weight_before = false;
+    int32_t n_used        = 0;     // only the first n_used selected experts count, 0 = all
+
+    bool operator==(const llama_expert_handoff_form & o) const {
+        return act == o.act && alpha == o.alpha && limit == o.limit && beta == o.beta && lb == o.lb &&
+               weight_before == o.weight_before && n_used == o.n_used;
+    }
+};
+
 class llama_expert_handoff {
 public:
     llama_expert_handoff(const llama_model & model, const std::vector<ggml_backend_t> & backends,
             const std::vector<ggml_backend_buffer_type_t> & bufts, const llama_expert_handoff_params & params);
     ~llama_expert_handoff();
 
-    // true: layer il's routed experts are split for a batch of n_tokens with activation act (ggml_expert_handoff_act);
-    // the first call per layer registers its experts with the host pool
-    bool use(int32_t il, int64_t n_tokens, int32_t act) const;
+    // true: layer il's routed experts are split for a batch of n_tokens, computed as form says; the first call per
+    // layer registers its experts with the host pool
+    bool use(int32_t il, int64_t n_tokens, const llama_expert_handoff_form & form) const;
 
     ggml_backend_t backend() const;
     ggml_tensor *  slot_map(int32_t il) const;                // I32 [1, n_expert] on the device
     ggml_tensor *  get_experts(const ggml_tensor * w) const;  // the cache view used in place of the host experts w
+                                                              // (also of their biases: [n, n_slots + 1], zeros at the miss slot)
 
     // what the send and join ops of layer il need
     ggml_expert_handoff_params params(int32_t il) const;

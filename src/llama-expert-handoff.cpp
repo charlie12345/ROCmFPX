@@ -51,10 +51,12 @@ struct eh_host_api {
 using eh_mapped_alloc_t = void * (*)(size_t);
 using eh_mapped_free_t  = void   (*)(void *);
 
-// gate, up, down or gate_up, down
+// the per-expert tensors of a layer, each cached in a bank: the weights (gate_up or gate and up, or up alone; down),
+// then their biases ([n, n_expert], F32), which the graph adds by slot so that a miss adds nothing
 std::vector<ggml_tensor *> eh_layer_experts(const llama_layer & layer) {
     std::vector<ggml_tensor *> res;
-    for (ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+    for (ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps,
+                             layer.ffn_gate_up_exps_b, layer.ffn_gate_exps_b, layer.ffn_up_exps_b, layer.ffn_down_exps_b }) {
         if (t != nullptr) {
             res.push_back(t);
         }
@@ -62,12 +64,34 @@ std::vector<ggml_tensor *> eh_layer_experts(const llama_layer & layer) {
     return res;
 }
 
+// bytes of one expert in t: weights [k, n, n_expert], biases [n, n_expert]
+size_t eh_expert_stride(const ggml_tensor * t) {
+    return ggml_n_dims(t) >= 3 ? t->nb[2] : t->nb[1];
+}
+
+int64_t eh_n_expert(const ggml_tensor * t) {
+    return ggml_n_dims(t) >= 3 ? t->ne[2] : t->ne[1];
+}
+
 bool eh_same_layout(const std::vector<ggml_tensor *> & a, const std::vector<ggml_tensor *> & b) {
     if (a.size() != b.size()) {
         return false;
     }
     for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i]->type != b[i]->type || !ggml_are_same_shape(a[i], b[i]) || a[i]->nb[2] != b[i]->nb[2]) {
+        if (a[i]->type != b[i]->type || !ggml_are_same_shape(a[i], b[i]) || eh_expert_stride(a[i]) != eh_expert_stride(b[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool eh_valid_experts(const std::vector<ggml_tensor *> & experts) {
+    if (experts.empty()) {
+        return false;
+    }
+    const int64_t n_expert = eh_n_expert(experts[0]);
+    for (const ggml_tensor * t : experts) {
+        if (eh_n_expert(t) != n_expert || (ggml_n_dims(t) < 3 && (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)))) {
             return false;
         }
     }
@@ -115,7 +139,7 @@ struct llama_expert_handoff::impl {
         std::vector<ggml_tensor *> experts;         // host experts in the order of the banks
         // registration with the host pool (first use)
         mutable int32_t state = 0;                  // 0 = not yet, 1 = ok, -1 = the host cannot compute it
-        mutable int32_t act   = -1;
+        mutable llama_expert_handoff_form form;
         mutable std::vector<float> gate_s, up_s, down_s;
     };
 
@@ -198,7 +222,7 @@ struct llama_expert_handoff::impl {
         size_t max_blob = 0;
         for (size_t il = 0; il < model.layers.size(); ++il) {
             auto experts = eh_layer_experts(model.layers[il]);
-            if (experts.empty() || !std::all_of(experts.begin(), experts.end(), eh_is_host_weight)) {
+            if (!eh_valid_experts(experts) || !std::all_of(experts.begin(), experts.end(), eh_is_host_weight)) {
                 continue;
             }
             auto it = std::find_if(groups.begin(), groups.end(), [&](const group & g) { return eh_same_layout(g.ref, experts); });
@@ -206,9 +230,9 @@ struct llama_expert_handoff::impl {
                 groups.emplace_back();
                 it = groups.end() - 1;
                 it->ref = experts;
-                it->n_expert = (int32_t) experts[0]->ne[2];
+                it->n_expert = (int32_t) eh_n_expert(experts[0]);
                 for (const ggml_tensor * t : experts) {
-                    it->slot_bytes += t->nb[2];
+                    it->slot_bytes += eh_expert_stride(t);
                 }
                 max_blob = std::max(max_blob, it->slot_bytes);
             }
@@ -281,8 +305,10 @@ struct llama_expert_handoff::impl {
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             group & g = groups[ig];
             for (const ggml_tensor * t : g.ref) {
-                ggml_tensor * bank = ggml_new_tensor_3d(ctx.get(), t->type, t->ne[0], t->ne[1], g.n_slots + 2);
-                GGML_ASSERT(bank->nb[2] == t->nb[2]);
+                ggml_tensor * bank = ggml_n_dims(t) >= 3 ?
+                    ggml_new_tensor_3d(ctx.get(), t->type, t->ne[0], t->ne[1], g.n_slots + 2) :
+                    ggml_new_tensor_2d(ctx.get(), t->type, t->ne[0], g.n_slots + 2);
+                GGML_ASSERT(eh_expert_stride(bank) == eh_expert_stride(t));
                 ggml_format_name(bank, "expert_cache.%zu.%s", ig, t->name);
                 g.banks.push_back(bank);
             }
@@ -292,7 +318,9 @@ struct llama_expert_handoff::impl {
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     ggml_tensor * bank = g.banks[ip];
                     // the miss slot is a valid expert index of the view
-                    ggml_tensor * cached = ggml_view_3d(ctx.get(), bank, bank->ne[0], bank->ne[1], g.n_slots + 1, bank->nb[1], bank->nb[2], 0);
+                    ggml_tensor * cached = ggml_n_dims(l.experts[ip]) >= 3 ?
+                        ggml_view_3d(ctx.get(), bank, bank->ne[0], bank->ne[1], g.n_slots + 1, bank->nb[1], bank->nb[2], 0) :
+                        ggml_view_2d(ctx.get(), bank, bank->ne[0], g.n_slots + 1, bank->nb[1], 0);
                     ggml_format_name(cached, "expert_cache.%s", l.experts[ip]->name);
                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
                 }
@@ -347,7 +375,7 @@ struct llama_expert_handoff::impl {
             n_cached += g.n_slots;
             n_all    += (size_t) g.layers.size()*g.n_expert;
             LLAMA_LOG_INFO("%s: %2zu layers, %s: %6d of %6d experts in VRAM (%.1f%%), %.2f MiB each\n", __func__,
-                g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, (int32_t) (g.layers.size()*g.n_expert),
+                g.layers.size(), ggml_type_name(g.ref[0]->type), g.n_slots, (int32_t) (g.layers.size()*g.n_expert),
                 100.0*g.n_slots/std::max<size_t>(1, g.layers.size()*g.n_expert), g.slot_bytes/1048576.0);
         }
         LLAMA_LOG_INFO("%s: %zu of %zu experts cached%s, %d host workers, batches up to %d tokens split\n", __func__,
@@ -446,7 +474,8 @@ struct llama_expert_handoff::impl {
                 layer & l = layers[il];
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     const ggml_tensor * w = l.experts[ip];
-                    ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + e0*w->nb[2], s*w->nb[2], n*w->nb[2]);
+                    const size_t es = eh_expert_stride(w);
+                    ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + e0*es, s*es, n*es);
                 }
                 for (size_t k = 0; k < n; ++k) {
                     l.slots[e0 + k] = (int32_t) (s + k);
@@ -535,13 +564,16 @@ struct llama_expert_handoff::impl {
         }
     }
 
-    bool use(int32_t il, int64_t n_tokens, int32_t act) const {
+    bool use(int32_t il, int64_t n_tokens, const llama_expert_handoff_form & form) const {
         if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || n_tokens <= 0 || n_tokens > dims.max_tokens) {
+            return false;
+        }
+        if (form.act < 0) {
             return false;
         }
         if (model.hparams.no_alloc) {
             // measuring only: the same graph, nothing read from the weights
-            return act == GGML_EXPERT_HANDOFF_ACT_SILU || act == GGML_EXPERT_HANDOFF_ACT_GELU;
+            return true;
         }
         if (host == nullptr) {
             return false;
@@ -551,35 +583,47 @@ struct llama_expert_handoff::impl {
         if (l.state == 0) {
             const llama_layer & ml = model.layers[il];
             const int64_t n_expert = groups[l.ig].n_expert;
-            bool ok = act == GGML_EXPERT_HANDOFF_ACT_SILU || act == GGML_EXPERT_HANDOFF_ACT_GELU;
+            bool ok = true;
             l.gate_s = eh_read_scale(ml.ffn_gate_exps_s, n_expert, ok);
             l.up_s   = eh_read_scale(ml.ffn_up_exps_s,   n_expert, ok);
             l.down_s = eh_read_scale(ml.ffn_down_exps_s, n_expert, ok);
             if (ok) {
+                // the biases are host weights in the experts' list (eh_layer_experts), contiguous [n, n_expert] F32
                 ggml_expert_handoff_layer hl = {};
-                hl.gate       = ml.ffn_gate_exps;
-                hl.up         = ml.ffn_up_exps;
-                hl.gate_up    = ml.ffn_gate_up_exps;
-                hl.down       = ml.ffn_down_exps;
-                hl.gate_scale = l.gate_s.empty() ? nullptr : l.gate_s.data();
-                hl.up_scale   = l.up_s.empty()   ? nullptr : l.up_s.data();
-                hl.down_scale = l.down_s.empty() ? nullptr : l.down_s.data();
-                hl.act        = (ggml_expert_handoff_act) act;
-                hl.miss_slot  = groups[l.ig].n_slots;
+                hl.gate          = ml.ffn_gate_exps;
+                hl.up            = ml.ffn_up_exps;
+                hl.gate_up       = ml.ffn_gate_up_exps;
+                hl.down          = ml.ffn_down_exps;
+                hl.gate_scale    = l.gate_s.empty() ? nullptr : l.gate_s.data();
+                hl.up_scale      = l.up_s.empty()   ? nullptr : l.up_s.data();
+                hl.down_scale    = l.down_s.empty() ? nullptr : l.down_s.data();
+                hl.gate_bias     = ml.ffn_gate_exps_b ? (const float *) ml.ffn_gate_exps_b->data : nullptr;
+                hl.up_bias       = ml.ffn_gate_up_exps_b ? (const float *) ml.ffn_gate_up_exps_b->data :
+                                   ml.ffn_up_exps_b      ? (const float *) ml.ffn_up_exps_b->data : nullptr;
+                hl.down_bias     = ml.ffn_down_exps_b ? (const float *) ml.ffn_down_exps_b->data : nullptr;
+                hl.act           = (ggml_expert_handoff_act) form.act;
+                hl.alpha         = form.alpha;
+                hl.limit         = form.limit;
+                hl.beta          = form.beta;
+                hl.lb            = form.lb;
+                hl.weight_before = form.weight_before;
+                hl.n_used        = form.n_used;
+                hl.miss_slot     = groups[l.ig].n_slots;
                 ok = api.set_layer(host, il, &hl);
             }
             l.state = ok ? 1 : -1;
-            l.act   = act;
+            l.form  = form;
             if (!ok) {
                 LLAMA_LOG_WARN("%s: layer %d: the host cannot compute these experts, the layer runs without the handoff\n", __func__, il);
             }
         }
-        return l.state == 1 && l.act == act;
+        return l.state == 1 && l.form == form;
     }
 
     int64_t copy_experts(ggml_backend_t be, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) const {
+        // any backend of the cache's device (an MTP draft context has its own), copying on its stream
         const auto it = bindings.find(w);
-        if (it == bindings.end() || be != backend) {
+        if (it == bindings.end() || ggml_backend_get_device(be) != dev) {
             return 0;
         }
         const binding & b = it->second;
@@ -602,7 +646,7 @@ struct llama_expert_handoff::impl {
         ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), dst,  dst->ne[0],  dst->ne[1],  n, dst->nb[1],  dst->nb[2],  e*dst->nb[2]);
         ggml_backend_view_init(src_view);
         ggml_backend_view_init(dst_view);
-        ggml_backend_tensor_copy_async(backend, backend, src_view, dst_view);
+        ggml_backend_tensor_copy_async(be, be, src_view, dst_view);
         return n;
     }
 
@@ -650,8 +694,8 @@ llama_expert_handoff::llama_expert_handoff(const llama_model & model, const std:
 
 llama_expert_handoff::~llama_expert_handoff() = default;
 
-bool llama_expert_handoff::use(int32_t il, int64_t n_tokens, int32_t act) const {
-    return pimpl->use(il, n_tokens, act);
+bool llama_expert_handoff::use(int32_t il, int64_t n_tokens, const llama_expert_handoff_form & form) const {
+    return pimpl->use(il, n_tokens, form);
 }
 
 ggml_backend_t llama_expert_handoff::backend() const {

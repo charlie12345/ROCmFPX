@@ -191,6 +191,8 @@ struct eh_layer {
     int64_t n_embd   = 0;
     int64_t n_ff     = 0;
     int64_t n_expert = 0;
+    bool    has_gate = true;
+    int64_t gu_rows  = 0; // rows of the gate/up phase per expert: 2*n_ff, or n_ff without a gate
     ggml_type type_gu   = GGML_TYPE_COUNT; // gate/up weights
     ggml_type type_down = GGML_TYPE_COUNT;
     ggml_type vt_gu     = GGML_TYPE_COUNT; // their vec_dot types
@@ -325,10 +327,11 @@ struct ggml_expert_handoff_host {
         const float   * w     = (const float   *) (mb + ggml_expert_handoff_off_weights(dims));
         eh_layer & L = layers[il];
 
+        const int32_t n_count = L.l.n_used > 0 ? std::min(n_used, L.l.n_used) : n_used;
         for (int32_t t = 0; t < n_tokens; ++t) {
             miss_begin[t] = (int32_t) misses.size();
             bool any = false;
-            for (int32_t k = 0; k < n_used; ++k) {
+            for (int32_t k = 0; k < n_count; ++k) {
                 const int32_t e = ids[t*dims.max_used + k];
                 if (e < 0 || e >= L.n_expert) {
                     continue;
@@ -356,8 +359,8 @@ struct ggml_expert_handoff_host {
         if (xq.size() < (size_t) n_tokens*xq_row) {
             xq.resize((size_t) n_tokens*xq_row);
         }
-        if (gu.size() < misses.size()*2*J.n_ff) {
-            gu.resize(misses.size()*2*J.n_ff);
+        if (gu.size() < misses.size()*J.gu_rows) {
+            gu.resize(misses.size()*J.gu_rows);
         }
         if (hq.size() < misses.size()*hq_row) {
             hq.resize(misses.size()*hq_row);
@@ -367,10 +370,14 @@ struct ggml_expert_handoff_host {
         }
     }
 
-    // gate/up row r (0 .. 2*n_ff - 1, gate rows first) of expert e
+    // gate/up row r (0 .. gu_rows - 1: gate rows first, or the up rows alone without a gate) of expert e
     const uint8_t * gu_row(const eh_layer & J, int32_t e, int64_t r) const {
         if (J.l.gate_up) {
             const ggml_tensor * t = J.l.gate_up;
+            return (const uint8_t *) t->data + e*t->nb[2] + r*t->nb[1];
+        }
+        if (!J.has_gate) {
+            const ggml_tensor * t = J.l.up;
             return (const uint8_t *) t->data + e*t->nb[2] + r*t->nb[1];
         }
         const ggml_tensor * t = r < J.n_ff ? J.l.gate : J.l.up;
@@ -378,11 +385,66 @@ struct ggml_expert_handoff_host {
     }
 
     float gu_scale(const eh_layer & J, int32_t e, int64_t r) const {
-        if (J.l.gate_up) {
+        if (J.l.gate_up || !J.has_gate) {
             return J.l.up_scale ? J.l.up_scale[e] : 1.0f;
         }
         const float * s = r < J.n_ff ? J.l.gate_scale : J.l.up_scale;
         return s ? s[e] : 1.0f;
+    }
+
+    float gu_bias(const eh_layer & J, int32_t e, int64_t r) const {
+        if (J.l.gate_up || !J.has_gate) {
+            return J.l.up_bias ? J.l.up_bias[e*J.gu_rows + r] : 0.0f;
+        }
+        const float * b = r < J.n_ff ? J.l.gate_bias : J.l.up_bias;
+        return b ? b[e*J.n_ff + r % J.n_ff] : 0.0f;
+    }
+
+    // the activation of one expert: gu holds gate then up (or up alone), h gets n_ff values
+    static void activate(const eh_layer & J, const float * gu, float * h) {
+        const int64_t n_ff = J.n_ff;
+        const ggml_expert_handoff_layer & l = J.l;
+        auto silu    = [](float v) { return v/(1.0f + expf(-v)); };
+        auto gelu    = [](float v) { return 0.5f*v*(1.0f + tanhf(0.7978845608028654f*v*(1.0f + 0.044715f*v*v))); };
+        auto sigmoid = [](float v) { return 1.0f/(1.0f + expf(-v)); };
+        if (!J.has_gate) {
+            for (int64_t i = 0; i < n_ff; ++i) {
+                const float u = gu[i];
+                switch (l.act) {
+                    case GGML_EXPERT_HANDOFF_ACT_UP_SILU:     h[i] = silu(u); break;
+                    case GGML_EXPERT_HANDOFF_ACT_UP_GELU:     h[i] = gelu(u); break;
+                    case GGML_EXPERT_HANDOFF_ACT_UP_RELU:     h[i] = std::max(u, 0.0f); break;
+                    case GGML_EXPERT_HANDOFF_ACT_UP_RELU_SQR: { const float r = std::max(u, 0.0f); h[i] = r*r; } break;
+                    default: h[i] = 0.0f; break;
+                }
+            }
+            return;
+        }
+        const float * g = gu;
+        const float * u = gu + n_ff;
+        for (int64_t i = 0; i < n_ff; ++i) {
+            switch (l.act) {
+                case GGML_EXPERT_HANDOFF_ACT_SILU: h[i] = silu(g[i])*u[i]; break;
+                case GGML_EXPERT_HANDOFF_ACT_GELU: h[i] = gelu(g[i])*u[i]; break;
+                case GGML_EXPERT_HANDOFF_ACT_RELU: h[i] = std::max(g[i], 0.0f)*u[i]; break;
+                case GGML_EXPERT_HANDOFF_ACT_SWIGLU_OAI: {
+                    const float x = std::min(g[i], l.limit);
+                    const float y = std::clamp(u[i], -l.limit, l.limit);
+                    h[i] = x/(1.0f + expf(-l.alpha*x))*(y + 1.0f);
+                } break;
+                case GGML_EXPERT_HANDOFF_ACT_SILU_CLAMP:
+                    h[i] = silu(std::min(g[i], l.limit))*std::clamp(u[i], -l.limit, l.limit);
+                    break;
+                case GGML_EXPERT_HANDOFF_ACT_SILU_LIMIT:
+                    h[i] = std::min(silu(g[i]), l.limit)*std::clamp(u[i], -l.limit, l.limit);
+                    break;
+                case GGML_EXPERT_HANDOFF_ACT_SITU: {
+                    const float a = l.beta*tanhf(g[i]/l.beta)*sigmoid(g[i]);
+                    h[i] = a*(l.lb > 0.0f ? l.lb*tanhf(u[i]/l.lb) : u[i]);
+                } break;
+                default: h[i] = 0.0f; break;
+            }
+        }
     }
 
     void run(int iw) {
@@ -409,9 +471,10 @@ struct ggml_expert_handoff_host {
         }
         barrier.wait();
 
-        // 2. gate and up rows of every miss
+        // 2. gate and up rows of every miss (with weight_before, the routing weight scales the input: it is
+        //    linear up to here, so it scales the dot products)
         {
-            const int64_t rows  = 2*n_ff;
+            const int64_t rows  = J.gu_rows;
             const int64_t total = n_miss*rows;
             const int64_t i0 = total*iw/n_workers;
             const int64_t i1 = total*(iw + 1)/n_workers;
@@ -421,7 +484,7 @@ struct ggml_expert_handoff_host {
                 const eh_miss & ms = misses[m];
                 float s;
                 tr_gu->vec_dot((int) n_embd, &s, 0, gu_row(J, ms.e, r), 0, xq.data() + ms.t*xq_row, 0, 1);
-                gu[m*rows + r] = s*gu_scale(J, ms.e, r);
+                gu[m*rows + r] = s*gu_scale(J, ms.e, r)*(J.l.weight_before ? ms.w : 1.0f) + gu_bias(J, ms.e, r);
             }
         }
         barrier.wait();
@@ -430,20 +493,7 @@ struct ggml_expert_handoff_host {
         {
             float * h = hf.data() + (size_t) iw*n_ff;
             for (int64_t m = iw; m < n_miss; m += n_workers) {
-                const float * g = gu.data() + m*2*n_ff;
-                const float * u = g + n_ff;
-                if (J.l.act == GGML_EXPERT_HANDOFF_ACT_GELU) {
-                    constexpr float c = 0.7978845608028654f; // sqrt(2/pi)
-                    for (int64_t i = 0; i < n_ff; ++i) {
-                        const float v = g[i];
-                        h[i] = 0.5f*v*(1.0f + tanhf(c*v*(1.0f + 0.044715f*v*v)))*u[i];
-                    }
-                } else {
-                    for (int64_t i = 0; i < n_ff; ++i) {
-                        const float v = g[i];
-                        h[i] = v/(1.0f + expf(-v))*u[i];
-                    }
-                }
+                activate(J, gu.data() + m*J.gu_rows, h);
                 uint8_t * dst = hq.data() + m*hq_row;
                 if (J.vt_down == GGML_TYPE_F32) {
                     memcpy(dst, h, n_ff*sizeof(float));
@@ -469,7 +519,8 @@ struct ggml_expert_handoff_host {
                     float s;
                     tr_down->vec_dot((int) n_ff, &s, 0, (const uint8_t *) dn->data + ms.e*dn->nb[2] + c*dn->nb[1], 0,
                             hq.data() + m*hq_row, 0, 1);
-                    acc += ms.w*s*(J.l.down_scale ? J.l.down_scale[ms.e] : 1.0f);
+                    s = s*(J.l.down_scale ? J.l.down_scale[ms.e] : 1.0f) + (J.l.down_bias ? J.l.down_bias[ms.e*n_embd + c] : 0.0f);
+                    acc += (J.l.weight_before ? 1.0f : ms.w)*s;
                 }
                 y[t*dims.max_embd + c] = acc;
             }
@@ -553,20 +604,33 @@ void ggml_expert_handoff_host_free(ggml_expert_handoff_host_t h) {
 }
 
 bool ggml_expert_handoff_host_set_layer(ggml_expert_handoff_host_t h, int32_t il, const ggml_expert_handoff_layer * l) {
-    if (il < 0 || il >= (int32_t) h->layers.size() || l->down == nullptr || (l->gate_up == nullptr && (l->gate == nullptr || l->up == nullptr))) {
+    if (il < 0 || il >= (int32_t) h->layers.size() || l->down == nullptr || (l->gate_up == nullptr && l->up == nullptr)) {
         return false;
     }
-    const ggml_tensor * gu = l->gate_up ? l->gate_up : l->gate;
+    // a gate (separate or merged) for the gated activations, none for the activations of up alone
+    const bool has_gate = l->gate_up != nullptr || l->gate != nullptr;
+    const bool up_only_act = l->act >= GGML_EXPERT_HANDOFF_ACT_UP_SILU;
+    if (has_gate == up_only_act) {
+        return false;
+    }
+    const ggml_tensor * gu = l->gate_up ? l->gate_up : (l->gate ? l->gate : l->up);
     const ggml_tensor * dn = l->down;
-    if (!l->gate_up && (l->up->type != l->gate->type || !ggml_are_same_shape(l->up, l->gate))) {
+    if (l->gate && !l->gate_up && (l->up == nullptr || l->up->type != l->gate->type || !ggml_are_same_shape(l->up, l->gate))) {
+        return false;
+    }
+    if ((l->act == GGML_EXPERT_HANDOFF_ACT_SITU && l->beta == 0.0f) ||
+        ((l->act == GGML_EXPERT_HANDOFF_ACT_SWIGLU_OAI || l->act == GGML_EXPERT_HANDOFF_ACT_SILU_CLAMP ||
+          l->act == GGML_EXPERT_HANDOFF_ACT_SILU_LIMIT) && !(l->limit > 0.0f))) {
         return false;
     }
 
     eh_layer L;
     L.l        = *l;
+    L.has_gate = has_gate;
     L.n_embd   = gu->ne[0];
     L.n_ff     = l->gate_up ? gu->ne[1]/2 : gu->ne[1];
     L.n_expert = gu->ne[2];
+    L.gu_rows  = has_gate ? 2*L.n_ff : L.n_ff;
     L.type_gu   = gu->type;
     L.type_down = dn->type;
     if (dn->ne[0] != L.n_ff || dn->ne[1] != L.n_embd || dn->ne[2] != L.n_expert || L.n_embd > h->dims.max_embd) {

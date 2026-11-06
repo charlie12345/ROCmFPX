@@ -152,14 +152,25 @@ extern "C" {
     // threads that answers a mailbox by computing the routed experts the device does not hold, from host memory
     //
 
+    // the activation between the experts' gate/up and down projections, as build_moe_ffn applies it
     enum ggml_expert_handoff_act {
-        GGML_EXPERT_HANDOFF_ACT_SILU = 0, // silu(gate) * up (ggml_swiglu_split)
-        GGML_EXPERT_HANDOFF_ACT_GELU = 1, // gelu(gate) * up, tanh approximation (ggml_geglu_split)
+        GGML_EXPERT_HANDOFF_ACT_SILU       = 0,  // silu(gate) * up (ggml_swiglu_split)
+        GGML_EXPERT_HANDOFF_ACT_GELU       = 1,  // gelu(gate) * up, tanh approximation (ggml_geglu_split)
+        GGML_EXPERT_HANDOFF_ACT_RELU       = 2,  // relu(gate) * up (ggml_reglu_split)
+        GGML_EXPERT_HANDOFF_ACT_SWIGLU_OAI = 3,  // g = min(gate, limit): g*sigmoid(alpha*g) * (clamp(up, +-limit) + 1)
+        GGML_EXPERT_HANDOFF_ACT_SILU_CLAMP = 4,  // silu(min(gate, limit)) * clamp(up, +-limit) (ggml_swiglu_clamp)
+        GGML_EXPERT_HANDOFF_ACT_SILU_LIMIT = 5,  // min(silu(gate), limit) * clamp(up, +-limit)
+        GGML_EXPERT_HANDOFF_ACT_SITU       = 6,  // beta*tanh(gate/beta)*sigmoid(gate) * (lb > 0 ? lb*tanh(up/lb) : up)
+        // experts without a gate projection: the activation of up alone
+        GGML_EXPERT_HANDOFF_ACT_UP_SILU     = 7,
+        GGML_EXPERT_HANDOFF_ACT_UP_GELU     = 8,
+        GGML_EXPERT_HANDOFF_ACT_UP_RELU     = 9,
+        GGML_EXPERT_HANDOFF_ACT_UP_RELU_SQR = 10,
     };
 
     struct ggml_expert_handoff_layer {
         // the routed experts in host memory, ggml layout: gate and up [n_embd, n_ff, n_expert] or the merged
-        // gate_up [n_embd, 2*n_ff, n_expert] (gate rows first), down [n_ff, n_embd, n_expert]
+        // gate_up [n_embd, 2*n_ff, n_expert] (gate rows first), or up alone; down [n_ff, n_embd, n_expert]
         const struct ggml_tensor * gate;
         const struct ggml_tensor * up;
         const struct ggml_tensor * gate_up;
@@ -168,8 +179,19 @@ extern "C" {
         const float * gate_scale;
         const float * up_scale;
         const float * down_scale;
+        // per-expert biases in host memory or NULL: gate and up [n_expert][n_ff] (gate_up: [n_expert][2*n_ff],
+        // in up_bias), down [n_expert][n_embd]; added after the scale, like the graph
+        const float * gate_bias;
+        const float * up_bias;
+        const float * down_bias;
         enum ggml_expert_handoff_act act;
-        int32_t miss_slot; // the slot the device gives the experts the host computes
+        float   alpha;         // SWIGLU_OAI
+        float   limit;         // SWIGLU_OAI, SILU_CLAMP, SILU_LIMIT
+        float   beta;          // SITU
+        float   lb;            // SITU
+        bool    weight_before; // the routing weight scales the input (llama4) instead of the output
+        int32_t n_used;        // only the first n_used selected experts of a token count, 0 = all
+        int32_t miss_slot;     // the slot the device gives the experts the host computes
     };
 
     struct ggml_expert_handoff_stats {
