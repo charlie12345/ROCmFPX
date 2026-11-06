@@ -12932,6 +12932,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // ROCmFPX: decode attention over a q5_0 / q5_1 V cache (1 and 2 queries, 4k and 16k cells; head 256 with GQA 6 as
+    // Qwen3.8, head 128 with GQA 4 as Llama), the vec kernel's V loop [TAG_FATTN_VEC_Q5V_UNROLL]
+    for (auto kv_types : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_Q8_0, GGML_TYPE_Q5_0}, {GGML_TYPE_Q4_0, GGML_TYPE_Q5_1},
+             {GGML_TYPE_F16, GGML_TYPE_Q5_0}, {GGML_TYPE_Q5_0, GGML_TYPE_Q5_0}, {GGML_TYPE_Q5_1, GGML_TYPE_Q5_1}}) {
+        for (int64_t kv : {4096, 16384}) {
+            for (int64_t nb : {1, 2}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, kv_types.first, kv_types.second));
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, kv_types.first, kv_types.second));
+            }
+        }
+    }
+
     // ROCmFPX: a dense model's attention at depth, Nanbeige4.3-33B: head 128, 8 KV heads with GQA 7 (56 query heads), the
     // q4_0 KV cache; 1 / 2 queries (decode, a short verify) and a 512-row prompt batch, over 4k / 16k / 48k cells
     for (int64_t kv : {4096, 16384, 49152}) {

@@ -144,6 +144,21 @@ static __global__ void flash_attn_ext_vec(
 
     constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : V_rows_per_thread_q;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
+    // ROCmFPX [TAG_FATTN_VEC_Q5V_UNROLL]: with a q5_0 / q5_1 V cache, clang 24 (ROCm 10.1) fully unrolls the V loop below
+    // (one iteration per KV row of the warp, 32 at head 128 / 256), hoists every row's V loads and spills: head 256 with
+    // 2 queries 384-700 bytes per lane where clang 21 spills none, and the 1-query kernels lose 1-3 waves. Unrolled 4 at
+    // a time where that measured faster (RX 7900 XT, test-backend-ops, 4k / 16k cells): head 256, 2 queries 0.13-0.25x the
+    // time (the spill made 2 queries take 9x as long as 1); head 128, 1 query, quantized K 0.50-0.70x. Kept fully unrolled
+    // where capping it measured slower or mixed: head 256 with 1 query (K q5: up to 1.3x), head 128 with an f16 K or 2
+    // queries. Clang 21 builds keep the full unroll.
+#if defined(GGML_USE_HIP) && defined(__clang_major__) && __clang_major__ >= 22
+#define ROCMFPX_FA_Q5V_UNROLL_ON 1
+    constexpr bool V_is_q5   = type_V == GGML_TYPE_Q5_0 || type_V == GGML_TYPE_Q5_1;
+    constexpr bool V_k0_cap  = V_is_q5 && ((D == 256 && ncols >= 2) || (D == 128 && ncols == 1 && !K_is_fp_like));
+    constexpr int V_k0_unroll = V_k0_cap ? 4 : WARP_SIZE/V_cols_per_iter;
+#else
+#define ROCMFPX_FA_Q5V_UNROLL_ON 0
+#endif
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
     constexpr bool Q_q8_1 = !K_is_fp_like;
@@ -378,7 +393,11 @@ static __global__ void flash_attn_ext_vec(
 
         ggml_cuda_syncwarp();
 
+#if ROCMFPX_FA_Q5V_UNROLL_ON
+#pragma unroll V_k0_unroll
+#else
 #pragma unroll
+#endif
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
 
