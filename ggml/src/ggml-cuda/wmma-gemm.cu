@@ -438,13 +438,15 @@ static bool fp8_gemm_on(const int cc) {
 }
 
 // [TAG_WMMA_GEMM_SCRATCH_AUTO] How many weight rows one chunk unpacks. ROCMFPX_WMMA_GEMM_SCRATCH_MB=N: chunks of at most N MB
-// of f16, as before. Unset: the whole matrix at once for batches of 2048+ tokens on inputs of at most 8192 (gate / up, q / o
-// projections) when its unpacked copy (whole_row_bytes per row) fits the room the device had at its first chunked product,
-// else 64 MB chunks (the old default). One chunk also writes dst directly: no output temporary, no 2D copy per chunk.
-// RX 7900 XT, test-backend-ops, Q4_K / IQ4_XS on the weight shapes of Llama-3.1-8B, Gemma-3-27B, Qwen3-32B, Mistral-24B and
-// Qwen3.8-27B, one chunk against 64 MB chunks (day-1106\scratch-ab.ps1): at 2048 tokens and K <= 8192 every shape is faster,
-// 0.898-0.977 (ROCm 10.1); the down projections (K 14336-32768) are slower, 1.018-1.061, and at 512 tokens it goes both
-// ways, 0.874-1.227 (Qwen3.8's down 1.227): the tuned table has entries for the chunk shapes, not for whole matrices.
+// of f16, as before. Unset: the whole matrix at once where that measured faster, when its unpacked copy (whole_row_bytes per
+// row) fits the room the device had at its first chunked product, else 64 MB chunks (the old default). One chunk also
+// writes dst directly: no output temporary, no 2D copy per chunk. Where it measured faster (RX 7900 XT, ROCm 10.1,
+// test-backend-ops, Q4_K / IQ4_XS on the weight shapes of Llama-3.1-8B, Gemma-3-27B, Qwen3-32B, Mistral-24B and Qwen3.8-27B,
+// with the gfx1100 table's whole-matrix entries; day-1106\scratch-ab2.ps1, one chunk against 64 MB chunks):
+//   - batches of 2048+ tokens on inputs of at most 8192 (gate / up, q / o): 0.89-0.93
+//   - inputs of 8192+ into outputs of 5120+ (down, Qwen3-32B's o), any batch: 0.87-0.97, Qwen3-32B's down 1.00 / 1.02
+// Kept in chunks: gate / up at 512 tokens (one chunk 1.03-1.07) and Llama-3.1-8B's down (4096 outputs: 1.04-1.07). A 64 MB
+// chunk fits the 7900 XT's 80 MB Infinity Cache, a whole 100-330 MB matrix does not.
 // Room = cudaMemGetInfo's free memory minus 1 GiB, at most 512 MB: on Windows that figure counts this process's own
 // allocations only, so the 1 GiB (llama's --fit target) is what is left for the desktop and other programs. A 20 GB card
 // holding an 18.4 GB server (Qwen3.8-27B IQ4_XS at 96k, prod settings) has ~1.8 GiB of it and unpacks 17408 x 5120 (178 MB)
@@ -475,7 +477,8 @@ static int64_t wmma_gemm_chunk_rows(const int device, const int64_t M, const int
     static const int64_t def_mb  = 64;
     const int64_t        f16_row = K*(int64_t) sizeof(half);
     const int64_t        budget  = (env_mb > 0 ? env_mb : def_mb) << 20;
-    if (env_mb <= 0 && M >= 2048 && K <= 8192 && N*f16_row > budget && N*whole_row_bytes <= wmma_gemm_whole_cap(device)) {
+    const bool whole_faster = (M >= 2048 && K <= 8192) || (N >= 5120 && K >= 8192);
+    if (env_mb <= 0 && whole_faster && N*f16_row > budget && N*whole_row_bytes <= wmma_gemm_whole_cap(device)) {
         return N;
     }
     return std::min<int64_t>(N, std::max<int64_t>(256, budget / f16_row / 256 * 256));
