@@ -3042,6 +3042,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     // the MoE cache is only used by the target context
     result.moe_cache_size = 0;
+    result.expert_cache   = 0; // [TAG_EXPERT_HANDOFF] likewise the expert handoff (one mailbox per context)
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types

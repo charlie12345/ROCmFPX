@@ -25,6 +25,7 @@ struct llama_hadamard;
 class llama_moe_cache;
 
 class llama_moe_cache;
+class llama_expert_handoff; // [TAG_EXPERT_HANDOFF]
 
 struct llama_memory_context_i;
 
@@ -824,6 +825,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const llama_expert_handoff   * expert_handoff; // [TAG_EXPERT_HANDOFF]
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -1077,6 +1079,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const llama_expert_handoff   * expert_handoff; // [TAG_EXPERT_HANDOFF]
 
     const llama_prec_policy * prec_policy;
 
@@ -1237,6 +1240,9 @@ struct llm_graph_context {
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
                      int   il) const;
+
+    // [TAG_EXPERT_HANDOFF] the experts a cache keeps in place of the host experts w (moe cache or expert handoff)
+    ggml_tensor * build_cached_experts(ggml_tensor * w) const;
 
     //
     // inputs

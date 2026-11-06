@@ -691,6 +691,26 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
         return (void *)ggml_backend_cpu_set_threadpool;
     }
 
+    // ROCmFPX [TAG_EXPERT_HANDOFF] the host side of the expert handoff
+    if (strcmp(name, "ggml_expert_handoff_host_new") == 0) {
+        return (void *)ggml_expert_handoff_host_new;
+    }
+    if (strcmp(name, "ggml_expert_handoff_host_free") == 0) {
+        return (void *)ggml_expert_handoff_host_free;
+    }
+    if (strcmp(name, "ggml_expert_handoff_host_set_layer") == 0) {
+        return (void *)ggml_expert_handoff_host_set_layer;
+    }
+    if (strcmp(name, "ggml_expert_handoff_host_wake") == 0) {
+        return (void *)ggml_expert_handoff_host_wake;
+    }
+    if (strcmp(name, "ggml_expert_handoff_host_get_stats") == 0) {
+        return (void *)ggml_expert_handoff_host_get_stats;
+    }
+    if (strcmp(name, "ggml_expert_handoff_host_counts") == 0) {
+        return (void *)ggml_expert_handoff_host_counts;
+    }
+
     return NULL;
 
     GGML_UNUSED(reg);

@@ -426,6 +426,14 @@ extern "C" {
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
 
+        // ROCmFPX [TAG_EXPERT_HANDOFF] expert handoff: the routed experts kept in host memory are split per layer
+        // between a VRAM cache of the most used ones and host threads that compute the others [EXPERIMENTAL]
+        int32_t      expert_cache;        // VRAM cache size in units of the largest expert, -1 = fill the free VRAM, 0 = off
+        int32_t      vram_reserve_mib;    // VRAM the automatic cache size leaves free, -1 = default (2048)
+        int32_t      pool_workers;        // host threads computing the experts the cache misses, 0 = auto
+        const char * expert_profile;      // routing counts to fill the cache from, NULL = none
+        const char * expert_profile_save; // file to write the routing counts to at exit, NULL = none
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution

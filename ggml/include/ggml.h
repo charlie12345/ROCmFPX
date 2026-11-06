@@ -641,6 +641,8 @@ extern "C" {
 
         GGML_OP_GATED_DELTA_NET_REPLAY,
 
+        GGML_OP_EXPERT_HANDOFF, // ROCmFPX [TAG_EXPERT_HANDOFF], see ggml-expert-handoff.h
+
         GGML_OP_COUNT,
     };
 
@@ -2717,6 +2719,40 @@ extern "C" {
             struct ggml_tensor  * hist,
             struct ggml_tensor  * rep,
             int64_t               K);
+
+    // ROCmFPX [TAG_EXPERT_HANDOFF] expert handoff (layout and protocol in ggml-expert-handoff.h)
+    // send: writes the routed experts' input and selection to the mailbox and rings it, so the host can compute the
+    //       experts the device does not hold while the device computes the others. Returns slots unchanged: the
+    //       expert matmuls read their slots from it, which orders the send before them.
+    //   x       : [n_embd, n_tokens]          F32
+    //   ids     : [n_used, n_tokens]          I32 the selected experts
+    //   slots   : [n_used, n_tokens]          I32 their cache slots, the layer's miss slot for the host's experts
+    //   weights : [1, n_used, n_tokens]       F32 the routing weights
+    // mailbox: host memory the device reads and writes in place, at the same address on both (contiguous inputs)
+    GGML_API struct ggml_tensor * ggml_expert_handoff_send(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * slots,
+            struct ggml_tensor  * weights,
+            void                * mailbox,
+            int32_t               layer,
+            int32_t               max_tokens,
+            int32_t               max_embd,
+            int32_t               max_used);
+
+    // join: waits for the host's answer to the last send on this mailbox and returns y plus the host's experts' sum
+    // (after timeout_ms without an answer it returns y alone and counts a timeout in the mailbox header)
+    //   y : [n_embd, n_tokens] F32 the device's experts' sum
+    GGML_API struct ggml_tensor * ggml_expert_handoff_join(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * y,
+            void                * mailbox,
+            int32_t               layer,
+            int32_t               max_tokens,
+            int32_t               max_embd,
+            int32_t               max_used,
+            int32_t               timeout_ms);
 
     // DSA lightning indexer
     //

@@ -390,6 +390,13 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
 
+    // [TAG_EXPERT_HANDOFF]
+    cparams.expert_cache        = params.expert_cache;
+    cparams.vram_reserve_mib    = params.vram_reserve_mib;
+    cparams.pool_workers        = params.pool_workers;
+    cparams.expert_profile      = params.expert_profile      ? params.expert_profile      : "";
+    cparams.expert_profile_save = params.expert_profile_save ? params.expert_profile_save : "";
+
     // initialized later
     cparams.pipeline_parallel = false;
     cparams.training = false;
@@ -588,7 +595,8 @@ llama_context::llama_context(
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides() &&
-            cparams.moe_cache_size == 0; // not supported by the MoE cache
+            cparams.moe_cache_size == 0 && // not supported by the MoE cache
+            cparams.expert_cache == 0;     // nor by the expert handoff (one mailbox, one stream)
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -618,6 +626,20 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+        }
+
+        // [TAG_EXPERT_HANDOFF]
+        if (cparams.expert_cache != 0) {
+            if (moe_cache) {
+                throw std::runtime_error("the expert handoff (--expert-cache) and the MoE cache (--moe-cache-mib) exclude each other");
+            }
+            llama_expert_handoff_params ehp;
+            ehp.n_slots          = cparams.expert_cache;
+            ehp.vram_reserve_mib = cparams.vram_reserve_mib;
+            ehp.n_workers        = cparams.pool_workers;
+            ehp.profile          = cparams.expert_profile;
+            ehp.profile_save     = cparams.expert_profile_save;
+            expert_handoff = std::make_unique<llama_expert_handoff>(model, backend_ptrs, backend_buft, ehp);
         }
 
         sched_reserve();
@@ -2920,6 +2942,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.expert_handoff =*/ expert_handoff.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
@@ -2968,6 +2991,12 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+
+    // [TAG_EXPERT_HANDOFF] the host pool must be spinning before the device sends it a layer
+    if (expert_handoff) {
+        expert_handoff->check();
+        expert_handoff->wake();
+    }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -3035,10 +3064,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             last++;
         }
 
-        // the experts in the MoE cache are copied from device memory, the others are uploaded
+        // the experts in the MoE cache (or the expert handoff's VRAM cache) are copied from device memory, the others are uploaded
         int64_t next = first;
-        for (int64_t e = first; e <= last && lctx->moe_cache; ) {
-            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
+        for (int64_t e = first; e <= last && (lctx->moe_cache || lctx->expert_handoff); ) {
+            const int64_t n = lctx->moe_cache ? lctx->moe_cache->copy_experts(backend, src, dst, e, last)
+                                              : lctx->expert_handoff->copy_experts(backend, src, dst, e, last);
             if (n == 0) {
                 e++;
                 continue;
@@ -3940,6 +3970,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    if (expert_handoff) {
+        for (const auto & [buft, size] : expert_handoff->memory_breakdown()) {
+            ret[buft].context += size;
+        }
+    }
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
@@ -4230,6 +4265,11 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.expert_cache                =*/ 0,
+        /*.vram_reserve_mib            =*/ -1,
+        /*.pool_workers                =*/ 0,
+        /*.expert_profile              =*/ nullptr,
+        /*.expert_profile_save         =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
