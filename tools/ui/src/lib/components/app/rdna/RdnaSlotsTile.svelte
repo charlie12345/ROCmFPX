@@ -223,7 +223,7 @@
 			></div>
 		</div>
 
-		<!-- system RAM (owner, 2026-11-07): the model's own share bright, the rest of the system dim -->
+		<!-- system RAM (owner, 2026-11-07): the whole system's use in a dimmer gray, the model's own share over it in the VRAM bar's color -->
 		{#if ram && memory?.kind !== 'RAM'}
 			<p
 				class="rf-mem-line rf-mem-ram"
@@ -445,9 +445,9 @@
 		position: relative;
 	}
 
+	/* the whole system's use (owner, 2026-11-07): a dimmer solid gray, so the bar's length is used/total */
 	.rf-ram-rest {
-		background: var(--rf-text-dim);
-		opacity: 0.35;
+		background: color-mix(in srgb, var(--rf-text-dim) 45%, var(--rf-track));
 	}
 
 	.rf-ram-own {
