@@ -102,9 +102,199 @@ jobs:
           fi
           docker run --rm --entrypoint llama-server "$IMAGE" --version
 
+  # ROCm 10.1 builds (TheRock's pip SDK), one per GPU family like TheRock's own downloads: RDNA3 (gfx110X), RDNA3.5
+  # (gfx115X), RDNA4 (gfx120X). One family per build keeps the Windows ggml-hip.dll far below the 2 GB DLL limit (all 24
+  # release targets: 2.68 GB, which Windows does not load) and the compile within a runner's day. The flags are the
+  # README's build, with a portable CPU baseline (AVX2 / FMA / F16C) instead of -march=native; the UI is the one the ui
+  # job provided. They need ROCm 10.1's bin (Windows: hipBLAS / rocBLAS) or libraries (Linux) at run time.
+  rocm-windows:
+    needs: ui
+    runs-on: windows-2022
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: gfx110X
+            targets: "gfx1100;gfx1101;gfx1102;gfx1103"
+          - family: gfx115X
+            targets: "gfx1150;gfx1151;gfx1152"
+          - family: gfx120X
+            targets: "gfx1200;gfx1201"
+    env:
+      ROCM_VERSION: "10.1.0"
+      ASSET: rdna-fast-windows-rocm-10.1-${{ matrix.family }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the build number in --version
+      - uses: actions/download-artifact@v4
+        with:
+          name: rdna-fast-ui
+          path: ui-release
+      - name: Embed the UI
+        shell: bash
+        run: mkdir -p tools/ui/dist && tar -xzf ui-release/rdna-fast-ui.tar.gz -C tools/ui/dist && test -f tools/ui/dist/index.html && rm -rf ui-release
+      - name: Install Ninja
+        run: choco install ninja -y
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: rdna-fast-windows-rocm-${{ env.ROCM_VERSION }}-${{ matrix.family }}
+          evict-old-files: 1d
+          max-size: "2G"
+      - name: Setup ROCm
+        uses: ./.github/actions/windows-setup-rocm
+        with:
+          version: ${{ env.ROCM_VERSION }}
+      - name: ROCm environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & C:\TheRock\build\.venv\Scripts\Activate.ps1
+          rocm-sdk init
+          if ($LASTEXITCODE -ne 0) { throw "rocm-sdk init failed with exit code $LASTEXITCODE" }
+          $root = (rocm-sdk path --root).Trim()
+          $bin  = (rocm-sdk path --bin).Trim()
+          # ROCm brings no resource compiler: the newest Windows SDK's rc.exe (README build step)
+          $rc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\rc.exe" | Sort-Object FullName | Select-Object -Last 1
+          if (-not $rc) { throw "no rc.exe in the Windows SDK" }
+          echo "HIP_PATH=$root" >> $env:GITHUB_ENV
+          echo "ROCM_PATH=$root" >> $env:GITHUB_ENV
+          echo "HIP_PLATFORM=amd" >> $env:GITHUB_ENV
+          echo "HIP_DEVICE_LIB_PATH=$root\lib\llvm\amdgcn\bitcode" >> $env:GITHUB_ENV
+          echo "LLVM_PATH=$root\lib\llvm" >> $env:GITHUB_ENV
+          echo "RC_EXE=$($rc.FullName -replace '\\', '/')" >> $env:GITHUB_ENV
+          echo "$bin" >> $env:GITHUB_PATH
+          echo "C:\TheRock\build\.venv\Scripts" >> $env:GITHUB_PATH
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER="$env:HIP_PATH\lib\llvm\bin\clang.exe" -DCMAKE_CXX_COMPILER="$env:HIP_PATH\lib\llvm\bin\clang++.exe" `
+            -DCMAKE_RC_COMPILER="$env:RC_EXE" -DCMAKE_PREFIX_PATH="$env:HIP_PATH" `
+            -DGGML_HIP=ON -DGPU_TARGETS="${{ matrix.targets }}" -DCMAKE_HIP_ARCHITECTURES="${{ matrix.targets }}" `
+            -DGGML_HIP_GRAPHS=ON -DGGML_HIP_NO_VMM=ON -DGGML_HIP_FORCE_MMQ=ON -DGGML_CUDA_FA_ALL_QUANTS=ON `
+            -DGGML_CUDA_GRAPHS=ON -DGGML_SCHED_MAX_COPIES=4 -DGGML_OPENMP=OFF `
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON `
+            -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_CURL=OFF `
+            -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+          cmake --build build --target llama-server llama-cli llama-bench llama-quantize -j $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+      - name: Check
+        shell: pwsh
+        run: |
+          $dll = Get-Item build\bin\ggml-hip.dll
+          "ggml-hip.dll: {0:N0} MB" -f ($dll.Length / 1MB)
+          if ($dll.Length -ge 1.9GB) { throw "ggml-hip.dll is $($dll.Length) bytes: Windows does not load DLLs of 2 GB or more" }
+          foreach ($f in 'amdhip64_7.dll', 'amd_comgr.dll', 'rocm_kpack.dll') { if (-not (Test-Path "build\bin\$f")) { throw "HIP runtime not bundled: $f" } }
+          build\bin\llama-server.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "llama-server --version failed" }
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory stage, stage\licenses | Out-Null
+          foreach ($f in 'llama-server.exe', 'llama-cli.exe', 'llama-bench.exe', 'llama-quantize.exe') { Copy-Item "build\bin\$f" stage\ }
+          Copy-Item build\bin\*.dll stage\
+          Copy-Item LICENSE, NOTICE stage\
+          Copy-Item licenses\* stage\licenses\ -Recurse
+          7z a "$env:ASSET.zip" .\stage\*
+          (Get-FileHash "$env:ASSET.zip" -Algorithm SHA256).Hash.ToLower() + "  $env:ASSET.zip" | Out-File -Encoding ascii "$env:ASSET.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}.zip*
+
+  rocm-linux:
+    needs: ui
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: gfx110X
+            targets: "gfx1100;gfx1101;gfx1102;gfx1103"
+          - family: gfx115X
+            targets: "gfx1150;gfx1151;gfx1152"
+          - family: gfx120X
+            targets: "gfx1200;gfx1201"
+    env:
+      ROCM_VERSION: "10.1.0"
+      ASSET: rdna-fast-linux-rocm-10.1-${{ matrix.family }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: rdna-fast-ui
+          path: ui-release
+      - name: Embed the UI
+        run: mkdir -p tools/ui/dist && tar -xzf ui-release/rdna-fast-ui.tar.gz -C tools/ui/dist && test -f tools/ui/dist/index.html && rm -rf ui-release
+      - name: Free up disk space
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: rdna-fast-linux-rocm-${{ env.ROCM_VERSION }}-${{ matrix.family }}
+          evict-old-files: 1d
+          max-size: "2G"
+      - name: Tune ccache for the reinstalled ROCm toolchain
+        # the pip-installed clang gets a new mtime every run: hash its contents instead
+        run: |
+          ccache --set-config=compiler_check=content
+          ccache --set-config=sloppiness=time_macros,include_file_mtime,include_file_ctime
+      - name: Dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake git ninja-build
+      - name: Setup ROCm
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm[libraries,devel]==${ROCM_VERSION}"
+          rocm-sdk init
+          ROCM_ROOT=$(rocm-sdk path --root)
+          echo "ROCM_PATH=$ROCM_ROOT" >> "$GITHUB_ENV"
+          echo "HIP_PATH=$ROCM_ROOT" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=$(rocm-sdk path --cmake)" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$ROCM_ROOT/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "$(rocm-sdk path --bin)" >> "$GITHUB_PATH"
+          echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" -DHIP_PLATFORM=amd \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_HIP=ON -DGPU_TARGETS="${{ matrix.targets }}" -DCMAKE_HIP_ARCHITECTURES="${{ matrix.targets }}" \
+            -DGGML_HIP_GRAPHS=ON -DGGML_HIP_NO_VMM=ON -DGGML_HIP_FORCE_MMQ=ON -DGGML_CUDA_FA_ALL_QUANTS=ON \
+            -DGGML_CUDA_GRAPHS=ON -DGGML_SCHED_MAX_COPIES=4 -DGGML_OPENMP=OFF \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+            -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
+          cmake --build build --target llama-server llama-cli llama-bench llama-quantize -j "$(nproc)"
+      - name: Check
+        run: ./build/bin/llama-server --version
+      - name: Package
+        run: |
+          mkdir -p stage/bin stage/lib stage/licenses
+          cp build/bin/llama-server build/bin/llama-cli build/bin/llama-bench build/bin/llama-quantize stage/bin/
+          cp -a build/bin/*.so* stage/bin/ 2>/dev/null || true
+          cp LICENSE NOTICE stage/
+          cp -a licenses/. stage/licenses/
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf "$ASSET.tar.gz" -C stage .
+          sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}.tar.gz*
+
   github-release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [ui, linux-cpu, container]
+    needs: [ui, linux-cpu, container, rocm-windows, rocm-linux]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -120,6 +310,11 @@ jobs:
       - name: Add the UI
         # rdna-fast-ui.tar.gz on the release itself: a build of this tag downloads exactly this UI
         run: cp ui-release/rdna-fast-ui.tar.gz ui-release/rdna-fast-ui.tar.gz.sha256 dist/
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rdna-fast-*-rocm-*
+          path: dist
+          merge-multiple: true
       - name: Publish prerelease
         env:
           GH_TOKEN: ${{ github.token }}
