@@ -56,17 +56,17 @@
 <text x="765.1" y="652" fill="#9A9FA8" font-size="15">738 t/s</text>
 <text x="1136" y="645" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+40%</text>
 <text x="64" y="703" fill="#F4F4F5" font-size="17">4.3k new tokens at 17k depth</text>
-<rect x="420" y="680" width="402.8" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
-<text x="832.8" y="694" fill="#F4F4F5" font-size="17" font-weight="800">887 t/s</text>
+<rect x="420" y="680" width="410.5" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
+<text x="840.5" y="694" fill="#F4F4F5" font-size="17" font-weight="800">904 t/s</text>
 <rect x="420" y="702" width="320.1" height="17" rx="4" fill="#5B6068"/>
 <text x="750.1" y="716" fill="#9A9FA8" font-size="15">705 t/s</text>
-<text x="1136" y="709" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+26%</text>
+<text x="1136" y="709" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+28%</text>
 <text x="64" y="767" fill="#F4F4F5" font-size="17">4.0k new tokens at 41k depth</text>
-<rect x="420" y="744" width="321.5" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
-<text x="751.5" y="758" fill="#F4F4F5" font-size="17" font-weight="800">708 t/s</text>
+<rect x="420" y="744" width="322.4" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
+<text x="752.4" y="758" fill="#F4F4F5" font-size="17" font-weight="800">710 t/s</text>
 <rect x="420" y="766" width="246.6" height="17" rx="4" fill="#5B6068"/>
 <text x="676.6" y="780" fill="#9A9FA8" font-size="15">543 t/s</text>
-<text x="1136" y="773" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+30%</text>
+<text x="1136" y="773" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+31%</text>
 <rect x="40" y="820" width="1120" height="110" rx="14" fill="#141417" stroke="#26262B"/>
 <text x="64" y="851" fill="#ED1C24" font-size="17" font-weight="800" letter-spacing="2">TEXT COPY BOOST</text>
 <text x="276" y="851" fill="#9A9FA8" font-size="14">decode t/s when the answer copies the prompt (n-gram drafting)</text>
@@ -75,5 +75,5 @@
 <text x="900.0" y="884" fill="#F4F4F5" font-size="17" font-weight="800">315 t/s</text>
 <text x="420" y="906" fill="#9A9FA8" font-size="15">unavailable</text>
 <text x="56" y="962" fill="#9A9FA8" font-size="13">RX 7900 XT 20 GB, October and November 2026. Both: Swift 1.5 (Qwen3.8-27B) IQ4_XS, -c 98304, MTP draft, q4_0 KV cache, two sessions.</text>
-<text x="56" y="982" fill="#9A9FA8" font-size="13">This runtime: ROCm 10.1, -ub 2048, WMMA GEMM for prompts, best of four runs. LM Studio: ROCm llama.cpp runtime 2.69.0, batch 2048 / 1024, best of two.</text>
+<text x="56" y="982" fill="#9A9FA8" font-size="13">This runtime: ROCm 10.1, -ub 2048, WMMA GEMM for prompts, best of six runs. LM Studio: ROCm llama.cpp runtime 2.69.0, batch 2048 / 1024, best of two.</text>
 </svg>
