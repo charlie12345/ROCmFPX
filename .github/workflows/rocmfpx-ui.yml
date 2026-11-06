@@ -1,0 +1,83 @@
+name: ROCmFPX UI
+
+# ROCmFPX [TAG_UI_PREBUILT_GH] (RDNA-FAST): the prebuilt web UI that -DLLAMA_USE_PREBUILT_UI=ON (the default) downloads,
+# published as the rolling GitHub release ui-latest (rdna-fast-ui.tar.gz, .sha256, and rdna-fast-ui.tree = the git tree
+# id of tools/ui it was built from). npm runs only when tools/ui changed since that build: otherwise the published
+# archive is reused. Runs on pushes to main that touch tools/ui, by hand, and from rocmfpx-release.yml, whose builds
+# embed the artifact this uploads (rdna-fast-ui).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/ui/**'
+      - '.github/workflows/rocmfpx-ui.yml'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: write
+
+jobs:
+  ui:
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: rocmfpx-ui-latest
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the UI's version is b<commit count>
+
+      - name: Compare with the published UI
+        id: published
+        run: |
+          tree="$(git rev-parse HEAD:tools/ui)"
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+          mkdir -p ui-release
+          if gh release download ui-latest -p 'rdna-fast-ui.*' -D ui-release 2>/dev/null \
+             && [ "$(cat ui-release/rdna-fast-ui.tree 2>/dev/null)" = "$tree" ] \
+             && (cd ui-release && sha256sum -c rdna-fast-ui.tar.gz.sha256); then
+            echo "ui-latest was built from tools/ui $tree: reusing it"
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tools/ui $tree is not what ui-latest was built from: building"
+            rm -rf ui-release && mkdir -p ui-release
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.published.outputs.fresh != 'true'
+        with:
+          node-version: "24"
+
+      - name: Build
+        if: steps.published.outputs.fresh != 'true'
+        working-directory: tools/ui
+        run: |
+          npm ci
+          LLAMA_BUILD_NUMBER="b$(git rev-list --count HEAD)" npm run build
+          npx vitest --project=unit --run tests/unit/pwa.spec.ts
+
+      - name: Package and publish ui-latest
+        if: steps.published.outputs.fresh != 'true'
+        run: |
+          test -f tools/ui/dist/index.html
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf ui-release/rdna-fast-ui.tar.gz -C tools/ui/dist .
+          (cd ui-release && sha256sum rdna-fast-ui.tar.gz > rdna-fast-ui.tar.gz.sha256)
+          echo "${{ steps.published.outputs.tree }}" > ui-release/rdna-fast-ui.tree
+          notes="The web UI for builds with -DLLAMA_USE_PREBUILT_UI=ON (the default). Built from ${GITHUB_SHA} (tools/ui tree ${{ steps.published.outputs.tree }}); rebuilt only when tools/ui changes."
+          if ! gh release view ui-latest >/dev/null 2>&1; then
+            gh release create ui-latest --prerelease --target "$GITHUB_SHA" --title "Web UI (latest)" --notes "$notes"
+          fi
+          gh release upload ui-latest ui-release/rdna-fast-ui.tar.gz ui-release/rdna-fast-ui.tar.gz.sha256 ui-release/rdna-fast-ui.tree --clobber
+          gh release edit ui-latest --notes "$notes"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rdna-fast-ui
+          path: ui-release/
+          retention-days: 3

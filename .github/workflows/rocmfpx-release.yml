@@ -9,12 +9,26 @@ permissions:
   contents: read
 
 jobs:
+  # [TAG_UI_PREBUILT_GH] the web UI: ui-latest's archive when tools/ui has not changed since it was built, else built now
+  # (and ui-latest refreshed); the builds below embed it, and the release carries it as rdna-fast-ui.tar.gz
+  ui:
+    permissions:
+      contents: write
+    uses: ./.github/workflows/rocmfpx-ui.yml
+
   linux-cpu:
+    needs: ui
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          name: rdna-fast-ui
+          path: ui-release
+      - name: Embed the UI
+        run: mkdir -p tools/ui/dist && tar -xzf ui-release/rdna-fast-ui.tar.gz -C tools/ui/dist && test -f tools/ui/dist/index.html
       - name: Build and test
         run: |
           cmake -S . -B build -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON
@@ -38,6 +52,7 @@ jobs:
           path: rocmfpx-linux-x86_64.tar.gz*
 
   container:
+    needs: ui
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -46,6 +61,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          name: rdna-fast-ui
+          path: ui-release
+      - name: Embed the UI
+        # the Dockerfile copies the tree (tools/ui/dist included) and the build embeds it
+        run: mkdir -p tools/ui/dist && tar -xzf ui-release/rdna-fast-ui.tar.gz -C tools/ui/dist && rm -rf ui-release
       - uses: docker/setup-buildx-action@v3
       - name: Normalize image name
         id: image
@@ -82,7 +104,7 @@ jobs:
 
   github-release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux-cpu, container]
+    needs: [ui, linux-cpu, container]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -91,7 +113,15 @@ jobs:
         with:
           name: rocmfpx-linux-x86_64
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: rdna-fast-ui
+          path: ui-release
+      - name: Add the UI
+        # rdna-fast-ui.tar.gz on the release itself: a build of this tag downloads exactly this UI
+        run: cp ui-release/rdna-fast-ui.tar.gz ui-release/rdna-fast-ui.tar.gz.sha256 dist/
       - name: Publish prerelease
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: gh release create "$GITHUB_REF_NAME" --verify-tag --prerelease --generate-notes dist/*

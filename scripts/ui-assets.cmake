@@ -5,6 +5,11 @@
 #   2. If BUILD_UI=ON: npm build
 #   3. If above did not produce assets and HF_ENABLED=ON: HF Bucket download
 #      of dist.tar.gz (verified against dist.tar.gz.sha256)
+#      ROCmFPX [TAG_UI_PREBUILT_GH] (RDNA-FAST): with GH_REPO set, the download
+#      comes from that repository's GitHub releases instead (rdna-fast-ui.tar.gz,
+#      verified against rdna-fast-ui.tar.gz.sha256): the release GH_TAG when the
+#      checkout is a release tag, then the rolling release ui-latest. The HF
+#      bucket (ggml-org/llama-ui) holds llama.cpp's UI, not this one.
 
 cmake_minimum_required(VERSION 3.18)
 
@@ -15,6 +20,9 @@ set(HF_BUCKET         "" CACHE STRING "Hugging Face bucket name")
 set(HF_VERSION        "" CACHE STRING "Version to download (empty = resolve from git)")
 set(HF_ENABLED        "" CACHE STRING "Whether to allow HF Bucket download (ON/OFF)")
 set(BUILD_UI          "" CACHE STRING "Build UI via npm (ON/OFF)")
+set(GH_REPO           "" CACHE STRING "GitHub repository whose releases carry the prebuilt UI (empty = HF bucket)")
+set(GH_TAG            "" CACHE STRING "The checkout's release tag, if it is one")
+set(GH_URL            "" CACHE STRING "Release download base (default https://github.com/<GH_REPO>/releases/download)")
 set(LLAMA_UI_GZIP     "" CACHE STRING "Apply gzip compress to assets to save bandwidth")
 
 set(DIST_DIR     "${UI_BINARY_DIR}/dist")
@@ -517,6 +525,100 @@ function(hf_download version out_var out_resolved)
     endforeach()
 endfunction()
 
+# ROCmFPX [TAG_UI_PREBUILT_GH]: rdna-fast-ui.tar.gz from GH_REPO's GitHub releases (GH_TAG, then ui-latest), verified like
+# hf_download (the checksum file first; a matching local archive is not downloaded again)
+function(gh_download out_var out_resolved)
+    set(${out_var}      FALSE PARENT_SCOPE)
+    set(${out_resolved} ""    PARENT_SCOPE)
+
+    set(archive "${UI_BINARY_DIR}/rdna-fast-ui.tar.gz")
+    set(url_base "${GH_URL}")
+    if("${url_base}" STREQUAL "")
+        set(url_base "https://github.com/${GH_REPO}/releases/download")
+    endif()
+
+    # the checkout's own release, when it is exactly a v* release tag
+    set(tag "${GH_TAG}")
+    if("${tag}" STREQUAL "" AND NOT "${LLAMA_SOURCE_DIR}" STREQUAL "")
+        find_program(GIT_EXE git)
+        if(GIT_EXE)
+            execute_process(COMMAND "${GIT_EXE}" describe --tags --exact-match --match "v[0-9]*" HEAD
+                WORKING_DIRECTORY "${LLAMA_SOURCE_DIR}" OUTPUT_VARIABLE tag ERROR_QUIET
+                OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE git_rc)
+            if(NOT git_rc EQUAL 0 OR NOT tag MATCHES "^v[0-9A-Za-z._-]+$")
+                set(tag "")
+            endif()
+        endif()
+    endif()
+
+    set(candidates "")
+    if(NOT "${tag}" STREQUAL "")
+        list(APPEND candidates "${tag}")
+    endif()
+    list(APPEND candidates "ui-latest")
+
+    foreach(resolved ${candidates})
+        set(base "${url_base}/${resolved}")
+        message(STATUS "UI: downloading from ${GH_REPO} release ${resolved}: ${base}/rdna-fast-ui.tar.gz")
+
+        file(DOWNLOAD "${base}/rdna-fast-ui.tar.gz.sha256" "${archive}.sha256" STATUS status TIMEOUT 30)
+        list(GET status 0 rc)
+        if(NOT rc EQUAL 0)
+            list(GET status 1 errmsg)
+            message(STATUS "UI: download rdna-fast-ui.tar.gz.sha256 from ${resolved} failed: ${errmsg}")
+            continue()
+        endif()
+
+        file(READ "${archive}.sha256" expected)
+        string(REGEX MATCH "^[0-9a-fA-F]+" expected "${expected}")
+        string(TOLOWER "${expected}" expected)
+        string(LENGTH "${expected}" expected_len)
+        if(NOT expected_len EQUAL 64)
+            message(STATUS "UI: invalid checksum from ${resolved}")
+            continue()
+        endif()
+
+        set(actual "")
+        if(EXISTS "${archive}")
+            file(SHA256 "${archive}" actual)
+        endif()
+
+        if("${actual}" STREQUAL "${expected}" AND EXISTS "${DIST_DIR}/index.html")
+            message(STATUS "UI: local rdna-fast-ui.tar.gz matches checksum from ${resolved}, skipping download")
+            set(${out_var}      TRUE          PARENT_SCOPE)
+            set(${out_resolved} "${resolved}" PARENT_SCOPE)
+            return()
+        endif()
+        if(NOT "${actual}" STREQUAL "${expected}")
+            file(DOWNLOAD "${base}/rdna-fast-ui.tar.gz" "${archive}" STATUS status TIMEOUT 300)
+            list(GET status 0 rc)
+            if(NOT rc EQUAL 0)
+                list(GET status 1 errmsg)
+                message(STATUS "UI: download rdna-fast-ui.tar.gz from ${resolved} failed: ${errmsg}")
+                continue()
+            endif()
+            file(SHA256 "${archive}" actual)
+            if(NOT "${actual}" STREQUAL "${expected}")
+                message(STATUS "UI: checksum mismatch for rdna-fast-ui.tar.gz from ${resolved}")
+                continue()
+            endif()
+        endif()
+
+        file(REMOVE "${STAMP_FILE}")
+        file(REMOVE_RECURSE "${DIST_DIR}")
+        file(ARCHIVE_EXTRACT INPUT "${archive}" DESTINATION "${DIST_DIR}")
+        if(NOT EXISTS "${DIST_DIR}/index.html")
+            message(STATUS "UI: archive from ${resolved} is missing required assets")
+            continue()
+        endif()
+
+        message(STATUS "UI: archive verified and extracted")
+        set(${out_var}      TRUE          PARENT_SCOPE)
+        set(${out_resolved} "${resolved}" PARENT_SCOPE)
+        return()
+    endforeach()
+endfunction()
+
 # ---------------------------------------------------------------------------
 # 1. Priority 1: pre-built assets supplied in tools/ui/dist
 # ---------------------------------------------------------------------------
@@ -543,7 +645,16 @@ endif()
 # ---------------------------------------------------------------------------
 # 3. Priority 3: HF Bucket download (if npm did not produce assets and HF_ENABLED=ON)
 # ---------------------------------------------------------------------------
-if(NOT provisioned AND HF_ENABLED)
+if(NOT provisioned AND HF_ENABLED AND NOT "${GH_REPO}" STREQUAL "")
+    # ROCmFPX [TAG_UI_PREBUILT_GH]: this repository's releases, never the HF bucket
+    gh_download(GH_OK GH_RESOLVED)
+    if(GH_OK)
+        message(STATUS "UI: GitHub release download succeeded (${GH_REPO}, ${GH_RESOLVED})")
+        set(provisioned TRUE)
+    else()
+        message(STATUS "UI: GitHub release download failed")
+    endif()
+elseif(NOT provisioned AND HF_ENABLED)
     resolve_version(VERSION)
 
     # Stamp a successful HF download: records bucket + requested version and
@@ -580,6 +691,11 @@ endif()
 if(NOT provisioned)
     if(EXISTS "${DIST_DIR}/index.html")
         message(WARNING "UI: provisioning failed; embedding stale assets from ${DIST_DIR}")
+    elseif(NOT "${GH_REPO}" STREQUAL "")
+        message(WARNING "UI: no assets available - building without an embedded UI. "
+                        "Build it with -DLLAMA_BUILD_UI=ON (needs Node.js), or download "
+                        "rdna-fast-ui.tar.gz from https://github.com/${GH_REPO}/releases "
+                        "and extract it to tools/ui/dist.")
     else()
         message(WARNING "UI: no assets available - building without an embedded UI. "
                         "In a disconnected environment, download the pre-built UI "
