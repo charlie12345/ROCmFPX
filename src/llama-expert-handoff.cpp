@@ -153,6 +153,8 @@ struct llama_expert_handoff::impl {
     ggml_expert_handoff_host_t host = nullptr;
     int32_t timeout_ms = 1000;
     mutable uint32_t timeouts_seen = 0;
+    mutable int64_t t_report = 0;              // the periodic report in check()
+    mutable ggml_expert_handoff_stats last = {};
 
     // routing counts loaded from the profile [il][e]
     std::vector<std::vector<uint64_t>> profile_counts;
@@ -465,12 +467,14 @@ struct llama_expert_handoff::impl {
         LLAMA_LOG_INFO("%s: expert profile %s: %zu layers\n", __func__, params.profile.c_str(), n_read);
     }
 
-    void save_profile() const {
+    void save_profile(bool verbose = true) const {
         const std::string & path = params.profile_save;
         if (path.empty() || host == nullptr) {
             return;
         }
-        FILE * f = fopen(path.c_str(), "w");
+        // written next to the target and renamed, so a reader never sees half a file
+        const std::string tmp = path + ".tmp";
+        FILE * f = fopen(tmp.c_str(), "w");
         if (f == nullptr) {
             LLAMA_LOG_WARN("%s: cannot write the expert profile to %s\n", __func__, path.c_str());
             return;
@@ -494,7 +498,14 @@ struct llama_expert_handoff::impl {
             fprintf(f, "\n");
         }
         fclose(f);
-        LLAMA_LOG_INFO("%s: expert profile written to %s\n", __func__, path.c_str());
+        std::remove(path.c_str());
+        if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+            LLAMA_LOG_WARN("%s: cannot replace the expert profile %s\n", __func__, path.c_str());
+            return;
+        }
+        if (verbose) {
+            LLAMA_LOG_INFO("%s: expert profile written to %s\n", __func__, path.c_str());
+        }
     }
 
     bool use(int32_t il, int64_t n_tokens, int32_t act) const {
@@ -577,6 +588,30 @@ struct llama_expert_handoff::impl {
             LLAMA_LOG_ERROR("%s: %u layer(s) gave up waiting for the host experts (%d ms each); their output lacks those experts\n",
                 __func__, n - timeouts_seen, timeout_ms);
             timeouts_seen = n;
+        }
+
+        // every 30 s of use: the hit rate and the host's time per layer since the last report
+        const int64_t now = ggml_time_us();
+        if (host != nullptr && now - t_report > 30*1000*1000) {
+            ggml_expert_handoff_stats st = {};
+            api.get_stats(host, &st);
+            uint64_t n_routed = 0;
+            for (int32_t c : device_counts()) {
+                n_routed += (uint32_t) c;
+            }
+            const uint64_t d_routed = n_routed - last.n_routed;
+            const uint64_t d_host   = st.n_host - last.n_host;
+            const uint64_t d_layers = st.n_layers - last.n_layers;
+            const uint64_t d_busy   = st.busy_ns - last.busy_ns;
+            if (d_routed > 0) {
+                LLAMA_LOG_INFO("%s: %" PRIu64 " routed experts, VRAM hit rate %.1f%%, %" PRIu64 " layers sent to the host, %.0f us each\n",
+                    __func__, d_routed, 100.0*(1.0 - (double) d_host/d_routed), d_layers, d_layers ? d_busy/1000.0/d_layers : 0.0);
+            }
+            last = st;
+            last.n_routed = n_routed;
+            t_report = now;
+            // keep what was learned if the process ends without a clean exit
+            save_profile(false);
         }
     }
 };
