@@ -1,5 +1,10 @@
 # Swift-1.5-Qwen3.8-27B ROCmFP4-FP6
 
+Status, 7 November 2026: no longer the production quant. Production has run
+Swift 1.5 IQ4_XS since 25 October 2026 (see the
+[main README](../../README.md#quick-start), which compares the two). This quant
+remains the ROCmFPX-optimised alternative.
+
 A 4-bit ROCmFP4 quantization of
 [Swift 1.5 Qwen3.8-27B](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b)
 (UkisAI's Qwen3.8-27B fine-tune) that promotes the 61 most sensitive tensors
@@ -33,8 +38,8 @@ Promoted tensors:
 | `attn_k`, `attn_v`, `attn_output` | 3 x 17 | the 16 full-attention layers (3, 7, 11, ... 63) and the MTP block 64 |
 | `ffn_down` | 8 | boundary layers 0, 1, 2, 3, 61, 62, 63, 64 |
 
-Why this shape: on RDNA3 the K-quants decode about 60% slower than the ROCmFP4
-kernel path, so a mixture that promotes to `Q5_K`/`Q6_K` (what the automatic
+Why this shape: on RDNA3 the K-quants decode slower than the ROCmFP4 kernel
+path, so a mixture that promotes to `Q5_K`/`Q6_K` (what the automatic
 planner picks) pays for its quality in speed. `Q6_0_ROCMFPX` stays on the fast
 path. The promoted set is the planner's own sensitivity ranking, re-expressed
 in that type. The attention promotions are nearly free (GQA, 4 KV heads); the
@@ -91,19 +96,8 @@ Perplexity, wikitext-2 test, 580 chunks, `-c 512 -b 512 -fa on`, f16 KV:
 | --- | ---: | ---: |
 | `ROCmFP4-FP6` (61 tensors) | 7.1516 ± 0.048 | 14.97 |
 
-Speed and memory on 9 and 10 October 2026, served with `-c 106496` on two
-slots, q4_0 KV, MTP draft `n-max 4` over 16,384 candidate tokens
-(`ROCMFPX_DRAFT_VOCAB`), six query heads per attention block
-(`GGML_HIP_FA_GQA6`), `-ub 1024`, vision `mmproj` on the CPU:
-
-| measure | value |
-| --- | ---: |
-| prose / code decode, MTP, tok/s, median (peak) | 50.1 (53.2) / 73.4 (81.8) |
-| decode at 41k depth, MTP, tok/s | 55.9 |
-| decode without MTP, tok/s | 34.6 |
-| prefill of a cold 17k / 41k prompt, tok/s | 679 / 621 |
-| the same without the MTP draft, tok/s | 701 / 640 |
-| VRAM at load, GB | 18.89 dedicated + 0.79 shared |
+Speed: its prompts run about 2% faster than Swift 1.5 IQ4_XS. The earlier
+speed measurements came from older builds and are no longer shown.
 
 Reasoning effort, 50 runs per setting (4 tool-calling agentic tasks x 3,
 10 reasoning tasks x 2, 9 harder python-verified tasks x 2, temperature 1,
@@ -148,7 +142,8 @@ answer.
 
 ## Reasoning cap
 
-In production this model runs with `--reasoning-budget 4096`. Over its first
+In production, until 25 October 2026, this quant ran with
+`--reasoning-budget 4096`; Swift 1.5 IQ4_XS runs with the same cap. Over its first
 three weeks in production, 27 September to 19 October 2026 (7,231 model calls
 from nine agents), it thought 104 tokens per call at the median. 95% of the
 calls stayed under 1,479 tokens and 99% under 3,863; the longest took 17,160.

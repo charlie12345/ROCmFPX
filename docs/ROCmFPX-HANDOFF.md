@@ -1,5 +1,11 @@
 # ROCmFPX Handoff
 
+> **Note (2026-11-07):** This is the June 2026 handoff from the legacy ROCmFPX
+> tree (Strix Halo, Linux). Since the 2026-09-15 merge of the ROCmFPX org repo,
+> `-ctk`/`-ctv` take only the stock cache types, so the K-cache guard and the
+> TurboQuant serving profiles it described are gone; the current format table
+> is in [docs/rocmfpx/README.md](rocmfpx/README.md).
+
 This is the working handoff for the experimental ROCmFPX branch. It is written
 for the next reviewer or agent that needs to continue the family without
 reconstructing the intent from commit history.
@@ -13,6 +19,9 @@ tree. It is not a new K/V-only compression layer. The model-file presets are:
 - `Q6_0_ROCMFPX`
 - `Q8_0_ROCMFPX`
 
+Added later: `Q2_0_ROCMFPX`, `Q5_0_ROCMFPX` and `Q7_0_ROCMFPX`, plus the
+`Q6_0_ROCMFPX_LEAN` and `Q6_0_ROCMFPX_AGENT_LEAN` routings.
+
 The ROCmFP4 path stays the reference for block shape, scale discipline, kernel
 coverage, and dequant semantics. K/V cache flags remain runtime settings in
 llama.cpp and should not be treated as model quant formats.
@@ -24,9 +33,9 @@ The local experimental branch carries:
 - ROCmFPX format docs and validation notes
 - agent-oriented quant wrapper scripts
 - agentic smoke tests for chat, coding, JSON, tool-call, coherency, and stream
-- ROCmFP4 and ROCmFPX cache handling adjustments
-- the K-cache coherency guard that promotes fp3 K cache to a safer higher-bit
-  type at runtime
+- ROCmFP4 and ROCmFPX cache handling adjustments, and the K-cache coherency
+  guard that promoted fp3 K cache to a higher-bit type (both removed on
+  2026-09-15, see the K/V cache rule below)
 
 ## Family Contract
 
@@ -56,6 +65,7 @@ JSON-heavy workloads:
 - `Q3_0_ROCMFPX_AGENT`
 - `Q6_0_ROCMFPX_AGENT`
 - `Q8_0_ROCMFPX_AGENT`
+- `Q2_0_ROCMFPX_AGENT`, `Q5_0_ROCMFPX_AGENT`, `Q7_0_ROCMFPX_AGENT` (added later)
 - `Q4_0_ROCMFP4_COHERENT` for ROCmFP4 agent-oriented builds
 
 These presets do not change the tensor layout. They spend extra precision on the
@@ -73,25 +83,20 @@ calls.
 
 ## K/V Cache Rule
 
-The ROCmFPX model family is separate from cache quantization, but cache types
-still matter at runtime.
+The ROCmFPX model family is separate from cache quantization.
 
-- `Q3_0_ROCMFPX` is usable for V cache.
-- `Q3_0_ROCMFPX` is not acceptable for K cache in the current build.
-- `common/common.cpp` promotes `-ctk q3_0_rocmfpx` to `q6_0_rocmfpx` and logs a
-  warning.
-- TurboQuant cache types `turbo3` and `turbo4` are already present in this tree.
-  They are runtime K/V cache types, not ROCmFPX model-weight formats.
-- The safe TurboQuant+ style serving policy is asymmetric: keep K higher
-  precision and compress V, for example `-ctk q8_0 -ctv turbo4`.
-- Symmetric TurboQuant sweeps can opt into first/last-layer protection with
-  `LLAMA_KV_TURBO_BOUNDARY_LAYERS=2`. That keeps K cache at `q8_0` for the
-  first and last two model layers while leaving middle layers on the requested
-  TurboQuant type. `LLAMA_KV_TURBO_BOUNDARY_V=1` also protects V cache, but
-  leave it off unless a test specifically needs it.
+Since the 2026-09-15 merge of the ROCmFPX org repo, `-ctk`/`-ctv` and the
+draft's `-ctkd`/`-ctvd` accept only the stock types `f32`, `f16`, `bf16`,
+`q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0` and `q5_1`. What this section
+described before that is gone:
 
-This is a coherency safeguard, not a new compression scheme. It keeps fp3 K
-cache above the observed tool-call / agent floor.
+- `q3_0_rocmfpx`, `q6_0_rocmfpx` and the other ROCmFP4/ROCmFPX types as cache
+  types, and the `common/common.cpp` guard that promoted `-ctk q3_0_rocmfpx`
+  to `q6_0_rocmfpx`.
+- `turbo3` and `turbo4` as cache types (the asymmetric `-ctk q8_0 -ctv turbo4`
+  profile). The TurboQuant kernels are still in ggml, but no flag selects them.
+- `LLAMA_KV_TURBO_BOUNDARY_LAYERS` and `LLAMA_KV_TURBO_BOUNDARY_V`, which are
+  no longer read.
 
 Do not merge the Python `turboquant_plus` package directly into this repository.
 The useful low-risk lesson from that repo is policy, not a new kernel import:
@@ -111,6 +116,9 @@ Use the repo’s existing build scripts for the relevant GPU family:
 | RDNA3 (`gfx1100` class) | `scripts/build-rdna3.sh` |
 | RDNA4 (`gfx1200` class) | `scripts/build-rdna4.sh` |
 
+These are bash scripts for Linux. On Windows, build with CMake as in the
+[README quick start](../README.md#quick-start).
+
 The usual local build pattern is:
 
 ```bash
@@ -121,34 +129,17 @@ For Strix Halo runs, the working runtime pattern is:
 
 ```bash
 HSA_OVERRIDE_GFX_VERSION=11.5.1 \
-GGML_HIP_ENABLE_UNIFIED_MEMORY=1 \
+GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
 ./build-strix-rocmfp4/bin/llama-cli -m /path/to/model.gguf -dev ROCm0 -ngl 999
 ```
 
-TurboQuant asymmetric MTP serving:
+The AMD-named `GGML_HIP_ENABLE_UNIFIED_MEMORY` alias is no longer read since
+2026-09-15; ggml reads only `GGML_CUDA_ENABLE_UNIFIED_MEMORY`.
 
-```bash
-MODEL=/path/to/model-Q6_0_ROCMFPX_AGENT.gguf \
-DEVICE=Vulkan0 \
-scripts/run-rocmfpx-turboquant-asym-server.sh
-```
-
-The wrapper sets:
-
-- `CACHE_TYPE_K=q8_0`
-- `CACHE_TYPE_V=turbo4`
-- `CACHE_TYPE_K_DRAFT=q8_0`
-- `CACHE_TYPE_V_DRAFT=turbo4`
-
-Boundary-protected symmetric TurboQuant test:
-
-```bash
-LLAMA_KV_TURBO_BOUNDARY_LAYERS=2 \
-CACHE_TYPE_K=turbo4 \
-CACHE_TYPE_V=turbo4 \
-MODEL=/path/to/model.gguf \
-scripts/run-rocmfpx-mtp-server.sh
-```
+The TurboQuant serving commands that stood here
+(`scripts/run-rocmfpx-turboquant-asym-server.sh`, and
+`scripts/run-rocmfpx-mtp-server.sh` with `turbo4` caches and
+`LLAMA_KV_TURBO_BOUNDARY_LAYERS`) no longer start: the server rejects `turbo4`.
 
 ## How To Quant
 
@@ -239,9 +230,12 @@ The script now refuses to start if ROCm already reports an active KFD process,
 and it idles briefly before loading the next model. That was added to make
 “clear VRAM before each test” a concrete rule instead of a memory-based one.
 
+The script still passes `--mmap`, which current builds reject (removed on
+2026-10-02; use `--load-mode mmap`), so it needs that change before it runs.
+
 ## Observed Local Results
 
-These are the current local reference points from the Strix Halo workspace:
+These are the June 2026 reference points from the Strix Halo workspace:
 
 - ROCmFP8 agent quant from BF16: `31,568.94 MiB`, `8.39 BPW`
 - ROCmFP4 agent quant from BF16: `17,136.79 MiB`, `4.55 BPW`
@@ -258,8 +252,8 @@ If you are extending the family, check these first:
 2. `ggml/rocmfpx/README.md`
 3. `scripts/quantize-rocmfpx-agent.sh`
 4. `scripts/check-rocmfpx-agentic-smoke.sh`
-5. `src/llama-kv-cache.cpp`
-6. `common/common.cpp`
+5. `docs/rocmfpx/FORMATS.md`
+6. `src/llama-quant.cpp` (the agent tensor routing)
 
 The point of the branch is to keep the ROCmFPX family straightforward:
 straight quants when the user wants size and speed, agent presets when they want

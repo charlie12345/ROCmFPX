@@ -6,27 +6,27 @@ RDNA3, RDNA4), see [`BUILD-AMD-ARCHITECTURES.md`](BUILD-AMD-ARCHITECTURES.md).
 Use this repository when you want the ready-to-build llama.cpp fork with
 ROCmFP4, MTP, ROCm/HIP, and Vulkan integration already applied.
 
-Reference repository:
-
 ```bash
-git clone https://github.com/charlie12345/rocmfp4-llama.git
-cd rocmfp4-llama
-git checkout mtp-rocmfp4-strix
+git clone https://github.com/serrynaimo/RDNA-FAST.git
+cd RDNA-FAST
 ```
 
-If the repository is private, public users cannot clone it from a Twitter link.
-Make it public or invite collaborators before sharing install instructions.
+This guide comes from ROCmFPX, whose proof target was Strix Halo. RDNA-FAST is
+tuned and measured on an RX 7900 XT (`gfx1100`); on `gfx1151` it is checked to
+build (see [Other cards](../README.md#other-cards) in the README). On Windows,
+build with ROCm 10.1 as in the [README quick start](../README.md#quick-start),
+using the `gfx1151` tarball and target.
 
 ## Target Hardware
 
-This build is tuned and validated on:
+ROCmFPX tuned and validated this build on:
 
 ```text
 Framework AMD Strix Halo 395+, 128 GB unified RAM, gfx1151
 ```
 
-Other AMD systems may work, but they are not the proof target for the published
-numbers.
+Other AMD systems may work, but they are not the proof target for ROCmFPX's
+published numbers.
 
 ## Prerequisites
 
@@ -116,7 +116,7 @@ for models whose template supports reasoning.
 
 ```bash
 HSA_OVERRIDE_GFX_VERSION=11.5.1 \
-GGML_HIP_ENABLE_UNIFIED_MEMORY=1 \
+GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
 ./build-strix-rocmfp4/bin/llama-cli \
   -m /path/to/model-ROCmFP4-STRIX_LEAN.gguf \
   -dev ROCm0 \
@@ -137,7 +137,7 @@ For a model with native MTP draft heads, add speculative draft flags:
 
 ```bash
 HSA_OVERRIDE_GFX_VERSION=11.5.1 \
-GGML_HIP_ENABLE_UNIFIED_MEMORY=1 \
+GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
 ./build-strix-rocmfp4/bin/llama-cli \
   -m /path/to/model-ROCmFP4-STRIX_LEAN.gguf \
   -dev ROCm0 \

@@ -1,5 +1,12 @@
 # Released Model Recipe Catalog
 
+Status, 7 November 2026: this catalog and its recipe notes come from the
+ROCmFPX project (June-July 2026) and cover the `jcbtc` releases on Hugging
+Face. RDNA-FAST's own recipes for the RX 7900 XT are in
+[`docs/rocmfpx/`](../rocmfpx/README.md):
+[Swift 1.5 ROCmFP4-FP6](../rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md) and
+[Nanbeige4.3-33B IQ3-FP6](../rocmfpx/nanbeige4.3-33b-iq3-fp6.md).
+
 This catalog keeps two identifiers separate:
 
 - The Hugging Face card title and GGUF filename define the released model
@@ -30,7 +37,6 @@ or `moe`. Actual BPW belongs to the built artifact, not the stable recipe ID.
 | `Step-3.7-Flash-ROCmFPX-Q3-QualityPlus-*.gguf` | `jcbtc/Step-3.7-Flash-ROCmFPX-Q3-QualityPlus` | `rocmfpx-q3.step35.moe.qualityplus.v1` |
 | `Qwen3.6-35B-A3B-NSC-ACE-SABER-MTP-F16-to-ROCmFP4-STRIX_LEAN.gguf` | `jcbtc/chadrock-35b-ace-saber-rocmfp4-mtp` | `rocmfp4.qwen35.moe.strix-lean.v1` |
 | `CHADROCK-35B-Ace-Saber-MTP-ROCmFPX-MoEQuality-7.07BPW.gguf` | `jcbtc/chadrock-35b-ace-saber-rocmfp4-mtp` | `rocmfpx.qwen35.moe.moequality.v1` |
-| `Qwable-27B-Chadrock-ROCmFPX-ULTRAQUALITY-7.61BPW.gguf` | `jcbtc/Qwable-27B-Chadrock-ROCmFPX-ULTRAQUALITY-7.61BPW` | `rocmfpx.qwen35.dense.ultraquality.v1` |
 | `Qwen3.6-35B-A3B-HaloStrix-Dyn-MTP-v7.gguf` | `jcbtc/qwen3.6-35b-a3b-crown-halo-mtp-dynamic` | `crown.qwen35.moe.halo-dynamic.v7` |
 | `Qwopus3.6-27B-v2-MTP-BF16-to-ROCmFP4-STRIX_LEAN.gguf` | `jcbtc/qwopus3.6-27b-v2-chadrock-rocmfp4-mtp` | `rocmfp4.qwen35.dense.strix-lean.v1` |
 | `CHADROCK3.6-35B-UNCENSORED-MTP-STRIX-LEAN.gguf` | `jcbtc/CHADROCK3.6-35B-UNCENSORED-MTP-STRIX-LEAN` | `rocmfp4.qwen35.moe.strix-lean.v1` |
@@ -38,14 +44,7 @@ or `moe`. Actual BPW belongs to the built artifact, not the stable recipe ID.
 | `CHADROCK3.6-35B-A3B-Coder-MTP-ROCmFPX-MoEQuality-7.08BPW.gguf` | `jcbtc/chadrock3.6-27b-coder-rocmfp4-mtp` | `rocmfpx.qwen35.moe.moequality.v1` |
 | `CHADROCK3.6-40B-Opus-Deckard-Uncensored-Thinking-NEO-CODE-Di-IMatrix-ROCmFP4.gguf` | `jcbtc/chadrock3.6-40b-opus-deckard-uncensored-thinking-neo-code-di-imatrix-rocmfp4` | `rocmfp4.qwen35.dense.strix-lean.v1` |
 | `CHADROCK3.6-27B-Pi-Agent-MTP-ROCmFP4-STRIX_LEAN.gguf` | `jcbtc/chadrock3.6-27b-pi-agent-rocmfp4-mtp` | `rocmfp4.qwen35.dense.strix-lean.v1` |
-| `Qwable-5-27B-Chadrock-v2-ROCmFP4.gguf` | `jcbtc/qwable-5-27b-chadrock-v2-rocmfp4` | `rocmfp4.qwen35.dense.strix-lean.v1` |
 | `Chadrockv2-Qwen3.6-27B-ROCmFP6-STRIX-QUALITY.gguf` | `jcbtc/Chadrockv2-Qwen3.6-27B-ROCmFP6-STRIX-QUALITY` | `rocmfpx-q6.qwen35.dense.strix-quality.v1` |
-| `Qwable-5-27B-Chadrock-v2-ROCmFP6-QUALITY.gguf` | `jcbtc/Qwable-5-27B-Chadrock-v2-ROCmFP6-QUALITY` | `rocmfpx-q6.qwen35.dense.strix-quality.v1` |
-
-The lowercase UltraQuality repository is a partial duplicate of the same
-released artifact, not another model. The public Qwable ROCmFP6 model remains
-named `ROCmFP6-QUALITY`; the internal recipe metadata may identify its Strix
-Quality policy without changing that released name.
 
 The same MoEQuality policy produced the 7.07 BPW Ace Saber and 7.08 BPW Coder
 artifacts. Conversely, the ROCmFP4 artifacts in those repositories are Strix
@@ -61,7 +60,7 @@ The machine-readable form of this table is
 - Qwen35/Qwen35MoE, Step35, and Gemma4 are separate implementation contracts.
   Their attention, SSM, expert, shared-expert, embedding, and MTP structures
   differ.
-- Fine-tune names such as Ace Saber, Qwopus, Qwable, Pi Agent, and Deckard do
+- Fine-tune names such as Ace Saber, Qwopus, Pi Agent, and Deckard do
   not create a recipe family by themselves. Reuse is allowed only within the
   same implementation/topology contract and after validation.
 - `Chadrock` is model/release/runtime branding, not a quantization recipe.
@@ -84,6 +83,5 @@ A recipe may be reused for another artifact only after all of these pass:
 
 Recipe-specific notes:
 
-- [Qwen35 dense UltraQuality](qwable-ultraquality-7p61bpw-rankleave32.md)
 - [Qwen35 MoE MoEQuality](qwen35-moe-rocmfpx-moequality.md)
 - [Step35 MoE Q3 QualityPlus](step35-rocmfpx-q3-qualityplus.md)

@@ -45,7 +45,7 @@ Set with `--split-mode` / `-sm`.
 | `-ctv` | `--cache-type-v` | same as `-ctk` | `f16` | KV cache type for V. |
 | `-fit` | `--fit` | `on` \| `off` | `on` | Auto-fit unset args to device memory. **Not supported with `tensor`. You may need to manually set the `--ctx-size` to make the model fit.**  |
 
-As for any CUDA program, the environment variable `CUDA_VISIBLE_DEVICES` can be used to control which GPUs to use for the CUDA backend: if you set it, llama.cpp only sees the specified GPUs. Use `--device` for selecting GPUs from among those visible to llama.cpp, this works for any backend.
+As for any CUDA program, the environment variable `CUDA_VISIBLE_DEVICES` can be used to control which GPUs to use for the CUDA backend: if you set it, llama.cpp only sees the specified GPUs (on ROCm: `HIP_VISIBLE_DEVICES`). Use `--device` for selecting GPUs from among those visible to llama.cpp, this works for any backend.
 
 ---
 
@@ -75,32 +75,32 @@ llama-cli --list-devices
 llama-cli -m model.gguf -dev CUDA1
 ```
 
-Use only the device listed as `CUDA1` when calling with `--list-devices`.
+Use only the device listed as `CUDA1` when calling with `--list-devices`. On the HIP backend the names are `ROCm0`, `ROCm1`, ...
 
 ### 4. Tensor parallelism (experimental)
 
 ```bash
-llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
+llama-cli -m model.gguf -sm tensor
 ```
 
 - `--flash-attn off` or (`--flash-attn auto` resolving to `off` when it isn't supported) is a hard error.
-- KV cache types must be non-quantized: `f32`, `f16`, or `bf16`. Support for quantized KV cache is not implemented and trying to use it will result in an error.
+- Quantized KV cache types work with `--split-mode tensor` (llama.cpp #23792, June 2026).
 - Mark this configuration as experimental in your tooling: validate output quality before deploying.
-- `--split-mode tensor`is not implemented for all architectures. The following will fail with *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'"*:
+- `--split-mode tensor`is not implemented for all architectures. The following will fail with *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'"* (names as the error prints them; the list is `llm_arch_supports_sm_tensor` in `src/llama-arch.cpp`):
 
-  - **MoE / hybrid:** Grok, MPT, OLMoE, DeepSeek2, GLM-DSA, Nemotron-H, Nemotron-H-MoE, Granite-Hybrid, LFM2-MoE, Minimax-M2, Mistral4, Kimi-Linear, Jamba, Falcon-H1
-  - **State-space / RWKV-style:** Mamba, Mamba2 (and the hybrid Mamba-attention models above)
-  - **Other:** PLAMO2, MiniCPM3, Gemma-3n, OLMo2, BitNet, T5
+  `bailingmoe3`, `bitnet`, `clover_moe`, `deepseek2`, `deepseek32`, `dots3note`, `falcon-h1`, `gemma3n`, `glm-dsa`, `glm5-next`, `granitehybrid`, `grok`, `hy_v4`, `jamba`, `kimi-k3`, `kimi-linear`, `mamba`, `mamba2`, `minicpm3`, `minimax-01`, `minimax-m2`, `minimax-m3`, `mistral4`, `mpt`, `nemotron_h`, `nemotron_h_moe`, `olmo2`, `olmoe`, `plamo2`, `qwen3tts`, `t5`
 
 ### 5. With NCCL
 
-There's no runtime flag for NCCL - it's selected at build time (`-DGGML_CUDA_NCCL=ON`, this is the default). Note that NCCL is **not** automatically distributed with CUDA and you may need to install it manually - when in doubt check the CMake log to see whether or not it can find the package. When llama.cpp is compiled with NCCL support it uses it automatically for cross-GPU reductions in `tensor` mode. When NCCL is missing on a multi-GPU build, you'll see this one-time warning and performance will be lower:
+NCCL is selected at build time (`-DGGML_CUDA_NCCL=ON`, this is the default). Note that NCCL is **not** automatically distributed with CUDA and you may need to install it manually - when in doubt check the CMake log, which prints *"Warning: NCCL not found, performance for multiple CUDA GPUs will be suboptimal"* when it cannot find the package. When llama.cpp is compiled with NCCL support it uses it automatically on Linux for cross-GPU reductions in `tensor` mode. A CUDA build without NCCL logs this warning and performance will be lower:
 
 ```
-NVIDIA Collective Communications Library (NCCL) is unavailable, multi GPU performance will be suboptimal
+NCCL not compiled in; falling back to internal AllReduce.  Recompile with -DGGML_CUDA_NCCL=ON for best multi-GPU performance.
 ```
 
-When using the "ROCm" backend (which is the ggml CUDA code translated for AMD via HIP), the AMD equivalent RCCL can be used by compiling with `-DGGML_HIP_RCCL=ON`. Note that RCCL is by default *disabled* because (unlike NCCL) it was not universally beneficial during testing.
+The environment variable `GGML_CUDA_ALLREDUCE` overrides the choice: `nccl`, `internal` (llama.cpp's own AllReduce, the default off Linux) or `none`.
+
+When using the "ROCm" backend (which is the ggml CUDA code translated for AMD via HIP), the AMD equivalent RCCL can be used by compiling with `-DGGML_HIP_RCCL=ON`. Note that RCCL is by default *disabled* because (unlike NCCL) it was not universally beneficial during testing. A HIP build without RCCL falls back to the internal AllReduce without a warning.
 ### 6. With CUDA peer-to-peer access (`GGML_CUDA_P2P`)
 
 CUDA peer-to-peer (P2P) lets GPUs transfer data directly between each other instead of going through system memory, which generally improves multi-GPU performance. It is **opt-in** at runtime - set the environment variable `GGML_CUDA_P2P` to any value to enable it:
@@ -113,13 +113,19 @@ P2P requires driver support (usually restricted to workstation/datacenter GPUs) 
 
 ### 7. Direct AllReduce between two AMD cards (`GGML_CUDA_AR_P2P`)
 
-With two ROCm cards and `--split-mode tensor`, the internal AllReduce (`GGML_CUDA_ALLREDUCE=internal`) sends large tensors through host memory. `GGML_CUDA_AR_P2P=1` sends them directly between the cards instead, which is faster where the board and driver allow peer access. If the cards cannot reach each other it logs a warning and keeps the host-staged path. Windows builds use `GGML_CUDA_NO_PEER_COPY=ON`, so leave it off there.
+With two ROCm cards and `--split-mode tensor`, the internal AllReduce (`GGML_CUDA_ALLREDUCE=internal`) sends large tensors through host memory. `GGML_CUDA_AR_P2P=1` sends them directly between the cards instead, which is faster where the board and driver allow peer access. If the cards cannot reach each other it logs a warning and keeps the host-staged path. Two-card Windows builds use `GGML_CUDA_NO_PEER_COPY=ON` (see *Windows AMD multi-GPU bridge* in the [README](../README.md)), so leave it off there.
 
 ```bash
 GGML_CUDA_ALLREDUCE=internal GGML_CUDA_AR_P2P=1 GGML_CUDA_AR_P2P_ISSUER=1 llama-server -m model.gguf -sm tensor
 ```
 
 `GGML_CUDA_AR_P2P_ISSUER` picks the device that issues both copies (default 1). Try the card that does not drive a display.
+
+This path is RDNA-FAST's (November 2026). It is compile-checked on gfx1100 but has not yet run on two cards.
+
+### 8. Expert handoff on several GPUs (RDNA-FAST)
+
+Expert handoff (`--expert-cache`, `--moe-cache-mib`) works with the layer split: each GPU caches the experts of its own layers and one CPU pool serves them all. With `--split-mode tensor` it logs a warning and the experts stay where they are. The multi-GPU path is built but has not yet run on two GPUs. See [expert-handoff.md](expert-handoff.md).
 
 ---
 
@@ -128,9 +134,8 @@ GGML_CUDA_ALLREDUCE=internal GGML_CUDA_AR_P2P=1 GGML_CUDA_AR_P2P_ISSUER=1 llama-
 | Symptom | How to fix |
 |---|---|
 | Startup error *"SPLIT_MODE_TENSOR requires flash_attn to be enabled"* | Add `-fa on` or remove `-fa off`. |
-| Startup error *"simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented"* | Use `-ctk f16 -ctv f16` (or `bf16`/`f32`) with `--split-mode tensor`. |
 | Startup error *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'X'"* | Architecture not on the TENSOR allow-list. Use `--split-mode layer`. |
-| Warning *"NCCL is unavailable, multi GPU performance will be suboptimal"* | llama.cpp wasn't built with NCCL. Either accept the lower performance or install NCCL and rebuild. |
+| Warning *"NCCL not compiled in; falling back to internal AllReduce"* | llama.cpp wasn't built with NCCL. Either accept the lower performance or install NCCL and rebuild. |
 | CUDA OOM at startup or during prefill in `--split-mode tensor` | Auto-fit is disabled in this mode, so reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |
 | Performance is worse with multi-GPU than single-GPU | The performance is bottlenecked by GPU interconnect speed. For `--split-mode tensor`, verify that NCCL is being used. Try `--split-mode layer` (less communication than `tensor`). Increase GPU interconnect speed via more PCIe lanes or e.g. NVLink (if available). |
 | GPU not used at all | `--n-gpu-layers` is `0` or too low - try explicitly setting `-ngl all`. Or you are accidentally hiding the GPUs via an environment variable like `CUDA_VISIBLE_DEVICES=-1`. Or your build doesn't include support for the relevant backend. |

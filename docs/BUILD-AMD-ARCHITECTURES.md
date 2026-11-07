@@ -5,7 +5,12 @@ backend for best performance. To build HIP support, you must compile for your
 GPU's `gfx` target.
 
 Vulkan does not need a `gfx` target at compile time and works across RDNA2+ AMD
-GPUs, but HIP performance tuning in this tree is strongest on Strix Halo.
+GPUs. RDNA-FAST tunes and measures the HIP backend on an RX 7900 XT (`gfx1100`);
+the regression scripts below keep ROCmFPX's Strix Halo (`gfx1151`) defaults.
+
+The scripts in this guide are Linux (bash) builds inherited from ROCmFPX.
+RDNA-FAST itself builds with ROCm 10.1; the Windows build is the
+[README quick start](../README.md#quick-start).
 
 ---
 
@@ -18,7 +23,7 @@ GPUs, but HIP performance tuning in this tree is strongest on Strix Halo.
 | **RDNA3** | RX 7600, RX 7900 XTX, RX 7800 XT | `scripts/build-rdna3.sh` | `build-rdna3/` |
 | **RDNA4** | RX 9070 XT | `scripts/build-rdna4.sh` | `build-rdna4/` |
 | **Vega 20 / gfx906 experimental** | Radeon Instinct MI50 / MI60 | `scripts/build-gfx906.sh` | `build-gfx906/` |
-| **Windows RDNA2** | RX 6000 series on Windows | `build-hip.bat` | `build-hip/` |
+| **Windows** | RX 7000 / 9000, Strix Halo | ROCm 10.1 `cmake` command in the [README quick start](../README.md#quick-start) | `build-hip/` |
 | **Vulkan only** | Any AMD GPU with Vulkan drivers | see [Vulkan-only build](#vulkan-only-no-hip-arch-needed) | `build-vulkan/` |
 
 All Linux scripts accept `JOBS=16` to control parallel compile jobs:
@@ -45,8 +50,8 @@ Then match your GPU to this table:
 | Vega 20 / GCN5 | Radeon Instinct MI50 / MI60 | `gfx906` | `gfx906` | use native `gfx906` when ROCm supports it |
 | RDNA1 | RX 5700 XT, RX 5600 | `gfx1010`, `gfx1012` | `gfx1010` | `HSA_OVERRIDE_GFX_VERSION=10.1.0` |
 | RDNA2 | RX 6700/6800/6900 | `gfx1030`–`gfx1037` | `gfx1030` | `HSA_OVERRIDE_GFX_VERSION=10.3.0` |
-| RDNA3 | RX 7600, RX 7900 XTX/XT/GRE, RX 7800 XT | `gfx1100`–`gfx1102` | `gfx1100` | `HSA_OVERRIDE_GFX_VERSION=11.0.0` |
-| RDNA3.5 | Strix Halo, Ryzen AI MAX+ | `gfx1150`, `gfx1151` | `gfx1151` | `HSA_OVERRIDE_GFX_VERSION=11.5.1` |
+| RDNA3 | RX 7600, RX 7900 XTX/XT/GRE, RX 7800 XT, Radeon 780M / 760M | `gfx1100`–`gfx1103` | `gfx1100` | `HSA_OVERRIDE_GFX_VERSION=11.0.0` |
+| RDNA3.5 | Strix Halo, Ryzen AI MAX+, Radeon 890M / 880M / 860M | `gfx1150`–`gfx1152` | `gfx1151` | `HSA_OVERRIDE_GFX_VERSION=11.5.1` |
 | RDNA4 | RX 9060 XT (Navi 44) | `gfx1200` | `gfx1200` | use native `gfx` when ROCm supports it |
 | RDNA4 | RX 9070 / 9070 XT / AI PRO R9700 (Navi 48) | `gfx1201` | `gfx1201` | must be built as `gfx1201`, see below |
 
@@ -59,8 +64,9 @@ Then match your GPU to this table:
   hangs with no error message (issues #18 and #37). The build scripts detect the
   installed GPU and pick the matching target, and they check the emitted code
   objects afterwards, so this now fails loudly instead of silently.
-- Published benchmark numbers and regression guards assume **Strix Halo /
-  `gfx1151`**.
+- ROCmFPX's published benchmark numbers and the regression guards assume
+  **Strix Halo / `gfx1151`**. RDNA-FAST's README numbers are from an RX 7900 XT
+  (`gfx1100`).
 - Vega 20 / `gfx906` is an experimental community target. It is not RDNA/CDNA,
   and should be validated on real MI50/MI60 hardware before claiming support.
 - `HSA_OVERRIDE_GFX_VERSION` works on **Linux only** — not on Windows.
@@ -80,7 +86,8 @@ You do not need separate full build scripts for each architecture.
 | `scripts/build-rdna4.sh` | `gfx1200` default | RX 9000 class; uses `gfx1201` automatically on Navi 48 cards |
 | `scripts/build-gfx906.sh` | `gfx906` | Experimental Vega 20 / MI50 / MI60 community target |
 | `scripts/build-rocmfp4.sh` | any `gfx` | Generic — set `CMAKE_HIP_ARCHITECTURES` yourself |
-| `build-hip.bat` | `gfx1030` | Windows + ROCm 7.x |
+
+There is no Windows build script; see [Windows](#windows).
 
 Every wrapper honours `CMAKE_HIP_ARCHITECTURES`, so an explicit target always wins:
 
@@ -88,7 +95,8 @@ Every wrapper honours `CMAKE_HIP_ARCHITECTURES`, so an explicit target always wi
 CMAKE_HIP_ARCHITECTURES=gfx1201 scripts/build-rdna4.sh
 ```
 
-Two safeguards apply to all of them:
+Two safeguards apply to `build-rocmfp4.sh` and the wrappers that call it
+(`build-strix-rocmfp4-mtp.sh` runs CMake directly and has neither):
 
 - Changing target reuses nothing: if the build directory was configured for a
   different `gfx`, it is removed first, because CMake updates the cache while
@@ -107,14 +115,14 @@ env CMAKE_HIP_ARCHITECTURES=gfx1100 BUILD_DIR=build-rdna3 scripts/build-rocmfp4.
 
 ## Common CMake Flags
 
-Every ROCmFP4 HIP build in this tree uses:
+The Linux build scripts pass:
 
 | Flag | Value | Why |
 |---|---|---|
 | `GGML_HIP` | `ON` | Enable ROCm/HIP backend |
 | `GGML_VULKAN` | `ON` | Enable Vulkan (recommended fallback) |
 | `GGML_CUDA` | `OFF` | Disable NVIDIA CUDA |
-| `GGML_HIP_FORCE_MMQ` | `ON` | Required for ROCmFP4 MMQ kernels |
+| `GGML_HIP_FORCE_MMQ` | `ON` | No effect at present: the option is still declared, but nothing has read it since the September 2026 ROCmFPX merge. `GGML_CUDA_FORCE_MMQ` is the switch that forces MMQ |
 | `CMAKE_BUILD_TYPE` | `Release` | Release build |
 | `CMAKE_HIP_ARCHITECTURES` or `GPU_TARGETS` | your `gfx` | GPU ISA to compile for |
 
@@ -134,7 +142,7 @@ Run with:
 
 ```bash
 HSA_OVERRIDE_GFX_VERSION=11.5.1 \
-GGML_HIP_ENABLE_UNIFIED_MEMORY=1 \
+GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
 ./build-strix-rocmfp4/bin/llama-cli -m model.gguf -dev ROCm0 -ngl 999 ...
 ```
 
@@ -145,6 +153,9 @@ Full Strix install guide: [`docs/STRIX-HALO-QUICKSTART.md`](STRIX-HALO-QUICKSTAR
 ```bash
 env JOBS=16 scripts/build-rdna2.sh
 ```
+
+RDNA-FAST has not checked RDNA2 builds again (see
+[Other cards](../README.md#other-cards) in the README).
 
 If ROCm does not recognize your exact `gfx` ID:
 
@@ -203,16 +214,11 @@ If HIP support is unreliable on a specific ROCm version, try the
 
 ### Windows
 
-**RDNA2** — run the included batch file:
-
-```bat
-build-hip.bat
-```
-
-Binaries land in `build-hip\bin\`.
-
-**RDNA3** — same as RDNA2, but change `gfx1030` to `gfx1100` in the cmake command
-inside `build-hip.bat` (or copy the file and edit the arch line).
+Build with ROCm 10.1 as in the [README quick start](../README.md#quick-start):
+AMD's TheRock tarball for your GPU family (`gfx110X-all` for RDNA3, `gfx120X-all`
+for RDNA4, `gfx1151` for Strix Halo), then the `cmake` command shown there with
+your target in `-DGPU_TARGETS` and `-DCMAKE_HIP_ARCHITECTURES`. Binaries land in
+`build-hip\bin\`, next to the HIP runtime DLLs the build copies there.
 
 `HSA_OVERRIDE_GFX_VERSION` does not work on Windows. The binary must match a
 ROCm-supported `gfx` target.
@@ -232,7 +238,7 @@ cmake -S . -B build-multi \
   -DGGML_VULKAN=ON \
   -DGGML_CUDA=OFF \
   -DGGML_NATIVE=OFF \
-  -DGPU_TARGETS="gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201"
+  -DGPU_TARGETS="gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1200;gfx1201"
 
 cmake --build build-multi -j "$(nproc)"
 ```
@@ -242,8 +248,14 @@ cmake --build build-multi -j "$(nproc)"
 | RDNA2 only | `gfx1030` |
 | RDNA3 only | `gfx1100` |
 | RDNA3 + Strix Halo | `gfx1100;gfx1150;gfx1151` |
-| All current consumer AMD | `gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201` |
+| All current consumer AMD | `gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1200;gfx1201` |
 | Experimental MI50/MI60 add-on | append `gfx906` only if you intend to test Vega 20 |
+
+On Windows, `ggml-hip.dll` must stay below 2 GB or Windows will not load it. A
+build for every target is larger than that, so the RDNA-FAST release
+(`.github/workflows/rdna-fast-release.yml`) builds one GPU family per archive:
+`gfx1100;gfx1101;gfx1102;gfx1103`, `gfx1150;gfx1151;gfx1152` and
+`gfx1200;gfx1201`.
 
 ---
 
@@ -252,8 +264,11 @@ cmake --build build-multi -j "$(nproc)"
 | Variable | When to use | Example |
 |---|---|---|
 | `HSA_OVERRIDE_GFX_VERSION` | Linux; GPU not in official ROCm support | `10.3.0`, `11.0.0`, `11.5.1` |
-| `GGML_HIP_ENABLE_UNIFIED_MEMORY` | UMA systems (Strix Halo, APUs) | `1` |
+| `GGML_CUDA_ENABLE_UNIFIED_MEMORY` | UMA systems (Strix Halo, APUs) | `1` |
 | `HIP_VISIBLE_DEVICES` | Pick a specific GPU | `0` |
+
+The AMD-named alias `GGML_HIP_ENABLE_UNIFIED_MEMORY` is no longer read (dropped
+in the September 2026 ROCmFPX merge); use the `GGML_CUDA_` name.
 
 ---
 
@@ -313,10 +328,9 @@ default paths. Details: [`docs/ROCmFP4-REPRODUCIBILITY.md`](ROCmFP4-REPRODUCIBIL
 env JOBS=16 scripts/build-strix-rocmfp4-mtp.sh
 
 # Desktop AMD GPUs
-env JOBS=16 scripts/build-rdna2.sh   # RX 6000 / 7600
+env JOBS=16 scripts/build-rdna2.sh   # RX 6000
 env JOBS=16 scripts/build-rdna3.sh   # RX 7000
 env JOBS=16 scripts/build-rdna4.sh   # RX 9000
 
-# Windows RDNA2
-build-hip.bat
+# Windows: ROCm 10.1 cmake command in the README quick start
 ```

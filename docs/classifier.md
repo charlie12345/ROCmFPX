@@ -21,6 +21,8 @@ POST /v1/classifier            (alias: /v1/systemone)
                            "probabilities": {...}, "confidence": 0.95}}}
 ```
 
+The answer shown is TinyJev-4B v1's; StartLux-Decision and the other models answer in the same shape.
+
 The routes sit behind the normal API key check. State, instructions and option descriptions may be strings, numbers,
 lists or objects. The classifier is the model loaded with `-m`, on any backend; for pure CPU use `-dev none -ngl 0`
 (without `-dev none` llama.cpp may still offload large matmuls to a GPU). Two model families are served, chosen by

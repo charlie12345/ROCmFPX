@@ -181,3 +181,8 @@ state, repack caches store device-specific transformed weights keyed by model
 and kernel identity, and expert streaming supplies bounded MoE expert windows.
 They must use atomic publication, verify model/tensor hashes, and never treat a
 cache as the canonical GGUF.
+
+No in-tree plugin implements these lanes; the test plugin only advertises the
+repack-cache bit. The server's own SSD prompt cache (`--cache-disk`) and the
+[expert handoff](../expert-handoff.md) (`--expert-cache`) are built in and do
+not use the plugin ABI.

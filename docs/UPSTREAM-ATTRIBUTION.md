@@ -13,13 +13,14 @@ record here and cite the source commits in future commit messages.
 - If a manual port is required, include `Based on upstream llama.cpp commit(s):`
   in the commit message, with commit SHA, title, and author.
 - Keep upstream license and notice files intact.
-- Push these adapted commits only to this ROCmFP4 fork unless an upstream PR is
+- Push these adapted commits only to this fork unless an upstream PR is
   explicitly prepared.
 
 ## Direct Cherry-Picks / Preserved Author Metadata
 
-The following recent upstream commits in this branch preserve upstream authors in
-Git metadata:
+The following upstream commits, picked in June 2026, preserve upstream authors
+in Git metadata. Later cherry-picks keep their authors the same way and are not
+listed here:
 
 - `2998a4d7b` - `chat: fix LFM2/LFM2.5 ignoring json_schema (#24377)` by Tarek Dakhran.
 - `b7ec1175d` - `common : relax sampler name matching (#23744)` by ddh0.
@@ -49,6 +50,9 @@ behavior is already present in the experimental branch.
 
 ### WebUI CI Provisioning
 
+The adapted `scripts/webui-download.cmake` was removed by the 2026-09-15 merge
+of the ROCmFPX org repo; this record is kept as history.
+
 The promotion CI repair manually adapts these upstream fixes:
 
 - `0c3e4fccca8aea028df37d39510e9df11d90c1b3` - `fix: Propagate version tag to WebUI asset download in self-hosted CI (#23051)` by Aleksander Grygier, co-authored by Sigbjorn Skjaeret.
@@ -68,6 +72,9 @@ file is byte-for-byte identical to:
 - `4d742877b2631bd9094bc7603bc59b65940563e2` - `build : use umbrella Headers directory for XCFramework module map (#23974)` by Gerard Martinez.
 
 ### DiffusionGemma Support
+
+The DiffusionGemma model and its `llama-server` completion path were removed by
+the 2026-09-15 merge of the ROCmFPX org repo; this record is kept as history.
 
 The upstream DiffusionGemma source branch used locally was
 `upstream-diffusiongemma-pr24423`, corresponding to upstream llama.cpp PR
@@ -111,3 +118,16 @@ Upstream/source commits used or referenced during the port:
 ROCmFP4-specific additions in the local port include preserving local ROCmFP4
 quantized tensor behavior, resolving graph conflicts, and keeping the Strix
 build/test path working.
+
+### Vulkan FA Dequant Scratch-Size Check
+
+Local commit:
+
+- `84ab95513` - `vulkan : check combined K+V f16 scratch size in FA dequant path (#30487)`
+
+Hand port of:
+
+- `3b83d12b0876f2eaef38c708ac40b15c6e1c7b3f` - `vulkan : check combined K+V f16 scratch size in FA dequant path (#30487)` by Nisbenz.
+
+The local `use_dequant_kv` path has no `kv_raw_strided` branch, so only the
+combined-size checks were taken.

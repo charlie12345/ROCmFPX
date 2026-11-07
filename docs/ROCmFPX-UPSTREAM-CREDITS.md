@@ -1,8 +1,9 @@
 # ROCmFPX upstream credits
 
 This branch carries ROCmFPX-specific adaptations of selected upstream
-`ggml-org/llama.cpp` work. Keep this file updated when upstream code is
-merged or manually adapted.
+`ggml-org/llama.cpp` work and of other outside code. Keep this file updated
+when upstream code is merged or manually adapted. Manual ports of single
+upstream commits are recorded in [UPSTREAM-ATTRIBUTION.md](UPSTREAM-ATTRIBUTION.md).
 
 ## DFlash speculative decoding
 
@@ -30,3 +31,16 @@ merged or manually adapted.
 - Title: `kv-cache: integrate user TurboQuant KV for deep-context TPS`
 - Contributor: Tom Turney / `PlunderStruck` / Aydan S.
 - Scope: TurboQuant `turbo3`/`turbo4` K/V-cache quantization paths for ROCm/HIP and Vulkan.
+- Status (2026-11-07): since the 2026-09-15 merge of the ROCmFPX org repo,
+  `-ctk`/`-ctv` no longer accept `turbo3`/`turbo4`. The kernels remain in
+  `ggml/src` (CPU, CUDA/HIP, Vulkan) and in `extensions/rocmfpx-vulkan`.
+
+## WMMA prompt GEMM
+
+- Source: `adelj88/rocm_wmma_gemm` (https://github.com/adelj88/rocm_wmma_gemm), commit `ea3aa74`
+- Author: Adel Johar
+- License: MIT, in `vendor/rocm_wmma_gemm/LICENSE` and `licenses/LICENSE-rocm_wmma_gemm`
+- Local integration: commit `96c837311` (`[TAG_WMMA_GEMM]`), vendored in
+  `vendor/rocm_wmma_gemm`; the included parts and local changes are listed in
+  its README, and `NOTICE` carries the attribution.
+- Scope: prompt-sized matrix products on gfx11 through `ggml/src/ggml-cuda/wmma-gemm.cu`.

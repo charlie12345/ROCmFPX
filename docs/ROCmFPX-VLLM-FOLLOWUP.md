@@ -2,6 +2,10 @@
 
 This is a parked follow-up, not part of the current llama.cpp ROCm/Vulkan kernel work.
 
+Status 2026-11-07: still parked (written 2026-06-29); nothing in this repo implements it.
+The ROCmFPX family has since added `Q2_0_ROCMFPX`, `Q5_0_ROCMFPX`, `Q7_0_ROCMFPX` and
+`Q4_0_ROCMI4`, which a port would also need to map.
+
 ## Goal
 
 Evaluate whether ROCmFPX formats can run faster under vLLM on AMD hardware than the

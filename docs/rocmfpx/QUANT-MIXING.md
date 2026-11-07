@@ -15,14 +15,19 @@ exact size is the priority.
 | --- | --- | --- |
 | ROCmFP2 | attention/selected FFN to FP3; embeddings/output to fast FP4 | selectively promote the first/last FFN-down layers to FP4 |
 | ROCmFP3 | established Q5_K/Q6_K and ROCmFP6 routing | use imatrix ranking to reduce the promoted layer count |
-| ROCmFP5 | sensitive tensors to ROCmFP6 | compare FP6_K where a backend lacks a native FP6 kernel |
+| ROCmFP5 | sensitive tensors to ROCmFP6 | compare stock Q6_K for the promoted tensors |
 | ROCmFP6 | established ROCmFP8 or Q6_K routing, including lean variants | separately tune dense and MoE expert tensors |
 | ROCmFP7 | sensitive tensors to ROCmFP8 | compare F16 only for small normalization-adjacent projections |
 | ROCmFP8 | selected tensors to stock Q8_0 | retain F16 for logits-critical tensors only when measurements justify it |
 
 “Candidate” means an experiment, not a release default. Every candidate is
 expressible today through `--tensor-type`/`--tensor-type-file`, so the format
-does not need irregular per-block metadata.
+does not need irregular per-block metadata. The
+[Swift 1.5 ROCmFP4-FP6](swift-1.5-qwen3.8-27b-rocmfp4-fp6.md) and
+[Nanbeige4.3 IQ3-FP6](nanbeige4.3-33b-iq3-fp6.md) recipes are worked examples:
+a base preset (`Q4_0_ROCMFP4`, `IQ3_S`) plus a `--tensor-type-file` with
+whole-tensor `Q6_0_ROCMFPX` promotions, quantized from BF16 with an importance
+matrix.
 
 Recommended evaluation loop:
 

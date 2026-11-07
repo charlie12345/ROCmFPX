@@ -1,5 +1,13 @@
 # ROCmFP4 Upstream Integration Tree
 
+> **Note (2026-11-07):** Historical: the legacy ROCmFPX integration workspace on
+> a Linux Strix Halo machine (May-June 2026, llama.cpp `b9438`); its paths,
+> branch and build directory are not part of this RDNA-FAST checkout. The
+> Step 3.7 scripts below need updating before they run: `--mmap`/`--no-mmap`
+> gave way to `--load-mode` (2026-10-02), and the `step35` pre-tokenizer alias
+> is gone (2026-09-15), so such files now need
+> `--override-kv tokenizer.ggml.pre=str:deepseek-v3`.
+
 This checkout is the active upstream-integration workspace.
 
 ## Do Not Confuse These Trees

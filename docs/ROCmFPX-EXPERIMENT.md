@@ -1,5 +1,13 @@
 # ROCmFPx Experiment
 
+Historical (June 2026, Strix Halo, gfx1151, Linux; the `/home/caf` and `/tmp`
+paths are the original author's machine). The family has since added
+`Q2_0_ROCMFPX`, `Q5_0_ROCMFPX`, `Q7_0_ROCMFPX` and `Q4_0_ROCMI4`. The current
+format contract is [rocmfpx/FORMATS.md](rocmfpx/FORMATS.md), and the overview is
+[rocmfpx/README.md](rocmfpx/README.md). Several check scripts listed below still
+pass `--strict-json` (removed in the 2026-09-15 upstream merge) or `--no-mmap` /
+`-mmp 0` (replaced by `-lm none` on 2026-10-02), so they fail until updated.
+
 The ROCmFPx experiment is the staging area for possible AMD-native
 `ROCmFP3`, `ROCmFP6`, and `ROCmFP8` quant formats.
 
@@ -69,7 +77,7 @@ the quantization discipline and kernel contract. The ROCmFPX code ranges are:
 | Format | Code range | Scale policy |
 |---|---|---|
 | `Q3_0_ROCMFPX` | `0, +/-1, +/-2, +/-4` | two UE4M3 scales, one per 16 weights |
-| `Q6_0_ROCMFPX` | signed magnitude up to `31` | two UE4M3 scales, one per 16 weights |
+| `Q6_0_ROCMFPX` | signed magnitude, `[-32, 31]` (the negative-zero code decodes to `-32`) | two UE4M3 scales, one per 16 weights |
 | `Q8_0_ROCMFPX` | signed int8 clamped to `[-127, 127]` | one UE4M3 scale per 32 weights |
 
 ## Current Layouts
@@ -221,8 +229,9 @@ Coherent-MSE v2:
 Coherent-MSE v3:
   Protects attention Q/K/V/O and FFN-down as Q5_K.
   Produces the duplicate function, three coherent bullets, and computes 391.
-  For strict machine-readable output, use `llama-completion -no-cnv --strict-json`
-  instead of the chat wrapper.
+  For strict machine-readable output, use `llama-completion -no-cnv -j '{}'`
+  instead of the chat wrapper (the run used `--strict-json`, which applied the
+  same `{}` schema and has since been removed).
 
 Coherent-LEAN v5 (current default):
   Selective Q3 routing: Q/O and early K/V at `Q5_K`, boosted down at `Q5_K`,
@@ -339,8 +348,11 @@ MODEL=/path/to/target-rocmfpx.gguf DRAFT_MODEL=/path/to/draft.gguf \
 
 The scripts skip when default local fixtures are missing. Set
 `SKIP_MISSING_MODEL=0` in CI or when a required fixture should be mandatory.
-Keep KV cache types on the existing `q4_0`/F16/ROCmFP4 paths for now; ROCmFPx
-KV cache experiments need FlashAttention support before promotion.
+At the time, KV cache types stayed on the `q4_0`/F16/ROCmFP4 paths, and ROCmFPx
+KV cache experiments waited on FlashAttention support. Since the 2026-09-15
+upstream merge, `-ctk`/`-ctv` accept only the stock types (`f32`, `f16`, `bf16`,
+`q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1`); the ROCmFP4 and ROCmFPx cache
+types are gone.
 
 ## Opt-in Decode Tuning
 
@@ -358,11 +370,14 @@ Available ROCmFPx profiles:
 ```text
 rocmfpx-strix-nwarps1, rocmfpx-strix-nwarps2, rocmfpx-strix-nwarps4
 rocmfpx-strix-rpb2
-rocmfpx-strix-mmid3, rocmfpx-strix-mmid4
+rocmfpx-strix-mmid1, rocmfpx-strix-mmid2, rocmfpx-strix-mmid3, rocmfpx-strix-mmid4
 rocmfpx-strix-moe-rpb1, rocmfpx-strix-moe-rpb2, rocmfpx-strix-moe-rpb3, rocmfpx-strix-moe-rpb4
+rocmfpx-strix-vdr2, rocmfpx-strix-vdr8
 ```
 
-These profiles only alter MMVQ launch geometry. They do not change block
+The full list, including the ROCmFP4 profiles, is in
+`scripts/rocmfp4-decode-tune-flags.sh`. These profiles only alter MMVQ launch
+geometry (the `vdr` profiles set `GGML_ROCMFP6_Q8_1_MMVQ_VDR`). They do not change block
 layouts, quantized values, FP3/FP6 MSE scale selection, or Q3 LEAN routing.
 
 ## Ranked Attention Tensor Policies
@@ -394,7 +409,8 @@ For local served-inference experiments, `scripts/run-rocmfpx-fp3-mtp-server-spee
 starts a `llama-server` FP3 MTP profile with the observed Strix/Vulkan settings:
 `draft-mtp`, `n_max=4`, `p_min=0.75`, F16 target/draft KV, and draft backend
 sampling disabled. This is an opt-in speed reproduction helper, not a validation
-gate or a universal default.
+gate or a universal default. The script was removed upstream on 2026-07-11
+(ea23f13a4); the commands below are the June 2026 record.
 
 The helper intentionally accepts environment overrides so the same launch shape
 can reproduce the FP4 cap4 rows with a local FP4 MTP GGUF:

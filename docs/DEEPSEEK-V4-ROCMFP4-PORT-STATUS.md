@@ -1,5 +1,32 @@
 # DeepSeek V4 ROCmFP4 Port Status
 
+## Status (2026-11-07)
+
+The rest of this page is the June 2026 port log from a Linux Strix Halo machine
+with 110+ GiB of free RAM. The `/home/caf` and `/mnt/ai-models` paths, the Pi,
+OpenCode and Kilo profiles, and the measurements belong to that machine. What
+has changed since:
+
+- DeepSeek V4 is in the main tree as architecture `deepseek4`
+  (`src/models/deepseek4.cpp`, converter class `DeepseekV4ForCausalLM` in
+  `conversion/deepseek.py`). No separate feature tree is needed.
+- The DeepSeek helper operations (`DSV4_HC_COMB`, `DSV4_HC_PRE`, `DSV4_HC_POST`,
+  `LIGHTNING_INDEXER`) have native HIP kernels since the 2026-09-15 merge and
+  Vulkan kernels since 2026-10-02. The CPU fallback that made FlashAttention
+  auto-disable on `ROCm0` no longer applies. The GPU numbers below have not been
+  re-measured.
+- `--deepseek4-include-mtp` and `--deepseek4-max-layers` are gone from
+  `convert_hf_to_gguf.py`. The base conversion drops the MTP tensors, and
+  `--mtp` exports the MTP head as a separate `mtp-` GGUF, to load as the draft
+  (`-md`) with `--spec-type draft-mtp`. The two-file path has not been tested
+  on DeepSeek V4 here.
+- `--no-mmap` became `-lm none` (`--load-mode none`) on 2026-10-02.
+- The `scripts/run-deepseek-v4-*.sh` helpers still pass the removed flags and
+  expect a `build-deepseek4-rocmfp4` build directory, so they fail on the
+  current tree until updated.
+- The promoted MTP artifact is about 92 GB, far beyond a 20 GB card with 32 GB
+  of system RAM.
+
 ## Target
 
 Convert the original checkpoint:
@@ -7,7 +34,8 @@ Convert the original checkpoint:
 - Hugging Face: <https://huggingface.co/0xSero/DeepSeek-V4-Flash-180B>
 - Local source: `/mnt/ai-models/gguf-sources/DeepSeek-V4-Flash-180B`
 
-The target runtime is this isolated special llama ROCmFP4 feature tree:
+The target runtime was this isolated special llama ROCmFP4 feature tree (DeepSeek
+V4 now lives in the main tree):
 
 - `/home/caf/strix-fp4/llama.cpp-deepseek-v4-rocmfp4-modern-port`
 
@@ -164,19 +192,21 @@ NO_REPACK=1 N_PREDICT=8 \
 ```
 
 Replace `ROCm0` with `Vulkan0` for the Vulkan path. The harness adds
-`--no-mmap` by default. Set `NO_MMAP=0` only for controlled loader diagnostics.
+`--no-mmap` by default (`-lm none` on the current tree). Set `NO_MMAP=0` only
+for controlled loader diagnostics.
 
 ## Runtime Notes
 
-The isolated tree includes the DeepSeek V4 metadata, tensor loader, hybrid
-compressed-attention cache, graph, and CPU helper operations. ROCm and Vulkan
-can execute the compressed fixture, but the DeepSeek-specific helper operations
-do not yet have native GPU kernels. The ROCm path currently disables
-FlashAttention automatically when the scheduler detects CPU fallback.
+The isolated tree included the DeepSeek V4 metadata, tensor loader, hybrid
+compressed-attention cache, graph, and CPU helper operations. In June, ROCm and
+Vulkan could execute the compressed fixture, but the DeepSeek-specific helper
+operations had no native GPU kernels, and the ROCm path disabled FlashAttention
+automatically when the scheduler detected CPU fallback. The main tree now has
+HIP and Vulkan kernels for these operations (see Status).
 
 The HIP/CUDA concat backend also needed `F16` support for the compact compressed
-KV-cache merge. This is a generic backend fix and should be regression-tested
-against the existing ROCmFP4 architectures before the feature tree is merged.
+KV-cache merge. This was a generic backend fix, to be regression-tested against
+the existing ROCmFP4 architectures before the feature tree was merged.
 
 The first full-model attempts timed out before graph execution because the
 default mmap path issued:
@@ -194,9 +224,10 @@ conversion.
 
 ## MTP Phase
 
-MTP remains opt-in and separate from the proven base-model artifact. Pass
-`--deepseek4-include-mtp` to `convert_hf_to_gguf.py`, or use the guarded full
-conversion wrapper with a third argument of `1`:
+MTP remains opt-in and separate from the proven base-model artifact. In June the
+route was `--deepseek4-include-mtp` on `convert_hf_to_gguf.py` (now removed; the
+current converter uses `--mtp`, see Status), or the guarded full conversion
+wrapper with a third argument of `1`:
 
 ```bash
 scripts/run-deepseek-v4-rocmfp4-full-conversion.sh \

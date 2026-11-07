@@ -2,6 +2,8 @@
 
 Date: 2026-06-27
 
+Historical (Strix Halo, gfx1151, Linux). Since then the default `Vulkan0` backend stores FP6 packed (26-byte blocks). The expanded 34-byte layout and the `block_rocmfpx_fp6_packed16` loads tested here remain only in the optional ROCmFPX Vulkan extension (`ROCmFPXVulkan0`, see [extensions/rocmfpx-vulkan](../extensions/rocmfpx-vulkan/README.md)). On HIP the packed FP6 MMVQ dot became branch-free on 2026-10-24 (`[TAG_FP6_MMVQ_FAST]`): on an RX 7900 XT a one-row 4096 x 14336 product went from 88.8 to 47.0 us. The Q6_K comparison below has not been re-run on that code.
+
 Model:
 
 `/mnt/seconddrive/models/Qwythos-9B-Claude-Mythos-5-1M-GGUF`
@@ -88,7 +90,8 @@ experimental until the decode path is improved.
 The HIP/ROCm build keeps packed FP6 device storage by default, with the expanded
 layout still gated by `GGML_ROCMFP6_EXPANDED_DEVICE=1`. The Vulkan path in this
 branch uses expanded signed-byte device storage for FP6 to avoid 6-bit unpacking
-inside shaders; the packed GGUF file format remains compatible.
+inside shaders; the packed GGUF file format remains compatible. (Today only the
+optional ROCmFPX Vulkan extension does this; `Vulkan0` keeps FP6 packed.)
 
 ## Best Next Decode Targets
 

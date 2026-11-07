@@ -1,38 +1,40 @@
-# ROCmFPX CI policy
+# RDNA-FAST CI
 
-ROCmFPX keeps the upstream llama.cpp workflow files intact for easier upstream merges, but most inherited workflows are disabled in the private GitHub repository.
-Only these workflows remain enabled:
+RDNA-FAST (`serrynaimo/RDNA-FAST`, public, default branch `main`) inherited the ROCmFPX and llama.cpp workflow files.
+On 2026-11-06 the 48 llama.cpp workflows it does not use, and ROCmFPX's self-hosted gfx1151 qualification, were removed rather than disabled (commit `f45275ab4`).
+Many of the llama.cpp ones triggered on pushes to `master` only, so they never ran on `main`.
 
-- `check-rocmfpx.yml`: focused hosted CPU reference, format, plugin ABI, PLE, script, and converter checks for ROCmFPX paths.
-- `rocmfpx-upstream-sync.yml`: weekly and manual upstream merge preparation.
-- `rdna-fast-release.yml`: manual or version-tag release packaging.
+## Workflows
 
-This policy avoids running the full upstream CPU, Windows, CUDA, server, UI, WebGPU, and cross-platform matrices for every private downstream pull request.
-Disabled workflow source files continue to receive normal upstream merges and can be re-enabled temporarily when a cross-platform qualification is required.
+RDNA-FAST's own:
 
-## Apply or inspect the policy
+- `rdna-fast-release.yml` ("RDNA-FAST release"): on `v*.*.*` tags and by hand. Takes the web UI from `rdna-fast-ui.yml` and builds the Linux CPU archive, the OCI image, and ROCm 10.1 archives for Windows and Linux per GPU family; a tag run publishes them as a GitHub prerelease, a run started by hand publishes nothing. See [RELEASES.md](RELEASES.md).
+- `rdna-fast-publish.yml` ("RDNA-FAST publish"): by hand. Publishes a successful release run that was started by hand: creates the tag at that run's commit and the prerelease with its archives, and pushes the image.
+- `rdna-fast-ui.yml` ("RDNA-FAST UI"): on pushes to `main` that touch `tools/ui`, by hand, and from the release workflow. Keeps the rolling `ui-latest` release current, the prebuilt UI that `-DLLAMA_USE_PREBUILT_UI=ON` (the default) downloads.
 
-The policy script verifies the exact private destination before changing workflow state.
-It uses the authenticated GitHub CLI session and never reads or stores a token itself.
+From ROCmFPX:
 
-```bash
-scripts/rocmfpx/manage-actions-policy.sh --dry-run
-scripts/rocmfpx/manage-actions-policy.sh --apply
-scripts/rocmfpx/manage-actions-policy.sh --check
-```
+- `check-rocmfpx.yml` ("ROCmFPX reference check"): focused hosted CPU reference, format, plugin ABI, PLE, script, and converter checks, plus a Vulkan ROCmFP4 CM1 build with the option on and off. Runs on every push to `main`, on non-draft pull requests that change a ROCmFPX implementation path, and by hand.
+- `rocmfpx-upstream-sync.yml` ("ROCmFPX upstream sync"): weekly (Monday 09:23 UTC) and by hand. Tries to merge llama.cpp `master`. RDNA-FAST takes llama.cpp changes as curated picks, so a merge that conflicts ends green with a report in the job summary; only a clean merge pushes `automation/upstream-sync` and opens a pull request.
 
-`--dry-run` reports drift and exits successfully, `--apply` reconciles workflow states, and `--check` returns nonzero when the GitHub configuration differs from the allowlist.
-Run the policy after the first private publication and after an upstream merge adds a workflow file.
+From llama.cpp, kept:
+
+- `ui.yml`, with `ui-build.yml` (called by `ui.yml` and `docker.yml`): UI checks and tests on pushes to `main` and on pull requests that touch `tools/ui` or the server tests.
+- `python-type-check.yml` and `python-check-requirements.yml`: on pushes and pull requests that change Python or requirements files.
+- Scheduled: `docker.yml` (daily, images to ghcr.io), `build-cache.yml` (hourly), `build-cross.yml` and `build-msys.yml` (weekly), `close-issue.yml` (daily). `winget.yml` is scheduled daily, but its job only runs in `ggml-org` repositories.
+
+`bench.yml.disabled` is not a workflow; GitHub ignores the extension.
+
+## The actions policy script
+
+`scripts/rocmfpx/manage-actions-policy.sh` is ROCmFPX's: it enabled an allowlist of workflows and disabled the rest through the GitHub CLI.
+It acts only on `ROCmFPX/ROCmFPX` and only while that repository is private, so it refuses RDNA-FAST and, with `ROCmFPX/ROCmFPX` now public, every repository.
+RDNA-FAST trims workflows by deleting the files instead.
 
 ## Hosted and self-hosted work
 
-The focused reference check uses a GitHub-hosted Linux runner only when a pull request or push changes a ROCmFPX implementation path.
-The gfx1151 workflow has no push, pull request, or schedule trigger and therefore cannot start automatically.
-It requires a runner with the labels `self-hosted`, `linux`, `x64`, `rocmfpx`, and `gfx1151`.
+Every workflow runs on GitHub-hosted runners; none needs a self-hosted runner since ROCmFPX's manual gfx1151 qualification workflow was removed.
+Hosted CI builds the ROCm archives but has no AMD GPU, so it proves compilation, not AMD runtime behavior.
 
-Treat a self-hosted runner as a code-execution boundary.
-Use a dedicated machine or isolated runner account, keep the repository private, never add a pull request trigger to the gfx1151 workflow, and review the selected commit before manual dispatch.
+If a self-hosted runner is added again, treat it as a code-execution boundary: use a dedicated machine or isolated runner account, never give its workflow a pull request trigger, and review the selected commit before a manual dispatch.
 Do not register the live inference host as a general-purpose runner while protected services are active.
-
-GitHub billing and budget controls belong to the repository owner account.
-Keeping a zero paid-overage budget prevents surprise hosted-runner charges but pauses hosted checks after the included allowance is exhausted.

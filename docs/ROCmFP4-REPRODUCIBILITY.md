@@ -4,6 +4,12 @@ This tree should only claim ROCmFP4 gains that are reproducible from a clean
 GitHub checkout, a named build, named model files, exact flags, and a recorded
 hardware target.
 
+> Scope: this is the ROCmFPX standard for ROCmFP4 on Strix Halo (gfx1151)
+> under Linux, written 2026-05. The scripts default to the gfx1151
+> `build-strix-rocmfp4` build, `HSA_OVERRIDE_GFX_VERSION=11.5.1` and model
+> paths on the original author's machine. RDNA-FAST's own numbers are measured
+> on an RX 7900 XT (gfx1100) under Windows, built with ROCm 10.1.
+
 ## Promotion Rules
 
 A ROCmFP4 optimization is promoted only when all of these are true:
@@ -25,24 +31,23 @@ runtime knob until an end-to-end decode guard also benefits.
 
 ## Current Proof Commands
 
+Run these from the root of the checkout.
+
 Build the reproducible Strix Halo ROCmFP4 + MTP binary:
 
 ```bash
-cd /home/caf/strix-fp4/llama.cpp-mtp-rocmfp4
 env JOBS=16 scripts/build-strix-rocmfp4-mtp.sh
 ```
 
 Run the full promoted regression gate:
 
 ```bash
-cd /home/caf/strix-fp4/llama.cpp-mtp-rocmfp4
 env HSA_OVERRIDE_GFX_VERSION=11.5.1 scripts/check-rocmfp4-all-regression.sh
 ```
 
 Run the controlled Qwen3.6 27B MTP comparison and write a markdown report:
 
 ```bash
-cd /home/caf/strix-fp4/llama.cpp-mtp-rocmfp4
 env HSA_OVERRIDE_GFX_VERSION=11.5.1 scripts/reproduce-rocmfp4-qwen-mtp-comparison.sh
 ```
 
@@ -72,6 +77,14 @@ The comparison script records:
 - prompt tokens per second,
 - decode tokens per second,
 - full command flags.
+
+The Qwen MTP guards in the regression gate print `SKIP` and exit 0 when their
+model file is missing (`SKIP_MISSING_MODEL=1` is the default), so the full gate
+passes without them. Set `MODEL=...` or `SKIP_MISSING_MODEL=0` when the gate
+has to prove a decode result. They also fail when `llama-cli` is older than
+`common/speculative.cpp`, `common/arg.cpp`, `src/llama-context.cpp` or
+`src/llama-model.cpp` (`STALE_BINARY_CHECK=1`). The dense 27B guard floors are
+`12.0` / `11.5 tok/s` (short / sustained) since 2026-06-24.
 
 ## Current Proven Gain
 
@@ -106,7 +119,9 @@ ROCmFP4 is not a renamed Q4 path. The promoted path includes:
 - ROCmFP4-specific Vulkan scale lookup logic.
 - ROCmFP4 source/dequant CPY kernels so fallback conversion paths do not leave
   the format-specific implementation.
-- MTP host-loop cleanup for long-running target/draft decode.
+- MTP host-loop cleanup for long-running target/draft decode (that host code
+  was replaced by the ROCmFPX upstream MTP code in the 2026-09-15 merge,
+  `40c5e4965`).
 
 The next high-upside work must keep this same proof standard: fused ROCmFP4
 matvec changes, long-context attention changes, and speculative scheduler

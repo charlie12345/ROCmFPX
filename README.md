@@ -18,9 +18,10 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
   model, quant and context, a scripted two-agent session finishes in 93 s
   instead of 130 s. [Numbers](#speed)
 
-- **Multi-token prediction.** The model's own MTP head drafts tokens ahead: up
-  to 60 t/s on prose and 96 t/s on code. When an answer repeats text from the
-  prompt, as code edits do, n-gram drafting copies it at up to 315 t/s.
+- **Fast Multi-token prediction.** The model's own MTP head drafts tokens
+  ahead: up to 60 t/s on prose and 96 t/s on code. When an answer repeats text
+  from the prompt, as code edits do, n-gram drafting copies it at up to 315 t/s.
+  DFlash2 drafters are supported too. [More](#other-cards)
 
 - **Prompts on the matrix cores.** Prompt processing runs on RDNA3's WMMA units
   through [rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) by Adel
@@ -51,6 +52,7 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 - **A decision classifier on the same port**: yes/no, choice and score answers
   with calibrated probabilities, from a small model on the CPU.
+  [More](#decision-classifier)
 
 - **Request priority**, so the most urgent agent goes first. [More](#request-priority)
 
@@ -96,15 +98,13 @@ The same session with each quant we tested:
 | [Q4_K_M](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf)\* | 17.4 GB | 146.8 s | 1,211 s (spill) | 408 / 548 / 431 | 50.6 / 50.8 / 48.2 | 238 |
 | [Q4_K_S](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_S.gguf) | 16.4 GB | 112.6 s | 1,139 s (spill) | 889 / 769 / 616 | 49.2 / 51.7 / 48.8 | 247 |
 | [IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf) | 15.5 GB | 92.6 s | 130.1 s | 1,035 / 904 / 710 | 70.1 / 66.7 / 65.3 | 315 |
-| [ROCmFP4-FP6](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md) | 16.1 GB | 104.5 s | | 923 / 798 / 634 | 60.2 / 56.4 / 58.5 | 243 |
 
 <sub>\* At 64k (`-c 65536`) and `-ub 512`: the smaller context and prompt
 batches keep Q4_K_M's spill into system RAM down while staying above Hermes'
 64,000-token minimum. The other quants ran at 96k with `-ub 1024`, IQ4_XS at
 `-ub 2048` since. Prefill and decode are this runtime's, in the session above;
 the better of two runs (IQ4_XS: best of six runs, Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M (runtime 2.64.0) sit at the edge of
-the card's memory and read every prompt again in full. ROCmFP4-FP6 is a ROCmFPX
-format, which LM Studio does not load.</sub>
+the card's memory and read every prompt again in full.</sub>
 
 Decode, 450-token answers at temperature 1, best of six runs
 (nine answers each; without MTP from an earlier run):
@@ -135,8 +135,8 @@ the time (mean KL divergence 0.021, wikitext-2).
 
 The ROCmFPX-optimised alternative is our quant of the same model,
 `Swift-1.5-Qwen3.8-27B-ROCmFP4-FP6` (16.1 GB): ROCmFP4 weights with 61
-sensitive tensors in `Q6_0_ROCMFPX`. Its prompts run 2-5% faster, at 92.8% the
-same top token (KL divergence 0.026). The
+sensitive tensors in `Q6_0_ROCMFPX`. Its prompts run about 2% faster, at 92.8%
+the same top token (KL divergence 0.026). The
 [recipe and its tensor policy file](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md)
 are in this repository.
 
@@ -162,8 +162,7 @@ cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release ^
   -DCMAKE_PREFIX_PATH="%ROCM%" -DGGML_HIP=ON -DGPU_TARGETS=gfx1100 -DCMAKE_HIP_ARCHITECTURES=gfx1100 ^
   -DGGML_HIP_GRAPHS=ON -DGGML_HIP_NO_VMM=ON -DGGML_HIP_FORCE_MMQ=ON -DGGML_CUDA_FA_ALL_QUANTS=ON ^
   -DGGML_CUDA_GRAPHS=ON -DGGML_NATIVE=ON -DGGML_OPENMP=ON -DGGML_SCHED_MAX_COPIES=4 ^
-  -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF ^
-  -DLLAMA_BUILD_WEBUI=OFF -DLLAMA_BUILD_UI=ON -DLLAMA_USE_PREBUILT_UI=OFF
+  -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=OFF
 cmake --build build-hip --target llama-server -j 12
 ```
 
@@ -171,9 +170,10 @@ ROCm 10.1 brings no resource compiler, so CMake takes the Windows SDK's
 `rc.exe` (use the SDK version folder you have, with forward slashes). The build
 copies ROCm's HIP runtime (`amdhip64_7.dll`, `amd_comgr.dll`, `rocm_kpack.dll`)
 next to `llama-server.exe`: Windows would otherwise load the AMD driver's older
-runtime, on which ROCm 10.1's rocBLAS fails. The UI build needs Node.js (npm);
-it embeds the RDNA-FAST web UI with its live status page at
-`http://127.0.0.1:<port>/#/status`. Without Node.js, use `-DLLAMA_BUILD_UI=OFF`.
+runtime, on which ROCm 10.1's rocBLAS fails. The build also downloads the
+RDNA-FAST web UI, with its live status page, from this repository's releases
+and embeds it. To build the UI from source instead (needs Node.js), add
+`-DLLAMA_BUILD_UI=ON -DLLAMA_USE_PREBUILT_UI=OFF`.
 
 **3. Run:**
 
@@ -197,134 +197,32 @@ llama-server -m Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf --mmproj mmproj-Qwen3.8-27B-BF
 ```
 
 The server speaks the usual OpenAI-compatible API on `/v1`. Every flag and
-variable above is explained under [Flags and switches](#flags-and-switches).
+variable above is explained in [docs/FLAGS.md](docs/FLAGS.md).
+
+**4. Open the UI and run the bench.** Open `http://127.0.0.1:1234/` in a
+browser for the RDNA-FAST web UI. With `--api-key-file` set, it asks for one of
+the file's keys on its first load. The status page at
+`http://127.0.0.1:1234/#/status` shows the loaded model live: speed, slots, VRAM
+and RAM, the SSD cache and the requests.
+
+**Run bench** on its Speed tile measures the model with the prompts behind the
+[Speed](#speed) numbers: two scripted agent sessions, three code edits that copy
+the prompt, and eighteen prose and code answers. It runs at priority `xhigh`,
+so other requests wait until it is done, and **Stop** ends it early. The results
+stay in your browser, per model file: a speed card, which **Save image**
+downloads, and a chart against earlier runs.
 
 ## Flags and switches
 
-All measurements on the RX 7900 XT with Swift 1.5 IQ4_XS unless a row says
-otherwise.
-
-### The quick start's flags
-
-| flag | what it does | where it helps |
-|---|---|---|
-| `-c 98304`, `-ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0` | 96k tokens of context, with a 4-bit KV cache (~18 KB per token) for the model and its draft head | the most a 20 GB card holds without paging: 17.9 GB at load, 18.6 GB with both slots full (58k and 39k tokens). The ROCmFP4-FP6 quant takes 0.5 GB more. Windows silently pages whatever does not fit to system RAM: 0.9 GB at `-c 131072` |
-| `-np 2 --kv-unified --kv-unified-reserve 12288` | two slots on one shared KV pool; a second request starts only while both can still generate 12k tokens, otherwise it waits in the queue | two agents on one card, e.g. an orchestrator and a worker. [More](#several-slots-on-one-gpu) |
-| `--no-cache-idle-slots` | keeps an idle conversation in its slot; the default saves and clears it at every new task | the next turn of either agent starts without a restore |
-| `-b 2048 -ub 2048` | prompts in batches of 2048 tokens | prompts 3-4% faster than at 1024. It fits since [rollback by replay](#rollback-by-replay). 1536 is slower, as the WMMA GEMM is tuned for 1024 and 2048 rows; below 512 the WMMA GEMM never runs |
-| `--no-mmproj-offload` | the 0.9 GB vision projector runs on the CPU | VRAM for context at two slots. Images take 7-12 s to the first token instead of 3-5 s. The BF16 projector encodes 8% faster than f16 on CPUs with AVX-512 BF16 (Ryzen 7000 and newer) |
-| `--spec-type draft-mtp`, `--spec-draft-n-max 4 --spec-draft-p-min 0.60` | the model's own MTP head drafts up to 4 tokens per pass | models that ship an MTP head (Qwen3.5/3.6/3.8): decode +45% on prose, +112% on code, for ~0.7 GB of VRAM and 3% of prefill speed |
-| `--spec-type "...,ngram-map-k4v"` | text copy boost: where the last tokens repeat an earlier place in the context, the continuation found there is drafted, up to 48 tokens once six 4-token probes in a row would have been accepted | answers that copy the prompt, such as code edits and quoted files: up to 315 t/s. On two days of agent traffic it saved 4.6-6.0% of decode time. Quote the value in a .cmd file, as cmd splits arguments at commas |
-| `--ctx-checkpoints 8 --checkpoint-min-step 2048` | up to 8 checkpoints of the model state per slot (~200 MiB each, host RAM), at least 2048 tokens apart. When the list is full, the one whose removal leaves the smallest gap goes; the one at the first user message stays | hybrid models such as Qwen3.8, whose recurrent layers cannot roll back: a prompt that changes late resumes from the nearest checkpoint instead of from scratch |
-| `--cache-ram 0 --cache-disk PATH --cache-disk-limit 65536 --cache-disk-checkpoints 4` | conversations and their checkpoints go to SSD (64 GB limit, 4 checkpoints per entry) instead of RAM | more agents than slots, and restarts. [More](#the-ssd-prompt-cache) |
-| `--load-mode dio` | reads the model with direct I/O instead of memory-mapping it | keeps the 15 GB model file out of system RAM |
-| `--gpu-keepalive-ms 2000` | a tiny clear on the GPU every 2 s | AMD on Windows: a card on a nearly full VRAM budget that sits idle loses its resident memory, and the next request crawls |
-| `--chat-template-kwargs "{\"reasoning_effort\":\"low\"}"` | Swift 1.5's low thinking level | agent turns; medium and xhigh did no better in our agent bench |
-| `--reasoning-budget 4096`, `--reasoning-budget-message` | caps the thinking of one answer at 4096 tokens; then the server inserts the message and ends the thinking, and the model answers | long re-planning loops. In 567 agent calls the median answer thought 86 tokens; the cap reached about 1% (up to 12.5k tokens, three and a half minutes) and cut 9% of all thinking. Per request: `reasoning_budget_tokens` |
-| `--reasoning-preserve` | every past assistant turn keeps its think block, empty when the client does not send it back (~4 tokens) | clients that do not echo thinking, such as Hermes: without it, the previous turn renders differently once a new user message arrives, and a tool-using turn was prefilled again (median 5k tokens) on every exchange |
-| `--temp 1` | sampling temperature 1 | Qwen3.8, which degrades under greedy decoding |
-| `-dev ROCm0 -ngl 999 -fa on --jinja`, `--alias`, `--host`, `--port`, `--api-key-file` | standard llama.cpp: the whole model on the first GPU, flash attention, the model's own chat template, the served name and the listening address | |
-
-### Flags this runtime adds
-
-Beyond the ones in the quick start:
-
-| flag | default | what it does | where it helps |
-|---|---|---|---|
-| `--shared-pass`, `--no-shared-pass` | on | slots that decode at the same moment go through the model in one pass | two busy slots on Qwen3.5/3.8: 46 to 67 t/s in total. [More](#several-slots-on-one-gpu) |
-| `--spec-ngram-map-ramp`, `--no-spec-ngram-map-ramp` | on | the probe gate of the text copy boost (`ngram-map-k`, `ngram-map-k4v`). Without it every n-gram draft has full length from the first match | without: 268 t/s on code edits and 180 t/s on the copy at 41k, but slower on answers that only share phrases with the context, where a wrong long draft costs a checkpoint restore and a replay pass |
-| `--priority-trickle-ms N` | 2000 | while an `xhigh` request runs, the held ones still join one pass every N ms; 0 = none | see [Request priority](#request-priority) |
-| `--classifier-head FILE`, `--classifier-config FILE`, `--classifier-cache DIR` | off | serve the loaded model as a decision classifier on `/v1/classifier`, with a decision head and its prompt layout; the cache answers a repeated question about the same text from disk | yes/no, choice and score decisions from a small model, on the CPU. [More](#decision-classifier) |
-| `--models-default NAME` | none | router mode: the model that serves requests without a known `"model"` | clients that send no model name, or another server's |
-| `--models-api-loopback-only` | off | router mode: loading and unloading models is accepted only from this machine; other addresses get 403 | a router port reachable from a LAN or the internet |
-| `--spec-mtp-strict-qwen` | off | MTP verification that keeps greedy output exact at draft boundaries (from the ROCmFPX project) | reproducible temperature-0 runs with MTP on Qwen3.5/3.8 and Qwen3.8-Flash-Next, one slot only |
-| `--cache-disk-min-tokens`, `--cache-disk-prefix-step` | 2048, 4096 | see [The SSD prompt cache](#the-ssd-prompt-cache) | |
-
-### Environment variables
-
-**Set in the quick start:**
-
-| variable | what it does | where it helps |
-|---|---|---|
-| `GGML_CUDA_NO_PINNED=1` | no pinned host memory | a nearly full card on Windows: pinned memory makes more of the model page out, for no speed gain |
-| `LLAMA_MAX_QUEUED=3` | a request is turned away once three are already waiting | clients that can fall back to another server instead of queueing |
-| `ROCMFPX_DRAFT_VOCAB=24576` | the MTP draft head scores 24,576 candidate tokens instead of all 248,320: half fixed, half the main model's own top tokens at the previous position, per slot. The main model still verifies every drafted token against the full vocabulary | MTP on Qwen3.5/3.8, where it is off unless set (Qwen3.8-Flash-Next uses 16,384 by default): decode +9% at a short context, +3-5% at 41k. 24,576 accepts slightly more drafted tokens than 16,384, at the same speed |
-
-**On by default.** `=0` turns each off, for comparisons or a card where one
-misbehaves:
-
-| variable | what it does | where it helps |
-|---|---|---|
-| `GGML_HIP_FA_GQA6` | decode attention with one GPU block per KV head carrying all six of its query heads, for batches of 1 to 5 tokens, instead of three groups of two and a batch padded to 8 | Qwen3.5/3.8-27B (head size 256, 24 query heads on 4 KV heads) on RDNA: decode +10-12% at 41k, +2-6% at 17k, nothing at a short context |
-| `GGML_HIP_FA_GQA7` | the same for seven query heads per KV head at head size 128 | models of that shape on RDNA, e.g. Nanbeige4.3-33B |
-| `GGML_HIP_FA_Q4_TILE` (`_MIN`, `_MAX`: 1, 8 tokens) | decode attention reads a q4_0 KV cache as stored, once per group of query heads, instead of converting the cache to f16 on every call | a q4_0 KV cache at head size 256 (or 128 with seven query heads per KV head), batches of 1 to 8 tokens, on RDNA; `=1` also on other HIP cards |
-| `ROCMFPX_WMMA_GEMM` | prompt batches of 512 tokens or more through an f16 WMMA GEMM instead of the int8 path | RDNA3 and RDNA3.5 with the GEMM library built. Weights: ROCmFP4/FP6 and the stock Q4_0, Q4_1, Q5_1, Q8_0, Q2_K-Q6_K, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS and IQ2 types. A cold 17k prompt: IQ4_XS 781 to 864 t/s, ROCmFP4 682 to 923. [More](#prompts-through-a-wmma-gemm) |
-| `ROCMFPX_WMMA_GEMM_MIN_BATCH`, `ROCMFPX_WMMA_GEMM_SCRATCH_MB`, `ROCMFPX_WMMA_GEMM_DIR` | the smallest batch for it (512), its f16 weight scratch (sized automatically), and where its library is loaded from (next to the binaries) | tuning, and installs that keep the library elsewhere |
-| `GGML_HIP_MM_SKINNY` | an F32 matmul kernel for weights of 9 to 256 rows at prompt and multi-slot batch sizes, instead of rocBLAS | Qwen3.5/3.8's DeltaNet gate weights, kept F32 by IQ4_XS and K-quant GGUFs, and F32 MoE routers, on RDNA: 1024-token prompts +3%, 10 to 16 parallel decodes +25-30% |
-| `GGML_HIP_GDN_CONV_SNAP` | the concat, the conv, the SILU and the rollback snapshots of a DeltaNet layer in one kernel | Qwen3.5/3.6/3.8 on HIP and CUDA. With `GGML_HIP_MMVQ_FUSE_VERIFY`: decode +2.3-3.9%, two slots +6.8%, short prompts +9-17% |
-| `GGML_HIP_MMVQ_FUSE_VERIFY` | the matmul kernel adds the residual itself in verify batches of 2 to 8 tokens | MTP and n-gram drafting, and two busy slots, on RDNA3.0 and RDNA4 |
-| `GGML_CUDA_GDN_CHUNKED` | the DeltaNet part of a prompt through a chunked WMMA kernel (from the ROCmFPX project) | Qwen3.5/3.6/3.8 and Qwen3-Next prompts of one sequence, 64 tokens or more, on RDNA3 |
-| `ROCMFPX_RS_REPLAY` | [rollback by replay](#rollback-by-replay) instead of a copy of the recurrent state per drafted token | Qwen3.5/3.6/3.8 and Qwen3-Next with drafting: 0.8 GB less VRAM at two slots, decode equal |
-| `ROCMFPX_MTP_LEAN_RESERVE` | the MTP draft context reserves memory for the two shapes it runs, 80 MiB instead of 784 MiB | dense Qwen3.5/3.8 with one MTP block; it lets `-ub 2048` fit beside `-c 98304` |
-| `ROCMFPX_NGRAM_SHADOW`, `ROCMFPX_NGRAM_PROBES` | the text copy boost scores its probes in the background instead of sending them (`=0` sends them); probes in a row before long drafts start (6) | with the ramp: 5-6% of the requests came out slower, against 12-40% when the probes were sent |
-| `LLAMA_KV_LANES_MERGE` | the largest batch, in tokens, that a shared pass takes (8); 0 = never share | the shared pass of two busy slots |
-| `GGML_CUDA_MMVQ_Q8_CACHE` | matmuls that read the same activation quantize it once (from the ROCmFPX project) | written for Qwen3.8-Flash-Next |
-| `GGML_CUDA_GRAPH_CHUNK_SIZE` | GPU graphs are captured in chunks of 512 nodes (from llama.cpp); 0 = one graph | |
-
-**Off by default:**
-
-| variable | what it does | where it helps |
-|---|---|---|
-| `ROCMFPX_FP8_GEMM=1` | prompt batches through an FP8 GEMM: FP8 WMMA on RDNA4, an f16 stand-in on RDNA3 that is only there to check it. `ROCMFPX_FP8_GEMM_TILE=1` picks 4-wave tiles instead of 8; `ROCMFPX_FP8_GEMM_CHECK=N` (RDNA3) compares the first N products with an emulation in the log | RDNA4, not yet run on one. With every token through FP8, mean KL divergence rises by about 0.005. See [Other cards](#other-cards) |
-| `GGML_HIP_MMVQ_FUSE_VERIFY_GLU=1` | also runs gate, up and GLU as one kernel in verify batches of 2 to 8 tokens | not measured on RDNA4; on the RX 7900 XT the same text in 2.2 times the time |
-| `GGML_CUDA_DQ_MMV`, `GGML_CUDA_DQ_Q6K` (`GGML_CUDA_DQ_ROWS`: 1, 2, 4 or 8 rows per block) | one-token decode of Q4_K and Q5_K (with `DQ_Q6K` also Q6_K) in floats instead of quantizing the activation | K-quant models on RDNA3.5, where it is on by default; `=1` on the RX 7900 XT is 6-24% slower per kernel |
-| `GGML_CUDA_FA_WMMA_MAX_HEAD` | the largest head size on the WMMA attention kernel: 576 on RDNA4, 256 elsewhere | heads of 320, 512 or 576 (Mistral Small 4, DeepSeek, GLM) run there on RDNA4; elsewhere for tests |
-| `ROCMFPX_MMQ_FUSION` | `=1` also runs the fused gate/up/GLU prompt kernel for MoE experts on RDNA3.0 (by default NVIDIA only), `=0` turns it off everywhere | correct but 3-16% slower on the RX 7900 XT (Qwen3-30B-A3B IQ4_XS) |
-| `GGML_CUDA_SHARED_EXPERT_FUSION` | llama.cpp's fused routed and shared expert matmul, off on HIP (`=1` turns it on) | MoE models with a shared expert. On gfx1151 MTP verify was 3-7% slower with it |
-| `LLAMA_SPEC_LOOKUP_EXTEND=1` (`_MATCH`, `_MAX`: 8, 16 tokens) | after a model drafter (MTP, DFlash2, EAGLE3) proposes its tokens, the draft is extended with what followed the same tail earlier in the prompt | the older form of the text copy boost; `ngram-map-k4v` is the measured one |
-| `GGML_CUDA_AR_P2P=1` (`_ISSUER`: device 1) | the all-reduce of two GPUs sends large tensors by peer copy instead of through host memory | two AMD cards whose peer access works both ways; not tested here (one card) |
-
-**From the ROCmFPX project**, for its models, quants and cards; not tuned or
-measured here:
-
-| variable | what it does | where it helps |
-|---|---|---|
-| `ROCMFPX_QWEN4_QSA_DECODE=1`, `ROCMFPX_QWEN4_QSA_DECODE_BLOCKS`, `ROCMFPX_QWEN4_QSA_DECODE_CACHE` | sparse attention for decode batches at 8k cells and more, block selection as in the prompt, and a cache of the pooled keys (the last two on by default) | Qwen3.8-Flash-Next (qwen4exp) on HIP |
-| `LLAMA_MTP_QSA_MIN_T` (1) | below this batch size the MTP layer attends densely | Qwen3.8-Flash-Next MTP |
-| `ROCMFPX_DRAFT_HEAD_QUANT` (on), `ROCMFPX_QWEN4_PAD_HEAD=1` | draft steps use a Q4_0 copy of the output head; 2-3-row head products padded to 4 rows | Qwen3.8-Flash-Next MTP |
-| `ROCMFPX_MTP_CUM_P` (`_MIN`, `_MAX`: 1, 5) | stops drafting once the product of the drafted tokens' probabilities falls below P | MTP with an adaptive draft length; off by default |
-| `ROCMFPX_NGRAM6`, `ROCMFPX_NGRAM_WINDOW`, `ROCMFPX_NGRAM_FLOOR4` | a 6-token table behind the main one, an adaptive draft window, and a window floor of 4 instead of 8 | `--spec-type ngram-mod` |
-| `ROCMFPX_MOE_SORT_IDS=1`, `ROCMFPX_ROCMI4_MOE_RPB8=1` | MoE decode kernels with sorted experts and with 8 rows per block | ROCmI4 and ROCmFP4_FAST experts on RDNA3.5 |
-| `GGML_CUDA_MMQ_MOE_TILE_MULT` (1) | weights the tokens per expert when the MoE prompt kernel picks its tile | MoE prompts on RDNA3 and RDNA4 |
-| `GGML_CUDA_NORM_GATED_MIN_ROWS` (4096), `GGML_CUDA_HC_COMBINE_MIN_ROWS` (512), `GGML_CUDA_HC_UP_PRE` (on) | fusions of the gated norm and of the hyper-connection kernels, and their thresholds | Qwen3.8-Flash-Next, DeepSeek 4, GLM-5-Next |
-| `ROCMFPX_HIP_GRAPH_COPY_KERNEL` | copies inside HIP graphs run as kernels (on by default only with unified memory) | RDNA3.5, where graph copies left stale recurrent state |
-| `GGML_SCHED_UMA_RING` (2) | copies of the graph inputs, so the host writes the next while the GPU reads the last | iGPUs and other shared-memory setups |
-| `GGML_SCHED_PIN_ASYNC_READS` (on) | keeps tensors that another backend still reads out of memory reuse | several backends in one graph |
-| `GGML_CUDA_DISABLE_SSD` | turns off the matmul path of the Mamba-2 scan for long sequences | Mamba-2 models |
-| `LLAMA_LAZY_PREFETCH_DRAFT=1` | with `--lazy-mode`, warms the per-layer embedding rows of drafted tokens | Qwen3.8-Flash-Next with lazy loading |
-| `GGML_VK_MMID_TILED` (on, `_MIN` 1024), `GGML_VK_ROCMFP4_COOPMAT=1` | Vulkan: a tiled int8 kernel for IQ3_S MoE experts in prompts; a ROCmFP4 coopmat matmul (built with `-DGGML_VULKAN_ROCMFP4_COOPMAT=ON`) | Vulkan |
-| `ROCMFPX_PLUGIN_PATH` | ROCmFPX plugins to load | see [Plugin system](#plugin-system) |
-
-**Diagnostics.** None of these is needed in normal use:
-
-| variable | what it does |
-|---|---|
-| `ROCMFPX_WMMA_GEMM_FP8_EMU=1`, `2`, `3` | rounds the weights, the activations or both to E4M3 inside the f16 WMMA GEMM, to measure what FP8 costs in quality on any gfx11 card (changes the output) |
-| `GGML_CUDA_OP_PROFILE=N` | GPU time per kind of op, every N graphs; slows every pass |
-| `LLAMA_DECODE_PROFILE=N` | host time per phase of a ubatch, and the server loop's phases |
-| `LLAMA_NODE_DUMP=1` | a fingerprint of every named tensor after each ubatch, to find where two runs part |
-| `GGML_CUDA_FA_DEBUG`, `GGML_HIP_FA_PARALLEL_BLOCKS=N` | logs attention launch shapes; forces N blocks along the KV axis |
-| `GGML_CUDA_FUSE_MASK`, `GGML_CUDA_FUSE_MASK0` | bit masks of the fusion groups, to bisect a fusion |
-| `GGML_CUDA_GRAPH_VERIFY_UID=1` | checks every reused GPU graph node by node |
-| `GGML_SCHED_SANITIZE=1` or `2`, `GGML_SCHED_SANITIZE_NONFATAL=1` | the scheduler's race detector, fatal or counting |
-| `ROCMFPX_TRACE_NGRAM`, `ROCMFPX_MMQ_NO_DEDUP` | logs n-gram accepts; turns off the once-per-token quantization of MoE prompt inputs |
+Every flag and variable of the quick start, the flags this runtime adds (expert handoff among them) and
+its switches, with what each does and where it helps: [docs/FLAGS.md](docs/FLAGS.md).
 
 ## Other cards
 
 Everything above is tuned and measured on an RX 7900 XT. The fast paths are on
 for every AMD card that can run their code, tuned or not; only the ones that
 would likely not help elsewhere stay limited to the RX 7900 series. Each has a
-switch in [Environment variables](#environment-variables).
+switch in [Environment variables](docs/FLAGS.md#environment-variables).
 
 - **Any backend (CPU, Vulkan, other GPUs).** The slot ranges on the shared
   pool, the shared pass of busy slots, the MTP changes, the draft vocabulary,
@@ -471,7 +369,10 @@ to does not wait behind background work. A request without it is `default`.
 A held request keeps its slot, its context and its connection. If it is
 generating it still joins one pass every 2 s (`--priority-trickle-ms`, shared
 by all held requests, `0` = none), so its client keeps seeing progress; if it
-is still reading its prompt it waits. Nothing is cancelled or restarted. With
+is still reading its prompt it waits. Nothing is cancelled or restarted, with
+one exception: when a waiting `xhigh` request needs the room of a running `low`
+one in the shared KV pool, the `low` one ends at its next token with a truncated
+answer. With
 `LLAMA_MAX_QUEUED`, waiting requests of a lower level do not count against a
 new one.
 
@@ -910,4 +811,4 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
 - [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
 - [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
-- [adelj88/rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) - WMMA GEMM for RDNA3/RDNA3.5, used for prompt-sized FP4/FP6 matrix products on RDNA3 and RDNA3.5 - MIT license
+- [adelj88/rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) - WMMA GEMM for RDNA3/RDNA3.5, used for prompt-sized matrix products of the ROCmFPX and stock quantized weights on RDNA3 and RDNA3.5 - MIT license

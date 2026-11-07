@@ -2,6 +2,8 @@
 
 Independent measurements of `Q4_0_ROCMFP4_STRIX_LEAN` across four model architectures on a Ryzen AI Max+ 395 (gfx1151 / Radeon 8060S), 128 GB unified memory, ROCm 7.2.4.
 
+> Historical (measured 2026-07, ROCm 7.2.4, not re-measured since). Later changes that can move these numbers: prompt matmuls on ROCmFP4 weights can take a WMMA GEMM path on gfx11 GPUs, gfx1151 included (`[TAG_WMMA_GEMM]`, 2026-10-22), and RDNA-FAST builds use ROCm 10.1 since 2026-11-05.
+
 Contributed to answer a question I had before starting and could not find answered anywhere: **which architectures actually get faster under ROCmFP4, and by how much?**
 
 All four builds used this fork. Failures are included.

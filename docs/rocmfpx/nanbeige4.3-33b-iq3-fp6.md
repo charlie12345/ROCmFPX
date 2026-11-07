@@ -1,5 +1,9 @@
 # Nanbeige4.3-33B IQ3-FP6
 
+Status, 7 November 2026: a production trial that ended on 26 October 2026;
+production runs Swift 1.5 IQ4_XS. The recipe and its measurements stay as a
+record.
+
 A 3-bit quantization of
 [Nanbeige4.3-33B](https://huggingface.co/Nanbeige/Nanbeige4.3-33B)
 (Nanbeige's dense 33B agentic model, Apache-2.0) for the 20 GB RX 7900 XT at
@@ -114,8 +118,8 @@ tokenizer makes it 49k), the better of two runs, and the README decode test
 | VRAM at load / under load, GB | 19.26 / 19.44 | 18.05 / 18.26 | 18.13 + 0.74 shared |
 
 <sub>Nanbeige: `-c 65536 -ub 1024`, q4_0 KV cache, two sessions on one pool,
-n-gram drafting. Swift 1.5: `-c 98304`, MTP draft, the numbers of the main
-README.</sub>
+n-gram drafting. Swift 1.5: `-c 98304`, MTP draft, the main README's numbers
+as of 26 October 2026.</sub>
 
 ## Notes
 

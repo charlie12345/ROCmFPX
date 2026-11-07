@@ -1,6 +1,6 @@
 # Native draft vocabulary
 
-This Flash Next path adds a draft-vocabulary selector, its state, and graph integration. It is on by default for qwen4exp MTP draft contexts with 16384 candidate rows; `ROCMFPX_DRAFT_VOCAB=<rows>` changes the budget and `ROCMFPX_DRAFT_VOCAB=0` turns it off. Target verification still evaluates the full vocabulary, so accepted output is the target's; the candidate rows only change which tokens get proposed.
+This path adds a draft-vocabulary selector, its state, and graph integration. It is on by default for qwen4exp (Qwen3.8 Flash Next) MTP draft contexts with 16384 candidate rows; `ROCMFPX_DRAFT_VOCAB=<rows>` changes the budget and `ROCMFPX_DRAFT_VOCAB=0` turns it off. For qwen35 (Qwen3.5/3.8 dense, such as Swift 1.5) it is off unless `ROCMFPX_DRAFT_VOCAB` is set; the production launcher sets 24576 (see [Environment variables](../../README.md#environment-variables) in the top-level README). qwen35moe accepts the variable, but its draft graph still runs the full head. Target verification still evaluates the full vocabulary, so accepted output is the target's; the candidate rows only change which tokens get proposed.
 
 Each MTP draft context owns its candidate state, so independent draft drivers (for example two server instances on one model) never share candidates. Candidates are kept per sequence: with `-np > 1` every slot selects from its own last target logits, and the draft graph uploads the rows of the sequence it decodes. The candidate-row head runs for single-row draft steps; when several sequences draft in one step the full head is used.
 
@@ -22,9 +22,9 @@ A faster selector microbenchmark is not an end-to-end decoding measurement.
 
 ## Enabling the fast Qwen3.8 Flash Next path
 
-Every switch below except `ROCMFPX_DRAFT_VOCAB` defaults off. A normal build and the existing ROCmFP4 v2 launcher keep their current kernels on RDNA 3, RDNA 3.5, and RDNA 4.
+Every switch below except `ROCMFPX_DRAFT_VOCAB` defaults off; `ROCMFPX_HIP_GRAPH_COPY_KERNEL` is also on by default when `GGML_CUDA_ENABLE_UNIFIED_MEMORY` is set. A normal build and launch keep their current kernels on RDNA 3, RDNA 3.5, and RDNA 4.
 
-Set these only for the measured Flash Next server:
+Set these only for the measured Flash Next server (RDNA 3.5, Strix Halo):
 
 ```text
 ROCMFPX_DRAFT_VOCAB=16384
@@ -37,6 +37,8 @@ ROCMFPX_MOE_SORT_IDS=1
 ROCMFPX_ROCMI4_MOE_RPB8=1
 ```
 
-`ROCMFPX_QWEN4_QSA_DECODE=1` requires the Radeon 8060S and stops if the device or tensor shape is outside the kernel it was measured on. `ROCMFPX_HIP_GRAPH_COPY_KERNEL` and `ROCMFPX_ROCMI4_MOE_RPB8` act only on RDNA 3.5. The signed ROCmI4 dot is compiled only for gfx1151; other GPU targets keep the previous dot.
+`ROCMFPX_QWEN4_QSA_DECODE=1` requires the Radeon 8060S as `ROCm0` and stops if the device or tensor shape is outside the kernel it was measured on. `ROCMFPX_HIP_GRAPH_COPY_KERNEL`, `ROCMFPX_MOE_SORT_IDS` and `ROCMFPX_ROCMI4_MOE_RPB8` act only on RDNA 3.5. The signed ROCmI4 dot is compiled only for gfx1151; other GPU targets keep the previous dot.
+
+On a 20 GB discrete card such as the RX 7900 XT, Flash Next runs through the [expert handoff](../expert-handoff.md) instead.
 
 `GGML_ROCMI4_Q8_1_MMVQ_VDR=4` is an optional gfx1151 compile definition. CMake does not set it. Leaving it unset preserves the existing ROCmI4 mat-vec width on every architecture.

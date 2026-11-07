@@ -2,6 +2,8 @@
 
 Status: experimental. These notes cover the Qwythos 9B Claude Mythos 5 1M MTP BF16 source tested on Strix Halo.
 
+Historical (measured June 2026 on Strix Halo, gfx1151, Linux). Since then the HIP FP6 decode dot product was rewritten (`[TAG_FP6_MMVQ_FAST]`, 2026-10-24), FP6 prompt products run through the WMMA GEMM on gfx1100/gfx1151 (`[TAG_WMMA_GEMM]`), and the default `Vulkan0` backend stores FP6 packed. None of the tables below were re-run on that code. `scripts/sweep-rocmfp6-competitive.sh` still passes `-mmp 0`, which llama-bench dropped on 2026-10-02 (use `-lm none`), so it fails until updated.
+
 ## Presets
 
 Two opt-in ROCmFP6 presets were added without changing existing file types:
@@ -38,9 +40,11 @@ An isolated HIP build tested Q6_K-like ROCmFP6 VDR settings:
 
 ```bash
 BUILD_DIR=build-rocmfp6-vdr1-mmq8 \
-CMAKE_HIP_FLAGS='-DVDR_ROCMFP6_Q8_1_MMVQ=1 -DVDR_ROCMFP6_Q8_1_MMQ=8' \
+CMAKE_HIP_FLAGS='-DGGML_ROCMFP6_Q8_1_MMVQ_VDR=1 -DVDR_ROCMFP6_Q8_1_MMQ=8' \
 scripts/build-strix-rocmfp4-mtp.sh llama-bench
 ```
+
+The run used `-DVDR_ROCMFP6_Q8_1_MMVQ=1`. That macro can no longer be overridden; `GGML_ROCMFP6_Q8_1_MMVQ_VDR` (1, 2, 4 or 8) now sets the FP6 MMVQ VDR.
 
 ROCm0 results:
 
@@ -63,6 +67,7 @@ Implementation:
 - Added opt-in HIP compile flags for ROCmFP6 MMVQ experiments:
   - `GGML_ROCMFP6_FAST_SIGNMAG_PACK=1`
   - `GGML_ROCMFP6_MMVQ_HALF_BLOCK_SPLIT=1`
+  - (`GGML_ROCMFP6_MMVQ_HALF_BLOCK_SPLIT` now defaults to 1. With the default packed layout and VDR 4, the FP6 MMVQ dot takes the `[TAG_FP6_MMVQ_FAST]` path, which reads neither flag.)
 - Made the HIP FP6 MMVQ packed-word helper use an explicit zero sentinel word for shifted 24-bit reads at the end of a block.
 - Fixed the Vulkan ROCmFP6 packed-bit helper to avoid a 32-bit shift on aligned reads.
 - Fixed Vulkan ROCmFP6 mat-vec accumulation so both 4-weight lanes contribute to the partial sum.
@@ -73,7 +78,7 @@ Bench target:
 - Model: `Qwythos-9B-Claude-Mythos-5-1M-MTP`
 - ROCmFP6 model: `/mnt/seconddrive/models/Qwythos-9B-Claude-Mythos-5-1M-GGUF/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q6_0_ROCMFPX_AGENT-00001-of-00001.gguf`
 - Q6_K model: `/mnt/seconddrive/models/Qwythos-9B-Claude-Mythos-5-1M-GGUF/Qwythos-9B-Claude-Mythos-5-1M-MTP-Q6_K.gguf`
-- Test: `llama-bench -p 512 -n 128 -r 2 -fa on -ngl 999 -mmp 0`
+- Test: `llama-bench -p 512 -n 128 -r 2 -fa on -ngl 999 -mmp 0` (today `-lm none` replaces `-mmp 0`)
 
 | Build / model | Backend | pp512 t/s | tg128 t/s | Result |
 |---|---:|---:|---:|---|

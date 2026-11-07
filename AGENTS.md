@@ -90,6 +90,15 @@ Common mistakes that AI agents usually make:
 
 Before writing code or implementing a new feature, always read [skills/code-review/SKILL.md](skills/code-review/SKILL.md). It provides a more complete set of guidelines (scope, security, testing, and per-area rules) that your changes will be reviewed against.
 
+### RDNA-FAST (this fork)
+
+This repository is RDNA-FAST (`origin`: `serrynaimo/RDNA-FAST`), a fork of ROCmFPX (`upstream`: `ROCmFPX/ROCmFPX`; `legacy`: `charlie12345/ROCmFPX`), which is a fork of llama.cpp.
+
+- Push only to `origin`, and only when the owner asks. Never push to, open pull requests in, or comment on `ROCmFPX/ROCmFPX` or `ggml-org/llama.cpp` from this repository.
+- RDNA-FAST's own changes carry `[TAG_...]` markers in code comments and commit subjects. Keep them when you edit those lines, and use them to find related code.
+- Commits made with an AI assistant in this fork end with a `Co-Authored-By:` trailer naming the assistant, as in the existing history. The `Assisted-by` rule below is ROCmFPX's, for its own automation.
+- Build and measure with ROCm 10.1, as in the README's quick start.
+
 ### Owner-authorized ROCmFPX downstream automation
 
 The repository owner may explicitly authorize an automated agent to write commit messages and pull-request titles or descriptions, commit, push branches, create pull requests, and merge pull requests in the public or private `ROCmFPX/ROCmFPX` downstream repository. One direct request may authorize a named sequence of those actions, but the authorization must identify the repository and intended workflow; do not infer it from a general request to edit or test code.

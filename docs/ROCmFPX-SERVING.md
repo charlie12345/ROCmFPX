@@ -1,5 +1,12 @@
 # ROCmFPX MTP Serving
 
+> **Note (2026-11-07):** Written in June 2026 for Strix Halo (gfx1151) on
+> Linux. Since the 2026-09-15 merge of the ROCmFPX org repo the server ignores
+> the per-request `speculative.*` fields and rejects `turbo3`/`turbo4` caches.
+> The scripts below still pass flags current builds reject
+> (`--checkpoint-every-n-tokens`, `--mmap`); for serving RDNA-FAST today see
+> [Flags and switches](FLAGS.md).
+
 This guide covers request-level MTP controls for ROCmFPX serving:
 
 ```text
@@ -9,7 +16,8 @@ speculative.p_min
 ```
 
 These fields let each request lower the active draft policy without restarting
-`llama-server`. The server startup value for `--spec-draft-n-max` remains the
+`llama-server` (currently ignored, see [Per-Request Overrides](#per-request-overrides)).
+The server startup value for `--spec-draft-n-max` remains the
 allocation cap, so start the server at the highest draft depth you plan to test
 and clamp individual requests downward.
 
@@ -31,11 +39,14 @@ Set `BUILD_DIR` or `BIN` when using a different build directory.
 
 ## Start A ROCmFPX MTP Server
 
-The helper script starts a single-slot OpenAI-compatible server with metrics and
-request-level draft overrides available. By default it first checks whether the
+The helper script starts a single-slot OpenAI-compatible server with metrics.
+By default it first checks whether the
 GGUF actually exposes MTP metadata/tensors. If the model does not support MTP,
 it prints a warning and starts without `draft-mtp` instead of passing invalid
 speculative flags.
+
+The script still passes `--checkpoint-every-n-tokens`, removed on 2026-09-15,
+so it fails to start against a current build until that line is dropped.
 
 ```bash
 MODEL=/path/to/model.gguf \
@@ -65,7 +76,7 @@ scripts/rocmfpx-model-capabilities.py /path/to/model.gguf --server-args
 ```
 
 The helper emits a validated serving profile for known local families. For
-example, Qwen/Qwable MTP ROCmFP4/ROCmFPX models get the Strix prompt-fast
+example, Qwen MTP ROCmFP4/ROCmFPX models get the Strix prompt-fast
 Vulkan profile with `draft-mtp`, `n-max 4`, q4 target/draft K/V, and a
 `4096/512` batch shape, while Nemotron 3 Nano 30B A3B ROCmFPX agent models are
 marked non-MTP and use the validated ROCm/f16-KV profile.
@@ -92,9 +103,9 @@ structured output before chasing smaller K/V cache.
 
 The helper also reports `supports_dflash` when a GGUF or filename exposes
 DFlash/DDFlash markers. Treat this as a capability signal, not a forced launch
-flag: this branch currently exposes MTP, Eagle3, and n-gram speculative types
-in the public `--spec-type` path. Add DFlash launch flags only after the binary
-advertises the spec type and a smoke test proves it on ROCm and Vulkan.
+flag. `--spec-type` now also takes `draft-dflash` and `draft-dspark`, which need
+a DFlash draft model; smoke-test such a launch on ROCm and Vulkan before
+relying on it.
 
 For production wrappers, run the preflight before launching:
 
@@ -130,6 +141,10 @@ time, so ports and host bindings can stay outside the model profile:
 my-rocmfpx-model-server --host 127.0.0.1 --port 18180
 ```
 
+The helper's profiles still include `--mmap`, which current builds reject
+(removed on 2026-10-02; use `--load-mode mmap`), so `launch_command` and
+generated wrappers need that edit.
+
 Useful defaults:
 
 ```text
@@ -150,14 +165,18 @@ CACHE_TYPE_K_DRAFT=f16
 CACHE_TYPE_V_DRAFT=f16
 THREADS=16
 THREADS_BATCH=32
-STRICT_BENCH=1
+SPEC_DRAFT_N_MAX=6
+SPEC_DRAFT_N_MIN=0
+SPEC_DRAFT_P_MIN=0.6
+SPEC_DRAFT_P_SPLIT=0.10
+STRICT_BENCH=0
 ```
 
 For ROCmFP4/ROCmFPX prompt-heavy work on Strix, use the prompt-fast preset:
 
 ```bash
 PERF_PRESET=prompt-fast \
-MODEL=/path/to/qwen-or-qwable-rocmfpx-mtp.gguf \
+MODEL=/path/to/qwen-rocmfpx-mtp.gguf \
 scripts/run-rocmfpx-mtp-server.sh
 ```
 
@@ -176,20 +195,21 @@ PARALLEL=1
 POLL=50
 ```
 
-For single-user decode on Qwen/Qwable MTP ROCmFP4/ROCmFPX models, use the
+For single-user decode on Qwen MTP ROCmFP4/ROCmFPX models, use the
 decode-fast preset:
 
 ```bash
 PERF_PRESET=decode-fast \
-MODEL=/path/to/qwen-or-qwable-rocmfpx-mtp.gguf \
+MODEL=/path/to/qwen-rocmfpx-mtp.gguf \
 scripts/run-rocmfpx-mtp-server.sh
 ```
 
 This is still a serving policy change, not a GGUF or quantization change. It
 uses Vulkan0, q8 accepted K/V, q4 draft K/V, `512/512` batch shape, single
-slot, and a `p-min 0.75` confidence gate so low-confidence draft tokens do not
-burn verify work. On the local Qwen3.6 27B MTP ROCmFP4 STRIX_LEAN smoke matrix,
-the relevant results were:
+slot, `n-max 6` and a `p-min 0.6` confidence gate so low-confidence draft tokens
+do not burn verify work. Until 2026-07-03 it used `n-max 4` and `p-min 0.75`;
+the matrix below predates that change. On the local Qwen3.6 27B MTP ROCmFP4
+STRIX_LEAN smoke matrix, the relevant results were:
 
 | Profile | Backend | KV | `n-max` | `p-min` | Short decode tok/s | Sustained decode tok/s |
 |---|---|---|---:|---:|---:|---:|
@@ -211,8 +231,8 @@ ROCmFP4 coherent GGUF was about 7% smaller than Q4_K_M, with WikiText-2 PPL
 `5.7358` versus Q4_K_M `5.4800` on the same clone build.
 
 `STRICT_BENCH=1` disables prompt-cache reuse and sets slot prompt similarity to
-zero so benchmark rows are easier to compare. For interactive serving, set
-`STRICT_BENCH=0` if you want normal prompt-cache behavior.
+zero so benchmark rows are easier to compare. The default, `STRICT_BENCH=0`
+since 2026-06-25, keeps normal prompt-cache behavior.
 
 ## Backend Utilization Knobs
 
@@ -231,7 +251,7 @@ Presets:
 |---|---|
 | `balanced` | stable default, single slot, conservative polling |
 | `prompt-fast` | Strix ROCmFP4/ROCmFPX prefill profile; Vulkan0, q4 K/V, `4096/512`, single slot |
-| `decode-fast` | Strix Qwen/Qwable MTP decode profile; Vulkan0, q8 accepted K/V, q4 draft K/V, `p-min 0.75`, `512/512`, single slot |
+| `decode-fast` | Strix Qwen MTP decode profile; Vulkan0, q8 accepted K/V, q4 draft K/V, `n-max 6`, `p-min 0.6`, `512/512`, single slot |
 | `latency` | keeps one slot and raises polling to reduce wakeup overhead |
 | `throughput` | uses two slots by default for continuous batching / multi-client use |
 
@@ -253,7 +273,7 @@ NO_HOST=1
 ```
 
 Start with ROCm for Nemotron-style non-MTP models and Vulkan or ROCm for
-Qwable/Qwen MTP models, then benchmark both. Keep `PARALLEL=1` for single-user
+Qwen MTP models, then benchmark both. Keep `PARALLEL=1` for single-user
 decode-speed measurements; use `PARALLEL=2` or higher only when testing
 continuous batching or multiple clients.
 
@@ -288,7 +308,8 @@ must pass the ROCmFPX backend-op family gates before its full-model benchmark
 numbers are accepted. On the clean Strix Halo Qwen3.6 35B A3B run, rocWMMA
 FlashAttention compiled and passed the family gates, but the default build was
 faster for ROCmFP4 prompt processing, so rocWMMA remains opt-in rather than a
-default.
+default. The `GGML_HIP_ROCWMMA_FATTN` CMake option has since been removed
+(2026-09-15), so the harness's rocWMMA variant now builds the default.
 
 ## Imatrix Quantization
 
@@ -310,6 +331,11 @@ also verifies weighted reconstruction improves over plain quantization for
 ROCmFP3, ROCmFP6, and ROCmFP8.
 
 ## TurboQuant Asymmetric KV
+
+Not available since 2026-09-15: `-ctk`/`-ctv` and `-ctkd`/`-ctvd` accept only
+`f32`, `f16`, `bf16`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0` and `q5_1`, so
+the wrapper below fails on `turbo4`, and `LLAMA_KV_TURBO_BOUNDARY_LAYERS` /
+`LLAMA_KV_TURBO_BOUNDARY_V` are no longer read. Kept as a record.
 
 TurboQuant is already available in this ROCmFPX tree through the `turbo3` and
 `turbo4` runtime cache types. It is separate from the ROCmFPX model-weight
@@ -356,6 +382,13 @@ experiments.
 
 ## Per-Request Overrides
 
+The server currently ignores these keys: their handlers are disabled (`#if 0`)
+in `tools/server/server-schema.cpp` since the 2026-09-15 merge, and
+`generation_settings` reports only `speculative.types`. The startup flags
+`--spec-draft-n-max`, `--spec-draft-n-min` and `--spec-draft-p-min` set the
+policy for every request. The examples and clamping rules below describe the
+code when the keys were honoured.
+
 Use the request keys on `/completion`:
 
 ```bash
@@ -397,6 +430,11 @@ curl -sS http://127.0.0.1:18180/v1/chat/completions \
 
 ## Dynamic Drafting
 
+Neither tool below works today: `scripts/rocmfpx-dynamic-draft.py` was removed
+from the tree on 2026-07-12, and the request fields
+`scripts/rocmfpx-draft-profile.py` emits are ignored (see above). Kept as a
+record.
+
 ROCmFPX supports Dynamic Drafting as a request-layer policy over llama-server's
 per-request speculative controls. Start the server with a high enough draft cap,
 then let the client choose safer or more aggressive values for each prompt.
@@ -432,7 +470,7 @@ scripts/rocmfpx-dynamic-draft.py \
   --endpoint /completion \
   --profile dense-coder \
   --backend ROCm0 \
-  --model-key qwable-agent \
+  --model-key qwen-agent \
   --ctx-size 65536 \
   --mode coding \
   --state-file /tmp/rocmfpx-dd-state.json \
@@ -478,7 +516,7 @@ acceptance telemetry, the wrapper also stores it and caps future `n_max` at the
 first consistently weak draft position instead of waiting for whole-request
 acceptance to fall.
 
-For Qwen/Qwable-style templates, the wrapper also strips literal
+For Qwen-style templates, the wrapper also strips literal
 `<think>...</think>` blocks and `reasoning_content` fields from returned JSON by
 default. Disable that only for debugging with `--no-strip-thinking`. The wrapper
 also requests `reasoning_format=deepseek` by default for OpenAI-compatible chat
@@ -489,7 +527,7 @@ Mode defaults:
 
 | Mode | Default adjustment | Use when |
 |---|---|---|
-| `coding` | slightly deeper draft cap, moderate split | Qwable/code models with deterministic code output |
+| `coding` | slightly deeper draft cap, moderate split | code models with deterministic code output |
 | `json` | lower draft cap, `p_min>=0.25`, low split | strict JSON responses and schema-constrained output |
 | `tool` | lower draft cap, `p_min>=0.25`, low split | agent tool-call plans and function-call shaped output |
 | `chat` | profile default | normal chat |

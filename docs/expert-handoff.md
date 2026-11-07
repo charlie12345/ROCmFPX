@@ -105,8 +105,8 @@ had followed a few answers.
 2. Use it for the work the profile is meant for: the agent or coding sessions, chats and languages you expect. The
    counts come from the tokens the model writes and from short prompts. Long prompts take the upload path and aren't
    counted. A few thousand written tokens give a usable ranking, and more is better.
-3. The file is written every 30 s of use and at exit. After the last answer, wait 30 s or stop the server normally
-   before you copy it.
+3. The file is written every 30 s of use and at exit. A server that sits idle writes nothing, so after the last
+   answer, stop the server normally before you copy the file.
 
 To keep refining one profile, pass the same file to both flags. Each run then adds its counts to the ones it loaded:
 
@@ -129,7 +129,7 @@ Pass it to `--expert-profile` alone. The file is then only read, never changed.
 
 ```sh
 llama-server -m Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf --expert-cache auto \
-  --expert-profile models/expert-profiles/Swift-1.5-Flash-Next.txt
+  -ot per_layer_token_embd=CPU -ub 4096 --expert-profile models/expert-profiles/Swift-1.5-Flash-Next.txt
 ```
 
 - **Hardware doesn't matter.** A profile holds no sizes. Each machine fills as many of the top-ranked experts as fit

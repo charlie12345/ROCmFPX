@@ -6,6 +6,14 @@ Merged tree: `llama.cpp-mtp-rocmfp4`
 Branch: `mtp-rocmfp4-strix`
 Build: reproducible with `scripts/build-strix-rocmfp4-mtp.sh`
 
+> Historical (measured 2026-05-23 to 05-25 on Strix Halo, gfx1151; not
+> re-measured since). The MTP host code tuned here (`llama_get_embeddings_pre_norm_ith()`,
+> `common_speculative_batch_add_one_seq()`, the contiguous verify-row copy) was
+> replaced by the ROCmFPX upstream MTP code in the 2026-09-15 merge
+> (`40c5e4965`), and the rocWMMA FlashAttention build option
+> `GGML_HIP_ROCWMMA_FATTN` left the tree in the same merge (removed upstream in
+> llama.cpp #26046).
+
 ## What Was Tested
 
 This compares Qwen3.6 27B MTP against Qwen3.6 27B MTP. It does not compare Qwen to Gemma.
@@ -241,7 +249,8 @@ probability distribution but skips the unused final RNG sampler selection; the
 candidate measured `104.6 tok/s` short and `90.2 tok/s` sustained on the
 35B A3B guard, while the dense 27B guard held `33.9 tok/s` short and
 `28.1 tok/s` sustained. Guard floors are `100.0` and `85.0 tok/s` for 35B,
-and `30.0` / `25.5 tok/s` for dense 27B.
+and `30.0` / `25.5 tok/s` for dense 27B. (The dense 27B floors were lowered to
+`12.0` / `11.5 tok/s` on 2026-06-24, `db247885a`.)
 
 Current KV and draft-depth isolation on the promoted reasoning-on 35B profile:
 
@@ -369,7 +378,8 @@ promoted.
 The older rocWMMA FlashAttention build was also checked against the 35B A3B
 profile after it had already regressed the dense 27B guard. It measured
 `99.7 tok/s` short and `76.1 tok/s` sustained, so rocWMMA remains opt-in only
-and is not promoted for the current Strix Halo ROCmFP4 MTP path.
+and is not promoted for the current Strix Halo ROCmFP4 MTP path. (The option
+has since been removed; see the note at the top.)
 
 A single-sequence MTP `process()` fast path was also prototyped for the `-np 1`
 serving case. It compiled and passed the guard floors, but measured only
@@ -1115,3 +1125,8 @@ default HIP FlashAttention path.
 This isolated tree does not currently contain TurboQuant or TriAttention runtime
 flags. Adding either would be a source-level merge, not a flag flip, and should
 only be promoted after it beats the serial ROCmFP4 regression gate.
+
+Update: the TurboQuant KV kernels (`turbo3`, `turbo4`) were merged on
+2026-06-20 (`d859c9e67`), but `-ctk` / `-ctv` stopped accepting them in the
+2026-09-15 merge, so there is still no runtime flag. TriAttention is not in the
+tree.
