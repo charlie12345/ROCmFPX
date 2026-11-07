@@ -675,6 +675,15 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
             return true;
+        // ROCmFPX [TAG_FATTN_ROCMFP_KV] the ROCmFP KV caches have vector kernels for same-type K/V pairs (the
+        // ROCmFP branch of ggml_cuda_get_best_fattn_kernel picks them). This list came from upstream (#24403) in the
+        // 2026-09-15 merge without them, which left those kernels compiled but unreachable.
+        case GGML_TYPE_Q4_0_ROCMFP4:
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+        case GGML_TYPE_Q3_0_ROCMFPX:
+        case GGML_TYPE_Q6_0_ROCMFPX:
+        case GGML_TYPE_Q8_0_ROCMFPX:
+            return true;
         default:
             return false;
     }
@@ -796,14 +805,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    const bool is_rocmfp_family = K->type == GGML_TYPE_Q4_0_ROCMFP4 ||
-                                  K->type == GGML_TYPE_Q4_0_ROCMFP4_FAST ||
-                                  K->type == GGML_TYPE_Q3_0_ROCMFPX ||
-                                  K->type == GGML_TYPE_Q6_0_ROCMFPX ||
-                                  K->type == GGML_TYPE_Q8_0_ROCMFPX;
+    auto is_rocmfp_kv = [](const ggml_type t) {
+        return t == GGML_TYPE_Q4_0_ROCMFP4 || t == GGML_TYPE_Q4_0_ROCMFP4_FAST ||
+               t == GGML_TYPE_Q3_0_ROCMFPX || t == GGML_TYPE_Q6_0_ROCMFPX || t == GGML_TYPE_Q8_0_ROCMFPX;
+    };
+    const bool is_rocmfp_family = is_rocmfp_kv(K->type) || is_rocmfp_kv(V->type);
 
     if (is_rocmfp_family) {
-        if (can_use_vector_kernel && Q->ne[1] <= 2) {
+        // [TAG_FATTN_ROCMFP_KV] only same-type K/V pairs have a vector kernel instance (fattn-vec-instance-*)
+        if (K->type == V->type && can_use_vector_kernel && Q->ne[1] <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
         return BEST_FATTN_KERNEL_NONE;
