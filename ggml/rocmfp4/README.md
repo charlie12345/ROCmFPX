@@ -860,8 +860,10 @@ Current status:
     `F32/F16/BF16 -> Q4_0_ROCMFP4`,
     `F32/F16/BF16 -> Q4_0_ROCMFP4_FAST`, and the matching quant-to-F32
     dequant copy paths on the same large shape used by the ROCm CPY guard.
-    It is included in the all-regression harness to catch accidental Vulkan
-    copy fallback or shader-routing regressions.
+    It was in the all-regression harness to catch accidental Vulkan copy
+    fallback or shader-routing regressions; it is commented out there since
+    2026-11-07, because the 2026-09-15 merge dropped Vulkan's ROCmFP copy
+    pipelines.
   - `scripts/check-rocmfp4-rocm-runtime-regression.sh` measures the same
     focused `MUL_MAT` shapes on ROCm0. The guard covers `n=1`, `n=2`, `n=4`,
     and `n=8` for both FAST and dual-scale ROCmFP4 so MTP-style multi-column
