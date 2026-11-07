@@ -36,7 +36,7 @@ for backend in $BACKENDS; do
 
     echo "=== ROCmFPX EAGLE3 smoke: $backend ==="
     env HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-11.5.1}" \
-        GGML_HIP_ENABLE_UNIFIED_MEMORY="${GGML_HIP_ENABLE_UNIFIED_MEMORY:-1}" \
+        GGML_CUDA_ENABLE_UNIFIED_MEMORY="${GGML_CUDA_ENABLE_UNIFIED_MEMORY:-1}" \
         timeout --kill-after=30s 5m "$BIN" \
             -m "$MODEL" \
             -dev "$backend" \
@@ -48,7 +48,7 @@ for backend in $BACKENDS; do
             --spec-draft-n-max "${SPEC_DRAFT_N_MAX:-4}" \
             --spec-draft-n-min "${SPEC_DRAFT_N_MIN:-0}" \
             -fa on \
-            --no-mmap \
+            --load-mode none \
             -c "$CTX_SIZE" \
             -b "$BATCH_SIZE" \
             -ub "$UBATCH_SIZE" \

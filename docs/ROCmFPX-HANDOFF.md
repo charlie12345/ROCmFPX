@@ -139,7 +139,8 @@ The AMD-named `GGML_HIP_ENABLE_UNIFIED_MEMORY` alias is no longer read since
 The TurboQuant serving commands that stood here
 (`scripts/run-rocmfpx-turboquant-asym-server.sh`, and
 `scripts/run-rocmfpx-mtp-server.sh` with `turbo4` caches and
-`LLAMA_KV_TURBO_BOUNDARY_LAYERS`) no longer start: the server rejects `turbo4`.
+`LLAMA_KV_TURBO_BOUNDARY_LAYERS`) no longer start: the server rejects `turbo4`,
+and the asymmetric wrapper now exits at once saying so.
 
 ## How To Quant
 
@@ -230,8 +231,8 @@ The script now refuses to start if ROCm already reports an active KFD process,
 and it idles briefly before loading the next model. That was added to make
 “clear VRAM before each test” a concrete rule instead of a memory-based one.
 
-The script still passes `--mmap`, which current builds reject (removed on
-2026-10-02; use `--load-mode mmap`), so it needs that change before it runs.
+The script now passes `--load-mode mmap` in place of `--mmap`, which was
+removed on 2026-10-02.
 
 ## Observed Local Results
 

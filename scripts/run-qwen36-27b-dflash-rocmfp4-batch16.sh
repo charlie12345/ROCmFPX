@@ -9,7 +9,7 @@ rocmfpx_setup_env
 DFLASH_USE_ROCMFPX_ENV="${DFLASH_USE_ROCMFPX_ENV:-0}"
 if [[ "$DFLASH_USE_ROCMFPX_ENV" != "1" ]]; then
     unset HSA_OVERRIDE_GFX_VERSION
-    unset GGML_HIP_ENABLE_UNIFIED_MEMORY
+    unset GGML_CUDA_ENABLE_UNIFIED_MEMORY
 fi
 
 BUILD_DIR="${BUILD_DIR:-$ROOT/build-strix-rocmfp4}"

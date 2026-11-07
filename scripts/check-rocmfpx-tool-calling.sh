@@ -41,13 +41,13 @@ timeout --kill-after=20s 3m "$BIN" \
     -c "${CTX_SIZE:-4096}" \
     -t "${THREADS:-16}" \
     -tb "${THREADS_BATCH:-32}" \
-    --no-mmap \
+    --load-mode none \
     --simple-io \
     --no-display-prompt \
     --no-warmup \
     --no-perf \
     -no-cnv \
-    --strict-json \
+    -j '{}' \
     --temp 0 \
     --seed 123 \
     -n "$N_PREDICT" \

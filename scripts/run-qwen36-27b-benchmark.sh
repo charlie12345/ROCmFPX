@@ -26,7 +26,7 @@ THREADS_BATCH="${THREADS_BATCH:-32}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-10m}"
 
 export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-11.5.1}"
-export GGML_HIP_ENABLE_UNIFIED_MEMORY="${GGML_HIP_ENABLE_UNIFIED_MEMORY:-1}"
+export GGML_CUDA_ENABLE_UNIFIED_MEMORY="${GGML_CUDA_ENABLE_UNIFIED_MEMORY:-1}"
 
 mkdir -p "$OUT_DIR/raw"
 
@@ -155,7 +155,7 @@ run_pp() {
             -ctk q4_0 -ctv q4_0 \
             -p "$PROMPT_TOKENS" -n 0 \
             -b "$BATCH_SIZE" -ub "$UBATCH_SIZE" -t "$THREADS" \
-            -mmp 0 -r 3)
+            -lm none -r 3)
     value="$(bench_metric "$log" "pp${PROMPT_TOKENS}")"
     append_summary "$backend" "prompt-fill" "$status" "tok_s" "$value" "$seconds" "$log"
 }
@@ -170,7 +170,7 @@ run_tg() {
             -ctk q4_0 -ctv q4_0 \
             -p 0 -n "$TG_TOKENS" \
             -b "$BATCH_SIZE" -ub "$UBATCH_SIZE" -t "$THREADS" \
-            -mmp 0 -r 3)
+            -lm none -r 3)
     value="$(bench_metric "$log" "tg${TG_TOKENS}")"
     append_summary "$backend" "tg128" "$status" "tok_s" "$value" "$seconds" "$log"
 }
@@ -183,7 +183,7 @@ run_decode() {
     IFS=$'\t' read -r status seconds log < <(run_case "$label" \
         timeout --kill-after=60s "$TIMEOUT_SEC" "$CLI_BIN" \
             -m "$MODEL" -dev "$backend" -ngl 999 -fa on \
-            --no-mmap -ctk q4_0 -ctv q4_0 \
+            --load-mode none -ctk q4_0 -ctv q4_0 \
             -c 4096 -b "$BATCH_SIZE" -ub "$UBATCH_SIZE" \
             -t "$THREADS" -tb "$THREADS_BATCH" \
             --temp 0 --seed 123 --no-display-prompt --simple-io \
@@ -199,7 +199,7 @@ run_ppl() {
     IFS=$'\t' read -r status seconds log < <(run_case "$label" \
         timeout --kill-after=60s "$TIMEOUT_SEC" "$PPL_BIN" \
             -m "$MODEL" -dev "$backend" -ngl 999 -fa on \
-            --no-mmap -ctk q4_0 -ctv q4_0 \
+            --load-mode none -ctk q4_0 -ctv q4_0 \
             -c "$PPL_CTX" -b "$BATCH_SIZE" -ub "$UBATCH_SIZE" \
             -t "$THREADS" -tb "$THREADS_BATCH" \
             --no-warmup --chunks "$PPL_CHUNKS" -f "$CORPUS")

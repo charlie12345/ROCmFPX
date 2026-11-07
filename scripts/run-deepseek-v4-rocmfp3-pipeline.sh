@@ -11,17 +11,26 @@ CONVERSION_TMPDIR="/mnt/wd-easystore/.tmp"
 ROOT_DIR="/home/caf/rocmfpxclone/ROCmFPX"
 QUANTIZER="${ROOT_DIR}/build-strix-rocmfp4/bin/llama-quantize"
 
-INTERMEDIATE="/mnt/wd-easystore/DeepSeek-v4-Fable-MTP-BF16.gguf"
-QUANTIZED="${OUTPUT_DIR}/DeepSeek-v4-Fable-MTP-Q3_0_ROCMFPX.gguf"
+INTERMEDIATE="/mnt/wd-easystore/DeepSeek-v4-Fable-BF16.gguf"
+QUANTIZED="${OUTPUT_DIR}/DeepSeek-v4-Fable-Q3_0_ROCMFPX.gguf"
 
 INTERMEDIATE_PARTIAL="${INTERMEDIATE}.partial"
 QUANTIZED_PARTIAL="${QUANTIZED}.partial"
+
+# The converter no longer folds the MTP head into the target GGUF (--deepseek4-include-mtp is gone):
+# --mtp writes it as a separate draft, loaded with -md "$MTP_QUANTIZED" --spec-type draft-mtp.
+MTP_INTERMEDIATE="/mnt/wd-easystore/mtp-DeepSeek-v4-Fable-BF16.gguf"
+MTP_QUANTIZED="${OUTPUT_DIR}/mtp-DeepSeek-v4-Fable-Q3_0_ROCMFPX.gguf"
+
+MTP_INTERMEDIATE_PARTIAL="${MTP_INTERMEDIATE}.partial"
+MTP_QUANTIZED_PARTIAL="${MTP_QUANTIZED}.partial"
 
 echo "=== Pipeline Setup ==="
 echo "Source/Dest:    $DEST_SRC_DIR"
 echo "Output Dir:     $OUTPUT_DIR"
 echo "Intermediate:   $INTERMEDIATE"
 echo "Quantized:      $QUANTIZED"
+echo "MTP draft:      $MTP_QUANTIZED"
 echo "======================="
 
 # Ensure directories exist
@@ -36,14 +45,28 @@ cd "$ROOT_DIR"
 if [ -f "$INTERMEDIATE" ]; then
     echo "Intermediate BF16 GGUF already exists. Skipping conversion."
 else
-    echo "Step 2: Converting HF checkpoint to GGUF BF16 with MTP..."
+    echo "Step 2: Converting HF checkpoint to GGUF BF16..."
     TMPDIR="$CONVERSION_TMPDIR" python3 scripts/convert_deepseek_v4_modular.py \
         "$DEST_SRC_DIR" \
         --outtype bf16 \
-        --deepseek4-include-mtp \
         --use-temp-file \
         --outfile "$INTERMEDIATE_PARTIAL"
     mv "$INTERMEDIATE_PARTIAL" "$INTERMEDIATE"
+    echo "Conversion complete!"
+fi
+
+# 2b. Convert the MTP head to a separate BF16 draft GGUF
+if [ -f "$MTP_INTERMEDIATE" ]; then
+    echo "Intermediate BF16 MTP draft already exists. Skipping conversion."
+else
+    echo "Step 2b: Converting the MTP head to a BF16 draft GGUF..."
+    TMPDIR="$CONVERSION_TMPDIR" python3 scripts/convert_deepseek_v4_modular.py \
+        "$DEST_SRC_DIR" \
+        --outtype bf16 \
+        --mtp \
+        --use-temp-file \
+        --outfile "$MTP_INTERMEDIATE_PARTIAL"
+    mv "$MTP_INTERMEDIATE_PARTIAL" "$MTP_INTERMEDIATE"
     echo "Conversion complete!"
 fi
 
@@ -64,12 +87,32 @@ else
     echo "Quantization complete!"
 fi
 
+# 3b. Quantize the MTP draft to Q3_0_ROCMFPX
+if [ -f "$MTP_QUANTIZED" ]; then
+    echo "Quantized MTP draft already exists. Skipping quantization."
+else
+    echo "Step 3b: Quantizing the MTP draft to Q3_0_ROCMFPX..."
+    echo "Running dry-run..."
+    "$QUANTIZER" --dry-run "$MTP_INTERMEDIATE" Q3_0_ROCMFPX || true
+
+    echo "Running actual quantization..."
+    "$QUANTIZER" "$MTP_INTERMEDIATE" "$MTP_QUANTIZED_PARTIAL" Q3_0_ROCMFPX
+    mv "$MTP_QUANTIZED_PARTIAL" "$MTP_QUANTIZED"
+    echo "Quantization complete!"
+fi
+
 # 4. Clean up intermediate BF16 GGUF to free space
 if [ -f "$INTERMEDIATE" ] && [ -f "$QUANTIZED" ]; then
     echo "Step 4: Cleaning up intermediate GGUF..."
     rm -f "$INTERMEDIATE"
     echo "Cleanup complete!"
 fi
+if [ -f "$MTP_INTERMEDIATE" ] && [ -f "$MTP_QUANTIZED" ]; then
+    echo "Step 4: Cleaning up intermediate MTP draft GGUF..."
+    rm -f "$MTP_INTERMEDIATE"
+    echo "Cleanup complete!"
+fi
 
 echo "=== Pipeline Finished Successfully! ==="
 echo "Final model: $QUANTIZED"
+echo "MTP draft:   $MTP_QUANTIZED (load with -md and --spec-type draft-mtp)"

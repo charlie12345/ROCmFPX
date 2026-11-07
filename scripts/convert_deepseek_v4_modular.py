@@ -19,8 +19,10 @@ def main() -> None:
     parser.add_argument("--outtype", choices=["f16", "bf16", "auto"], default="f16")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--use-temp-file", action="store_true")
-    parser.add_argument("--deepseek4-include-mtp", action="store_true")
-    parser.add_argument("--deepseek4-max-layers", type=int, default=None)
+    # --deepseek4-include-mtp and --deepseek4-max-layers are gone from the converter. --mtp writes only
+    # the MTP head, as a separate draft GGUF (load it with -md and --spec-type draft-mtp).
+    parser.add_argument("--mtp", action="store_true",
+                        help="write only the MTP head, as a separate draft GGUF")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -35,6 +37,10 @@ def main() -> None:
     arch = get_model_architecture(hparams, ModelType.TEXT)
     logging.getLogger("hf-to-gguf").info("Model architecture: %s", arch)
     model_class = get_model_class(arch, mmproj=False)
+    if args.mtp:
+        if not model_class.supports_mtp_export:
+            raise SystemExit(f"--mtp is not supported for {arch}")
+        model_class.mtp_only = True
 
     model = model_class(
         args.model,
@@ -42,8 +48,6 @@ def main() -> None:
         args.outfile,
         use_temp_file=args.use_temp_file,
         dry_run=args.dry_run,
-        deepseek4_include_mtp=args.deepseek4_include_mtp,
-        deepseek4_max_layers=args.deepseek4_max_layers,
     )
     model.write()
 

@@ -21,9 +21,13 @@ has changed since:
   (`-md`) with `--spec-type draft-mtp`. The two-file path has not been tested
   on DeepSeek V4 here.
 - `--no-mmap` became `-lm none` (`--load-mode none`) on 2026-10-02.
-- The `scripts/run-deepseek-v4-*.sh` helpers still pass the removed flags and
-  expect a `build-deepseek4-rocmfp4` build directory, so they fail on the
-  current tree until updated.
+- The `scripts/run-deepseek-v4-*.sh` helpers no longer pass the removed flags
+  (updated 2026-11-07). With a third argument of `1` the full-conversion wrapper
+  now writes the `mtp-` draft with `--mtp` (run it with `0` for the target), the
+  ROCmFP3 pipeline writes the target and the `mtp-` draft, and the fixture
+  script, which needs the removed `--deepseek4-max-layers`, stops with a
+  message. Most helpers still expect a `build-deepseek4-rocmfp4` build
+  directory, so they fail on the current tree until that path is changed.
 - The promoted MTP artifact is about 92 GB, far beyond a 20 GB card with 32 GB
   of system RAM.
 
@@ -192,7 +196,7 @@ NO_REPACK=1 N_PREDICT=8 \
 ```
 
 Replace `ROCm0` with `Vulkan0` for the Vulkan path. The harness adds
-`--no-mmap` by default (`-lm none` on the current tree). Set `NO_MMAP=0` only
+`--load-mode none` by default (`--no-mmap` in June). Set `NO_MMAP=0` only
 for controlled loader diagnostics.
 
 ## Runtime Notes

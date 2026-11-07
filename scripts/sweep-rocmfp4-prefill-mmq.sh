@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Rebuild and benchmark ROCmFP4 MMQ prefill tuning candidates on the local
 # Strix ROCmFPX tree. This is intentionally full-model focused: backend-op
-# wins are only useful if Qwen/Qwable ROCmFP4 prompt throughput improves.
+# wins are only useful if Qwen ROCmFP4 prompt throughput improves.
 
 set -euo pipefail
 
@@ -43,7 +43,7 @@ run_bench() {
     local output="$3"
 
     env HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-11.5.1}" \
-        GGML_HIP_ENABLE_UNIFIED_MEMORY="${GGML_HIP_ENABLE_UNIFIED_MEMORY:-1}" \
+        GGML_CUDA_ENABLE_UNIFIED_MEMORY="${GGML_CUDA_ENABLE_UNIFIED_MEMORY:-1}" \
         "$bin" \
         -m "$model" \
         -dev "$DEVICE" \
@@ -53,7 +53,7 @@ run_bench() {
         -ctv q4_0 \
         -b "$BATCH_SIZE" \
         -ub "$UBATCH_SIZE" \
-        -mmp 0 \
+        -lm none \
         -t "$THREADS" \
         --poll "$POLL" \
         -p "$PROMPT" \

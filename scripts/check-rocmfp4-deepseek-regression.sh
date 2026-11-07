@@ -19,7 +19,7 @@ run_case() {
         -dev Vulkan0 \
         -ngl 999 \
         -fa on \
-        --no-mmap \
+        --load-mode none \
         -t 16 \
         -tb 32 \
         -ctk f16 \

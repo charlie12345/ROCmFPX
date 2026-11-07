@@ -64,7 +64,7 @@ for preset in $PRESETS; do
     timeout --kill-after=20s 5m "$PPL_BIN" \
         -m "$model" -dev "$BACKEND" -ngl 99 -c "$CTX_SIZE" \
         -t "${THREADS:-8}" -tb "${THREADS_BATCH:-16}" \
-        --no-mmap --no-warmup -f "$tmp_corpus" >"$log" 2>&1 || true
+        --load-mode none --no-warmup -f "$tmp_corpus" >"$log" 2>&1 || true
 done
 
 python3 - "$OUT_DIR" "$MODEL_SRC" <<'PY'

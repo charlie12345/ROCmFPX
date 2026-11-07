@@ -76,7 +76,7 @@ for preset in $PRESETS; do
             "$BENCH_BIN" \
                 -m "$model" -dev "$backend" -ngl "$NGL" -fa on \
                 -p "$PROMPT_TOKENS" -n "$GEN_TOKENS" -r "$REPEAT" -o md \
-                -t "$THREADS" -mmp 0 >"$log" 2>&1 || true
+                -t "$THREADS" -lm none >"$log" 2>&1 || true
         done
     fi
 done

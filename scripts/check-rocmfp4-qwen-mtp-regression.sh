@@ -85,7 +85,7 @@ run_case() {
         --spec-draft-device "$BACKEND" \
         -ngl 999 \
         -fa on \
-        --no-mmap \
+        --load-mode none \
         -t "$THREADS" \
         -tb "$THREADS_BATCH" \
         --spec-draft-threads "$SPEC_DRAFT_THREADS" \

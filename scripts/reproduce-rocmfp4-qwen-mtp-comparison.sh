@@ -81,7 +81,7 @@ run_case() {
         --spec-draft-device "$backend" \
         -ngl 999 \
         -fa on \
-        --no-mmap \
+        --load-mode none \
         -t "$THREADS" \
         -tb "$THREADS_BATCH" \
         -ctk "$CACHE_TYPE_K" \
@@ -174,7 +174,7 @@ fi
     echo
     echo "\`\`\`bash"
     echo "-ngl 999 -c $CTX_SIZE -b $BATCH_SIZE -ub $UBATCH_SIZE -fa on \\"
-    echo "-ctk $CACHE_TYPE_K -ctv $CACHE_TYPE_V --no-mmap --jinja -cnv -st \\"
+    echo "-ctk $CACHE_TYPE_K -ctv $CACHE_TYPE_V --load-mode none --jinja -cnv -st \\"
     echo "--reasoning $REASONING \\"
     echo "--spec-type draft-mtp --spec-draft-ngl all \\"
     echo "--spec-draft-type-k $SPEC_DRAFT_TYPE_K --spec-draft-type-v $SPEC_DRAFT_TYPE_V \\"

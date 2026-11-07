@@ -10,7 +10,6 @@ Built on [ROCmFPX](https://github.com/ROCmFPX/ROCmFPX) (its FP4/FP6 weight
 formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 [Other cards](#other-cards)
 
-
 ## Highlights
 
 - **Faster agent loops than LM Studio on the same card.** Leveraging ROCm 10
@@ -544,43 +543,6 @@ scripts/rocmfpx/retag-legacy-rocmfp2.py MODEL.gguf \
 
 The tool does not inspect or infer the layout because the two interpretations
 cannot be distinguished from the bytes. Do not use it on affine ROCmFP2 files.
-
-## Optional Charlie Vulkan plugin
-
-The optional [`ROCmFPXVulkan` extension](extensions/rocmfpx-vulkan/README.md)
-preserves the proven Charlie-era ROCmFP4 Vulkan path as a separate backend. It
-does not replace or patch llama.cpp's normal `Vulkan0` backend. The extension
-is disabled by default and appears as `ROCmFPXVulkan0` only when it is built
-and explicitly loaded.
-
-Build both the normal Vulkan backend and the optional extension on Linux:
-
-```bash
-cmake -S . -B build-rocmfpx-vulkan -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_SHARED_LIBS=ON \
-  -DGGML_VULKAN=ON \
-  -DROCMFPX_VULKAN_PLUGIN=ON
-cmake --build build-rocmfpx-vulkan \
-  --target llama-cli rocmfpx-vulkan-plugin -j
-```
-
-Load the plugin and select its device:
-
-```bash
-export ROCMFPX_PLUGIN_PATH="$PWD/build-rocmfpx-vulkan/bin/rocmfpx-vulkan-plugin.so"
-build-rocmfpx-vulkan/bin/llama-cli --list-devices
-build-rocmfpx-vulkan/bin/llama-cli \
-  -m /absolute/path/to/model.gguf \
-  -dev ROCmFPXVulkan0 -ngl 999
-```
-
-Keep `rocmfpx-vulkan-plugin.so` and its sibling
-`libggml-rocmfpx-vulkan.so` together. Both files must come from the same build
-and ROCmFPX commit. `--list-devices` should show both `Vulkan0` and
-`ROCmFPXVulkan0`; remove `ROCMFPX_PLUGIN_PATH` to return to the normal backend.
-See the [extension guide](extensions/rocmfpx-vulkan/README.md) for matched
-ROCmFP4 benchmarks and qualification limits.
 
 ## Plugin system
 

@@ -37,7 +37,7 @@ trap 'kill ${server_pid:-} 2>/dev/null || true; rm -f "$log"' EXIT
 
 "$SERVER_BIN" \
     -m "$MODEL" -dev "$BACKEND" -ngl 999 -c 2048 \
-    --host "$HOST" --port "$PORT" --no-mmap \
+    --host "$HOST" --port "$PORT" --load-mode none \
     >"$log" 2>&1 &
 server_pid=$!
 

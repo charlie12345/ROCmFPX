@@ -144,36 +144,6 @@ requirement. Until such an interface is implemented and qualified, the
 external CMake package plus its PowerShell launcher is the supported clean-tree
 route on Windows.
 
-## Use the Charlie Vulkan backend plugin
-
-The in-tree [Charlie Vulkan extension](../../extensions/rocmfpx-vulkan/README.md)
-is a complete backend-plugin example with a stricter compatibility rule: its
-wrapper and backend libraries must come from the same ROCmFPX build. It
-registers the legacy implementation as `ROCmFPXVulkan0` without replacing
-`Vulkan0`.
-
-```bash
-cmake -S . -B build-rocmfpx-vulkan -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_SHARED_LIBS=ON \
-  -DGGML_VULKAN=ON \
-  -DROCMFPX_VULKAN_PLUGIN=ON
-cmake --build build-rocmfpx-vulkan \
-  --target llama-cli rocmfpx-vulkan-plugin -j
-
-export ROCMFPX_PLUGIN_PATH="$PWD/build-rocmfpx-vulkan/bin/rocmfpx-vulkan-plugin.so"
-build-rocmfpx-vulkan/bin/llama-cli --list-devices
-build-rocmfpx-vulkan/bin/llama-cli \
-  -m /absolute/path/to/model.gguf -dev ROCmFPXVulkan0 -ngl 999
-```
-
-The wrapper resolves `libggml-rocmfpx-vulkan.so` beside itself and registers
-it through the host's backend registry. Expected startup messages include
-`registered 1 ROCmFPX Vulkan device(s)` and `loaded
-rocmfpx-vulkan-charlie`. Keep the two shared libraries together, use an
-absolute plugin path, and rebuild both for each ROCmFPX/ggml commit. Unset
-`ROCMFPX_PLUGIN_PATH` to disable the extension and use `Vulkan0` normally.
-
 ## Sidecar state
 
 The SSD lanes have distinct purposes: KV checkpoints persist resumable prompt

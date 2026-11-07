@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+printf 'run-deepseek-v4-rocmfp4-fixture.sh: convert_hf_to_gguf.py no longer has --deepseek4-max-layers (or --deepseek4-include-mtp), so it cannot write an N-layer DeepSeek V4 fixture; see scripts/run-deepseek-v4-rocmfp4-full-conversion.sh for the full model\n' >&2
+exit 2
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE_DIR="${1:-/mnt/ai-models/gguf-sources/DeepSeek-V4-Flash-180B}"
 OUTPUT_DIR="${2:-/home/caf/strix-fp4/runtime-fixtures/deepseek-v4}"

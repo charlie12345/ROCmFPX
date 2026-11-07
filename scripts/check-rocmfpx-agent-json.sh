@@ -45,13 +45,13 @@ run_case() {
         -c "$CTX_SIZE" \
         -t "${THREADS:-16}" \
         -tb "${THREADS_BATCH:-32}" \
-        --no-mmap \
+        --load-mode none \
         --simple-io \
         --no-display-prompt \
         --no-warmup \
         --no-perf \
         -no-cnv \
-        --strict-json \
+        -j '{}' \
         --temp 0 \
         --seed 123 \
         -n "$N_PREDICT" \

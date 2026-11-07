@@ -35,7 +35,7 @@ run_probe() {
         -c 4096 \
         -t 16 \
         -tb 32 \
-        --no-mmap \
+        --load-mode none \
         --simple-io \
         --no-display-prompt \
         --no-warmup \
@@ -110,7 +110,7 @@ for probe in "${probe_list[@]}"; do
         json)
             run_probe json \
                 "Return a JSON object with keys answer and method. answer must be 391 and method must be multiplication." \
-                --strict-json
+                -j '{}'
             ;;
         *)
             echo "unknown coherency probe: $probe" >&2

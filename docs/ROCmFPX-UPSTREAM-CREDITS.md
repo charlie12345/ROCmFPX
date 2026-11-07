@@ -33,7 +33,7 @@ upstream commits are recorded in [UPSTREAM-ATTRIBUTION.md](UPSTREAM-ATTRIBUTION.
 - Scope: TurboQuant `turbo3`/`turbo4` K/V-cache quantization paths for ROCm/HIP and Vulkan.
 - Status (2026-11-07): since the 2026-09-15 merge of the ROCmFPX org repo,
   `-ctk`/`-ctv` no longer accept `turbo3`/`turbo4`. The kernels remain in
-  `ggml/src` (CPU, CUDA/HIP, Vulkan) and in `extensions/rocmfpx-vulkan`.
+  `ggml/src` (CPU, CUDA/HIP, Vulkan).
 
 ## WMMA prompt GEMM
 

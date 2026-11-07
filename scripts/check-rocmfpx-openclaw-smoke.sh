@@ -35,8 +35,8 @@ PROMPT='OpenClaw agent check. Return only JSON with keys plan and command. plan 
 
 timeout --kill-after=20s 3m "$BIN" \
     -m "$MODEL" -dev "$BACKEND" -ngl 999 -c "${CTX_SIZE:-4096}" \
-    -t "${THREADS:-16}" -tb "${THREADS_BATCH:-32}" --no-mmap --simple-io \
-    --no-display-prompt --no-warmup --no-perf -no-cnv --strict-json \
+    -t "${THREADS:-16}" -tb "${THREADS_BATCH:-32}" --load-mode none --simple-io \
+    --no-display-prompt --no-warmup --no-perf -no-cnv -j '{}' \
     --temp 0 --seed 123 -n "${N_PREDICT:-128}" -p "$PROMPT" >"$tmp_out" 2>&1
 
 python3 - "$tmp_out" <<'PY'

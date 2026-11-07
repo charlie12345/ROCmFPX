@@ -5,15 +5,18 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE_DIR="${1:-/mnt/ai-models/gguf-sources/DeepSeek-V4-Flash-180B}"
 OUTPUT_DIR="${2:-/mnt/ai-models/rocmfp4-quants/DeepSeek-V4-Flash-180B}"
 INCLUDE_MTP="${3:-0}"
-ARTIFACT_SUFFIX=""
+ARTIFACT_PREFIX=""
 CONVERT_ARGS=()
 if [[ "${INCLUDE_MTP}" == "1" ]]; then
-    ARTIFACT_SUFFIX="-MTP"
-    CONVERT_ARGS+=(--deepseek4-include-mtp --use-temp-file)
+    # The converter no longer folds the MTP head into the target (--deepseek4-include-mtp is gone):
+    # --mtp writes it as a separate draft GGUF, loaded with -md and --spec-type draft-mtp.
+    # Run once with INCLUDE_MTP=0 for the target and once with 1 for the draft.
+    ARTIFACT_PREFIX="mtp-"
+    CONVERT_ARGS+=(--mtp --use-temp-file)
 fi
 CONVERSION_TMPDIR="${CONVERSION_TMPDIR:-${OUTPUT_DIR}/.tmp}"
-INTERMEDIATE="${OUTPUT_DIR}/DeepSeek-V4-Flash-180B${ARTIFACT_SUFFIX}-MXFP4-F16.gguf"
-QUANTIZED="${OUTPUT_DIR}/DeepSeek-V4-Flash-180B${ARTIFACT_SUFFIX}-MXFP4-to-ROCmFP4-STRIX_LEAN.gguf"
+INTERMEDIATE="${OUTPUT_DIR}/${ARTIFACT_PREFIX}DeepSeek-V4-Flash-180B-MXFP4-F16.gguf"
+QUANTIZED="${OUTPUT_DIR}/${ARTIFACT_PREFIX}DeepSeek-V4-Flash-180B-MXFP4-to-ROCmFP4-STRIX_LEAN.gguf"
 INTERMEDIATE_PARTIAL="${INTERMEDIATE}.partial"
 QUANTIZED_PARTIAL="${QUANTIZED}.partial"
 QUANTIZER="${ROOT_DIR}/build-deepseek4-rocmfp4/bin/llama-quantize"
@@ -71,22 +74,25 @@ expected = {
     "token_embd.weight": "Q4_0_ROCMFP4",
 }
 if include_mtp:
-    expected.update({
-        "blk.43.nextn.e_proj.weight": "Q4_0_ROCMFP4",
-        "blk.43.nextn.h_proj.weight": "Q4_0_ROCMFP4",
+    # The --mtp draft holds only the MTP layer (blk.43, e/h projections merged into eh_proj),
+    # its hyper-connection head (output_hc_*) and the embeddings. None: the tensor must exist;
+    # its type has not been checked on this two-file layout yet.
+    expected = {
+        "blk.43.nextn.eh_proj.weight": None,
         "blk.43.nextn.enorm.weight": "F32",
         "blk.43.nextn.hnorm.weight": "F32",
         "blk.43.nextn.shared_head_norm.weight": "F32",
-        "blk.43.nextn.hc_head_base.weight": "F32",
-        "blk.43.nextn.hc_head_fn.weight": "Q4_0_ROCMFP4",
-        "blk.43.nextn.hc_head_scale.weight": "F32",
+        "output_hc_base.weight": None,
+        "output_hc_fn.weight": None,
+        "output_hc_scale.weight": None,
         "blk.43.ffn_down_exps.weight": "MXFP4",
-        "blk.43.attn_kv.weight": "Q4_0_ROCMFP4",
-    })
+        "blk.43.attn_kv.weight": None,
+        "token_embd.weight": None,
+    }
 
 for name, tensor_type in expected.items():
     actual = tensors[name].tensor_type.name
-    if actual != tensor_type:
+    if tensor_type is not None and actual != tensor_type:
         raise SystemExit(f"{name}: expected {tensor_type}, got {actual}")
 
 counts = Counter(tensor.tensor_type.name for tensor in reader.tensors)

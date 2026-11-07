@@ -8,6 +8,9 @@
 
 set -euo pipefail
 
+echo '{"status": "skip", "reason": "the q3_0_rocmfpx KV cache type is unsupported since 2026-09-15 (-ctk/-ctv take f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1)"}'
+exit 0
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 HERMES_MODEL="${HERMES_MODEL:-$ROOT/../models/rocmfpx-hermes-tests/hermes-Q3_0_ROCMFPX_AGENT.gguf}"
@@ -16,7 +19,7 @@ BACKEND="${BACKEND:-ROCm0}"
 SKIP_MISSING_MODEL="${SKIP_MISSING_MODEL:-1}"
 
 export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-11.5.1}"
-export GGML_HIP_ENABLE_UNIFIED_MEMORY="${GGML_HIP_ENABLE_UNIFIED_MEMORY:-1}"
+export GGML_CUDA_ENABLE_UNIFIED_MEMORY="${GGML_CUDA_ENABLE_UNIFIED_MEMORY:-1}"
 
 cd "$ROOT"
 

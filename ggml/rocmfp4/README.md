@@ -998,19 +998,21 @@ Hardware note:
   upstream llama.cpp HIP backend sources still live under
   `ggml/src/ggml-cuda` and are compiled by HIP for AMD, but the ROCmFP4-owned
   helper code and user-facing build/run path are ROCm/HIP/Vulkan targeted.
-  This tree also accepts `GGML_HIP_ENABLE_UNIFIED_MEMORY=1` as the AMD-named
-  alias for the upstream unified-memory switch.
+  The unified-memory switch is the upstream `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`;
+  the AMD-named alias `GGML_HIP_ENABLE_UNIFIED_MEMORY` is no longer read
+  (since 2026-09-15).
 - The bundled rocWMMA 7.1.0 headers expose gfx12 WMMA paths for FP8/BF8 and
   integer 8-bit inputs, but no native FP4 input type or FP4 WMMA/MFMA builtin
   is visible locally. A true matrix-core ROCmFP4 path therefore needs a
   measured unpack/convert strategy first, such as ROCmFP4 Codebook10 to int8
   WMMA or FP8 WMMA tiles, before claiming native FP4 tensor-core execution.
-- rocWMMA FlashAttention is intentionally opt-in via
-  `GGML_HIP_ROCWMMA_FATTN=ON scripts/build-strix-rocmfp4-mtp.sh`.
-  It currently compiles with the local rocWMMA headers in
+- rocWMMA FlashAttention was opt-in via
+  `GGML_HIP_ROCWMMA_FATTN=ON scripts/build-strix-rocmfp4-mtp.sh`; the option
+  left this tree in the 2026-09-15 upstream merge (llama.cpp #26046), and the
+  build scripts no longer pass it. It compiled with the local rocWMMA headers in
   `/path/to/third_party/rocWMMA`, but the Strix Halo benchmark
   regressed sustained Qwen MTP decode (`23.3 tok/s` vs the promoted
-  `26.2 tok/s` default HIP FlashAttention path), so the default build keeps it
+  `26.2 tok/s` default HIP FlashAttention path), so the default build kept it
   disabled. A follow-up on the 35B A3B ROCmFP4 MTP guard measured only
   `99.7` / `76.1 tok/s` versus the promoted `104.4` / `89.3` band, so this
   remains true for the MoE-heavy profile as well.

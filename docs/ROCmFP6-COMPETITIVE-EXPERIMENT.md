@@ -2,7 +2,7 @@
 
 Status: experimental. These notes cover the Qwythos 9B Claude Mythos 5 1M MTP BF16 source tested on Strix Halo.
 
-Historical (measured June 2026 on Strix Halo, gfx1151, Linux). Since then the HIP FP6 decode dot product was rewritten (`[TAG_FP6_MMVQ_FAST]`, 2026-10-24), FP6 prompt products run through the WMMA GEMM on gfx1100/gfx1151 (`[TAG_WMMA_GEMM]`), and the default `Vulkan0` backend stores FP6 packed. None of the tables below were re-run on that code. `scripts/sweep-rocmfp6-competitive.sh` still passes `-mmp 0`, which llama-bench dropped on 2026-10-02 (use `-lm none`), so it fails until updated.
+Historical (measured June 2026 on Strix Halo, gfx1151, Linux). Since then the HIP FP6 decode dot product was rewritten (`[TAG_FP6_MMVQ_FAST]`, 2026-10-24), FP6 prompt products run through the WMMA GEMM on gfx1100/gfx1151 (`[TAG_WMMA_GEMM]`), and the default `Vulkan0` backend stores FP6 packed. None of the tables below were re-run on that code. `scripts/sweep-rocmfp6-competitive.sh` now passes `-lm none` in place of `-mmp 0`, which llama-bench dropped on 2026-10-02.
 
 ## Presets
 

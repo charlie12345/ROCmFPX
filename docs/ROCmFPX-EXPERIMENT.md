@@ -4,9 +4,10 @@ Historical (June 2026, Strix Halo, gfx1151, Linux; the `/home/caf` and `/tmp`
 paths are the original author's machine). The family has since added
 `Q2_0_ROCMFPX`, `Q5_0_ROCMFPX`, `Q7_0_ROCMFPX` and `Q4_0_ROCMI4`. The current
 format contract is [rocmfpx/FORMATS.md](rocmfpx/FORMATS.md), and the overview is
-[rocmfpx/README.md](rocmfpx/README.md). Several check scripts listed below still
-pass `--strict-json` (removed in the 2026-09-15 upstream merge) or `--no-mmap` /
-`-mmp 0` (replaced by `-lm none` on 2026-10-02), so they fail until updated.
+[rocmfpx/README.md](rocmfpx/README.md). The check scripts listed below that
+passed `--strict-json` (removed in the 2026-09-15 upstream merge) or `--no-mmap` /
+`-mmp 0` (replaced on 2026-10-02) were updated on 2026-11-07 to `-j '{}'` and
+`--load-mode none` / `-lm none`.
 
 The ROCmFPx experiment is the staging area for possible AMD-native
 `ROCmFP3`, `ROCmFP6`, and `ROCmFP8` quant formats.
@@ -370,7 +371,7 @@ Available ROCmFPx profiles:
 ```text
 rocmfpx-strix-nwarps1, rocmfpx-strix-nwarps2, rocmfpx-strix-nwarps4
 rocmfpx-strix-rpb2
-rocmfpx-strix-mmid1, rocmfpx-strix-mmid2, rocmfpx-strix-mmid3, rocmfpx-strix-mmid4
+rocmfpx-strix-mmid1, rocmfpx-strix-mmid2, rocmfpx-strix-mmid3, rocmfpx-strix-mmid4, rocmfpx-strix-mmid5
 rocmfpx-strix-moe-rpb1, rocmfpx-strix-moe-rpb2, rocmfpx-strix-moe-rpb3, rocmfpx-strix-moe-rpb4
 rocmfpx-strix-vdr2, rocmfpx-strix-vdr8
 ```

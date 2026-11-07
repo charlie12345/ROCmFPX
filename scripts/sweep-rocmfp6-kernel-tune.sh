@@ -82,7 +82,7 @@ for profile in $PROFILES; do
             "$bench_bin" \
                 -m "$MODEL" -dev "$backend" -ngl "$NGL" -fa on \
                 -p "$PROMPT_TOKENS" -n "$GEN_TOKENS" -r "$REPEAT" -o md \
-                -t "$THREADS" -mmp 0 >"$OUT_DIR/logs/$profile.$backend.bench.md" 2>&1 || true
+                -t "$THREADS" -lm none >"$OUT_DIR/logs/$profile.$backend.bench.md" 2>&1 || true
         done
     fi
 done

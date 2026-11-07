@@ -79,7 +79,7 @@ exec systemd-run \
     -p "MemorySwapMax=0" \
     /usr/bin/env \
         "HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-11.5.1}" \
-        "GGML_HIP_ENABLE_UNIFIED_MEMORY=${GGML_HIP_ENABLE_UNIFIED_MEMORY:-1}" \
+        "GGML_CUDA_ENABLE_UNIFIED_MEMORY=${GGML_CUDA_ENABLE_UNIFIED_MEMORY:-1}" \
         "${BIN}" \
         -m "${MODEL}" \
         -dev "${BACKEND}" \
@@ -91,7 +91,7 @@ exec systemd-run \
         -ub "${UBATCH_SIZE}" \
         -fa off \
         --fit off \
-        --no-mmap \
+        --load-mode none \
         --no-repack \
         --offline \
         --jinja \

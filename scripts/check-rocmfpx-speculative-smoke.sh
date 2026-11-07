@@ -38,13 +38,13 @@ run_case() {
 
     echo "=== ROCmFPX speculative smoke: $label ==="
     env HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-11.5.1}" \
-        GGML_HIP_ENABLE_UNIFIED_MEMORY="${GGML_HIP_ENABLE_UNIFIED_MEMORY:-1}" \
+        GGML_CUDA_ENABLE_UNIFIED_MEMORY="${GGML_CUDA_ENABLE_UNIFIED_MEMORY:-1}" \
         timeout --kill-after=30s 5m "$BIN" \
             -m "$MODEL" \
             -dev "$BACKEND" \
             -ngl 999 \
             -fa on \
-            --no-mmap \
+            --load-mode none \
             -c "$CTX_SIZE" \
             --temp 0 \
             --seed 123 \

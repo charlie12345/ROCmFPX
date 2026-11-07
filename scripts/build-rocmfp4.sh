@@ -32,16 +32,6 @@ if [[ -z "${CMAKE_HIP_ARCHITECTURES:-}" ]]; then
     echo "Set CMAKE_HIP_ARCHITECTURES to your GPU target (for example gfx1030, gfx1100, gfx1151, gfx1200)." >&2
 fi
 
-if [[ "${GGML_HIP_ROCWMMA_FATTN:-OFF}" == "ON" ]]; then
-    ROCM_WMMA_INCLUDE="${ROCM_WMMA_INCLUDE:-/home/caf/strix-fp4/third_party/rocWMMA/library/include}"
-    if [[ -d "$ROCM_WMMA_INCLUDE/rocwmma/internal" ]]; then
-        HIP_EXTRA_FLAGS="-I${ROCM_WMMA_INCLUDE} ${HIP_EXTRA_FLAGS}"
-        echo "Using local rocWMMA headers: $ROCM_WMMA_INCLUDE"
-    else
-        echo "Warning: rocWMMA headers not found at $ROCM_WMMA_INCLUDE" >&2
-    fi
-fi
-
 if ! tune_flags="$(rocmfp4_decode_tune_flags "$DECODE_TUNE_PROFILE")"; then
     echo "Unknown decode tuning profile '$DECODE_TUNE_PROFILE'" >&2
     echo "Known profiles: $(rocmfp4_decode_tune_known_profiles)" >&2
@@ -58,7 +48,6 @@ rocmfpx_reset_stale_build_dir "$BUILD_DIR" "$HIP_ARCH"
 cmake -S "$ROOT" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     -DGGML_HIP=ON \
-    -DGGML_HIP_ROCWMMA_FATTN="${GGML_HIP_ROCWMMA_FATTN:-OFF}" \
     -DGGML_HIP_FORCE_MMQ=ON \
     -DGGML_VULKAN=ON \
     -DGGML_CUDA=OFF \
@@ -66,8 +55,8 @@ cmake -S "$ROOT" -B "$BUILD_DIR" \
     -DGPU_TARGETS="${HIP_ARCH}" \
     -DCMAKE_HIP_FLAGS="$HIP_EXTRA_FLAGS" \
     -DLLAMA_BUILD_SERVER=ON \
-    -DLLAMA_BUILD_WEBUI=OFF \
-    -DLLAMA_USE_PREBUILT_WEBUI=OFF \
+    -DLLAMA_BUILD_UI=OFF \
+    -DLLAMA_USE_PREBUILT_UI=OFF \
     -DLLAMA_BUILD_TESTS=ON \
     -DGGML_BUILD_TESTS=OFF
 

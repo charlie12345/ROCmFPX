@@ -7,7 +7,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build-strix-rocmfp4}"
 JOBS="${JOBS:-$(nproc)}"
 HIP_ARCH="${CMAKE_HIP_ARCHITECTURES:-gfx1151}"
-ROCM_WMMA_INCLUDE="${ROCM_WMMA_INCLUDE:-/home/caf/strix-fp4/third_party/rocWMMA/library/include}"
 HIP_EXTRA_FLAGS="${CMAKE_HIP_FLAGS:-}"
 HIP_COMPILER_ARGS=()
 if [[ -n "${CMAKE_HIP_COMPILER:-}" ]]; then
@@ -16,15 +15,6 @@ fi
 ROCMFP4_DECODE_TUNE="${ROCMFP4_DECODE_TUNE:-stable}"
 DECODE_TUNE_PROFILE="${ROCMFPX_DECODE_TUNE:-$ROCMFP4_DECODE_TUNE}"
 source "$ROOT/scripts/rocmfp4-decode-tune-flags.sh"
-
-if [[ "${GGML_HIP_ROCWMMA_FATTN:-OFF}" == "ON" ]]; then
-    if [[ -d "$ROCM_WMMA_INCLUDE/rocwmma/internal" ]]; then
-        HIP_EXTRA_FLAGS="-I${ROCM_WMMA_INCLUDE} ${HIP_EXTRA_FLAGS}"
-        echo "Using local rocWMMA headers: $ROCM_WMMA_INCLUDE"
-    else
-        echo "Warning: rocWMMA headers not found at $ROCM_WMMA_INCLUDE" >&2
-    fi
-fi
 
 if ! tune_flags="$(rocmfp4_decode_tune_flags "$DECODE_TUNE_PROFILE")"; then
     echo "Unknown decode tuning profile '$DECODE_TUNE_PROFILE'" >&2
@@ -40,7 +30,6 @@ fi
 cmake -S "$ROOT" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     -DGGML_HIP=ON \
-    -DGGML_HIP_ROCWMMA_FATTN="${GGML_HIP_ROCWMMA_FATTN:-OFF}" \
     -DGGML_HIP_FORCE_MMQ=ON \
     -DGGML_VULKAN=ON \
     -DGGML_CUDA=OFF \
@@ -49,8 +38,8 @@ cmake -S "$ROOT" -B "$BUILD_DIR" \
     -DCMAKE_HIP_FLAGS="$HIP_EXTRA_FLAGS" \
     "${HIP_COMPILER_ARGS[@]}" \
     -DLLAMA_BUILD_SERVER=ON \
-    -DLLAMA_BUILD_WEBUI=OFF \
-    -DLLAMA_USE_PREBUILT_WEBUI=OFF \
+    -DLLAMA_BUILD_UI=OFF \
+    -DLLAMA_USE_PREBUILT_UI=OFF \
     -DLLAMA_BUILD_TESTS=ON \
     -DGGML_BUILD_TESTS=OFF
 

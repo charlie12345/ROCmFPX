@@ -1,2 +1,2 @@
-# Downstream ownership: either maintainer can review the other's changes.
-* @ROCmFPX @charlie12345
+# RDNA-FAST: the repository owner reviews all changes.
+* @serrynaimo

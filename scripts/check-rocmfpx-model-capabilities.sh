@@ -52,7 +52,7 @@ assert mtp["model_kind"] == "mtp"
 assert plain["model_kind"] == "regular"
 assert diffusion["model_kind"] == "diffusion"
 assert diffusion["supports_diffusion"] is True
-assert "--diffusion-kv-cache" in diffusion["serving_profile"]["server_args"]
+assert diffusion["serving_profile"]["name"] == "generic-diffusion-rocmfpx"
 assert qat["model_kind"] == "qat"
 assert qat["is_qat"] is True
 assert qat["serving_profile"]["name"] == "generic-qat-gguf"

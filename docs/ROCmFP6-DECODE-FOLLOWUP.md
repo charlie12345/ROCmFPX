@@ -2,7 +2,7 @@
 
 Date: 2026-06-27
 
-Historical (Strix Halo, gfx1151, Linux). Since then the default `Vulkan0` backend stores FP6 packed (26-byte blocks). The expanded 34-byte layout and the `block_rocmfpx_fp6_packed16` loads tested here remain only in the optional ROCmFPX Vulkan extension (`ROCmFPXVulkan0`, see [extensions/rocmfpx-vulkan](../extensions/rocmfpx-vulkan/README.md)). On HIP the packed FP6 MMVQ dot became branch-free on 2026-10-24 (`[TAG_FP6_MMVQ_FAST]`): on an RX 7900 XT a one-row 4096 x 14336 product went from 88.8 to 47.0 us. The Q6_K comparison below has not been re-run on that code.
+Historical (Strix Halo, gfx1151, Linux). Since then the default `Vulkan0` backend stores FP6 packed (26-byte blocks). The expanded 34-byte layout and the `block_rocmfpx_fp6_packed16` loads tested here lived on in the optional ROCmFPX Vulkan extension, which was removed on 2026-11-07. On HIP the packed FP6 MMVQ dot became branch-free on 2026-10-24 (`[TAG_FP6_MMVQ_FAST]`): on an RX 7900 XT a one-row 4096 x 14336 product went from 88.8 to 47.0 us. The Q6_K comparison below has not been re-run on that code.
 
 Model:
 

@@ -49,8 +49,8 @@ PY
 
 timeout --kill-after=20s 4m "$BIN" \
     -m "$MODEL" -dev "$BACKEND" -ngl 999 -c "$CTX_SIZE" \
-    -t "${THREADS:-16}" -tb "${THREADS_BATCH:-32}" --no-mmap --simple-io \
-    --no-display-prompt --no-warmup --no-perf -no-cnv --strict-json \
+    -t "${THREADS:-16}" -tb "${THREADS_BATCH:-32}" --load-mode none --simple-io \
+    --no-display-prompt --no-warmup --no-perf -no-cnv -j '{}' \
     --temp 0 --seed 123 -n "${N_PREDICT:-96}" -f "$tmp_prompt" >"$tmp_out" 2>&1
 
 python3 - "$tmp_out" <<'PY'

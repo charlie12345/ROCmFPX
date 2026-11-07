@@ -60,7 +60,7 @@ fi
     -dev "$BACKEND" \
     -ngl "$NGL" \
     -fa on \
-    --mmap \
+    --load-mode mmap \
     -c "$CTX" \
     -b 512 \
     -ub 512 \

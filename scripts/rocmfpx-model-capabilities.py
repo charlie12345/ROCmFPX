@@ -92,7 +92,7 @@ def infer_serving_profile(path: Path, model_kind: str, supports_mtp: bool, is_ag
                 "-dev", "ROCm0",
                 "-ngl", "999",
                 "-fa", "on",
-                "--mmap",
+                "--load-mode", "mmap",
                 "-ctk", "f16",
                 "-ctv", "f16",
                 "-c", "131072",
@@ -113,13 +113,13 @@ def infer_serving_profile(path: Path, model_kind: str, supports_mtp: bool, is_ag
     if model_kind == "diffusion":
         return {
             "name": "generic-diffusion-rocmfpx",
-            "reason": "Diffusion/Block-diffusion GGUF detected; use diffusion KV/cache controls and benchmark ROCm vs Vulkan before changing denoising steps.",
+            "reason": "Diffusion/Block-diffusion GGUF detected; benchmark ROCm vs Vulkan before changing denoising steps.",
             "supports_mtp": False,
             "server_args": [
                 "-dev", "ROCm0",
                 "-ngl", "999",
                 "-fa", "on",
-                "--mmap",
+                "--load-mode", "mmap",
                 "-ctk", "f16",
                 "-ctv", "f16",
                 "-c", "32768",
@@ -128,18 +128,15 @@ def infer_serving_profile(path: Path, model_kind: str, supports_mtp: bool, is_ag
                 "-t", "16",
                 "-tb", "32",
                 "--jinja",
-                "--diffusion-kv-cache", "auto",
-                "--diffusion-eb", "auto",
-                "--diffusion-eb-max-steps", "48",
                 "--no-mmproj",
                 "--metrics",
             ],
         }
 
-    if supports_mtp and ("qwable" in name or "qwen" in name) and (is_agent or is_rocmfpx_family_name(path)):
+    if supports_mtp and "qwen" in name and (is_agent or is_rocmfpx_family_name(path)):
         return {
-            "name": "qwen-qwable-mtp-rocmfpx-prompt-fast",
-            "reason": "Qwen/Qwable MTP ROCmFP4/ROCmFPX models on Strix have much faster prompt processing on Vulkan with q4 K/V and a 4096/512 batch shape; p-min 0.75 avoids low-confidence draft overhead during decode.",
+            "name": "qwen-mtp-rocmfpx-prompt-fast",
+            "reason": "Qwen MTP ROCmFP4/ROCmFPX models on Strix have much faster prompt processing on Vulkan with q4 K/V and a 4096/512 batch shape; p-min 0.75 avoids low-confidence draft overhead during decode.",
             "supports_mtp": True,
             "server_args": [
                 "-dev", "Vulkan0",
@@ -147,7 +144,7 @@ def infer_serving_profile(path: Path, model_kind: str, supports_mtp: bool, is_ag
                 "-ngl", "999",
                 "--spec-draft-ngl", "all",
                 "-fa", "on",
-                "--mmap",
+                "--load-mode", "mmap",
                 "-ctk", "q4_0",
                 "-ctv", "q4_0",
                 "--spec-draft-type-k", "q4_0",
@@ -177,10 +174,10 @@ def infer_serving_profile(path: Path, model_kind: str, supports_mtp: bool, is_ag
             ],
         }
 
-    if supports_mtp and ("qwable" in name or "qwen" in name):
+    if supports_mtp and "qwen" in name:
         return {
-            "name": "qwen-qwable-dense-mtp",
-            "reason": "Qwen/Qwable MTP-capable models validated fastest with bounded draft depth and a confidence gate; use q8 target/q4 draft KV where memory allows.",
+            "name": "qwen-dense-mtp",
+            "reason": "Qwen MTP-capable models validated fastest with bounded draft depth and a confidence gate; use q8 target/q4 draft KV where memory allows.",
             "supports_mtp": True,
             "server_args": [
                 "-dev", "ROCm0",
@@ -188,7 +185,7 @@ def infer_serving_profile(path: Path, model_kind: str, supports_mtp: bool, is_ag
                 "-ngl", "999",
                 "--spec-draft-ngl", "all",
                 "-fa", "on",
-                "--mmap",
+                "--load-mode", "mmap",
                 "-ctk", "q8_0",
                 "-ctv", "q8_0",
                 "--spec-draft-type-k", "q4_0",
@@ -242,7 +239,7 @@ def infer_serving_profile(path: Path, model_kind: str, supports_mtp: bool, is_ag
                 "-dev", "ROCm0",
                 "-ngl", "999",
                 "-fa", "on",
-                "--mmap",
+                "--load-mode", "mmap",
                 "-ctk", "f16",
                 "-ctv", "f16",
                 "-c", "32768",
@@ -265,7 +262,7 @@ def infer_serving_profile(path: Path, model_kind: str, supports_mtp: bool, is_ag
                 "-dev", "ROCm0",
                 "-ngl", "999",
                 "-fa", "on",
-                "--mmap",
+                "--load-mode", "mmap",
                 "-ctk", "f16",
                 "-ctv", "f16",
                 "-c", "32768",
@@ -290,7 +287,7 @@ def infer_serving_profile(path: Path, model_kind: str, supports_mtp: bool, is_ag
             "-dev", "ROCm0",
             "-ngl", "999",
             "-fa", "on",
-            "--mmap",
+            "--load-mode", "mmap",
             "-ctk", "f16",
             "-ctv", "f16",
             "-c", "32768",

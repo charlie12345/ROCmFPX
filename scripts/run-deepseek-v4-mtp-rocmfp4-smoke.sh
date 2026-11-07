@@ -81,7 +81,7 @@ printf 'DeepSeek V4 MTP ROCmFP4 smoke: backend=%s model=%s context=%s predict=%s
 
 output="$(
     env HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-11.5.1}" \
-    GGML_HIP_ENABLE_UNIFIED_MEMORY="${GGML_HIP_ENABLE_UNIFIED_MEMORY:-1}" \
+    GGML_CUDA_ENABLE_UNIFIED_MEMORY="${GGML_CUDA_ENABLE_UNIFIED_MEMORY:-1}" \
     timeout --kill-after=10s "${TIMEOUT_SECONDS}" \
     "${BIN}" \
         -m "${MODEL}" \
@@ -91,7 +91,7 @@ output="$(
         -ub "${UBATCH_SIZE}" \
         -fa "${FA}" \
         --fit off \
-        --no-mmap \
+        --load-mode none \
         --no-repack \
         -t "${THREADS}" \
         -tb "${THREADS_BATCH}" \

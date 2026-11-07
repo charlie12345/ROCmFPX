@@ -84,7 +84,7 @@ if [[ "${NO_REPACK}" == "1" ]]; then
 fi
 
 if [[ "${NO_MMAP}" == "1" ]]; then
-    args+=(--no-mmap)
+    args+=(--load-mode none)
 fi
 
 if [[ -n "${LOG_FILE}" ]]; then

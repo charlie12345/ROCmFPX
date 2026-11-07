@@ -164,6 +164,14 @@ fi
 # earlier MoE auto-disable was an artifact of the db247885a draft_mtp throttling MTP;
 # it has been removed. Both dense and MoE keep draft-mtp (n_max 6, p_min 0.6).
 
+# --checkpoint-every-n-tokens is gone (llama.cpp #22929): the server no longer makes periodic
+# prefill checkpoints, and CTXCP=0 turns checkpoints off. A CPENT >= 0 maps to the nearest
+# remaining knob, the minimum spacing between checkpoints (--checkpoint-min-step).
+checkpoint_args=()
+if [[ "$CPENT" -ge 0 ]]; then
+    checkpoint_args+=(--checkpoint-min-step "$CPENT")
+fi
+
 cache_args=(--cache-ram "$CACHE_RAM")
 if [[ "$STRICT_BENCH" == "1" ]]; then
     cache_args=(--no-cache-prompt --cache-ram "$CACHE_RAM" --slot-prompt-similarity 0.0)
@@ -229,7 +237,7 @@ exec "$BIN" \
     --reasoning-budget -1 \
     --no-context-shift \
     --ctx-checkpoints "$CTXCP" \
-    --checkpoint-every-n-tokens "$CPENT" \
+    "${checkpoint_args[@]}" \
     -dev "$DEVICE" \
     -ngl "$N_GPU_LAYERS" \
     -fa "$FLASH_ATTN" \

@@ -70,7 +70,7 @@ systemd-run --user --scope --quiet \
     -p "MemorySwapMax=$MEMORY_SWAP_MAX" \
     env \
     HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-11.5.1}" \
-    GGML_HIP_ENABLE_UNIFIED_MEMORY="${GGML_HIP_ENABLE_UNIFIED_MEMORY:-1}" \
+    GGML_CUDA_ENABLE_UNIFIED_MEMORY="${GGML_CUDA_ENABLE_UNIFIED_MEMORY:-1}" \
     timeout --kill-after=30s "$TIMEOUT" "$BIN" \
         -m "$MODEL" \
         -dev "$BACKEND" \
@@ -82,7 +82,7 @@ systemd-run --user --scope --quiet \
         -ub "$UBATCH_SIZE" \
         -fa on \
         --fit off \
-        --mmap \
+        --load-mode mmap \
         -t "$THREADS" \
         -tb "$THREADS_BATCH" \
         --spec-draft-threads "$THREADS" \

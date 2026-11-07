@@ -21,13 +21,13 @@ timeout --kill-after=20s 3m "$BIN" \
     -c 4096 \
     -t 16 \
     -tb 32 \
-    --no-mmap \
+    --load-mode none \
     --simple-io \
     --no-display-prompt \
     --no-warmup \
     --no-perf \
     -no-cnv \
-    --strict-json \
+    -j '{}' \
     --temp 0 \
     -n "$N_PREDICT" \
     -p "$PROMPT" >"$tmp_out" 2>&1

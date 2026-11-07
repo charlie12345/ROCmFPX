@@ -3,8 +3,8 @@
 > **Note (2026-11-07):** Written in June 2026 for Strix Halo (gfx1151) on
 > Linux. Since the 2026-09-15 merge of the ROCmFPX org repo the server ignores
 > the per-request `speculative.*` fields and rejects `turbo3`/`turbo4` caches.
-> The scripts below still pass flags current builds reject
-> (`--checkpoint-every-n-tokens`, `--mmap`); for serving RDNA-FAST today see
+> The scripts below no longer pass the removed `--checkpoint-every-n-tokens`
+> and `--mmap` flags (updated 2026-11-07); for serving RDNA-FAST today see
 > [Flags and switches](FLAGS.md).
 
 This guide covers request-level MTP controls for ROCmFPX serving:
@@ -45,8 +45,9 @@ GGUF actually exposes MTP metadata/tensors. If the model does not support MTP,
 it prints a warning and starts without `draft-mtp` instead of passing invalid
 speculative flags.
 
-The script still passes `--checkpoint-every-n-tokens`, removed on 2026-09-15,
-so it fails to start against a current build until that line is dropped.
+`--checkpoint-every-n-tokens` was removed on 2026-09-15. The script no longer
+passes it; a `CPENT` of 0 or more now goes to `--checkpoint-min-step` (minimum
+spacing between checkpoints), and the default `CPENT=-1` passes nothing.
 
 ```bash
 MODEL=/path/to/model.gguf \
@@ -141,9 +142,8 @@ time, so ports and host bindings can stay outside the model profile:
 my-rocmfpx-model-server --host 127.0.0.1 --port 18180
 ```
 
-The helper's profiles still include `--mmap`, which current builds reject
-(removed on 2026-10-02; use `--load-mode mmap`), so `launch_command` and
-generated wrappers need that edit.
+The helper's profiles pass `--load-mode mmap` (`--mmap` was removed on
+2026-10-02), so `launch_command` and generated wrappers use the current flag.
 
 Useful defaults:
 
@@ -309,7 +309,8 @@ numbers are accepted. On the clean Strix Halo Qwen3.6 35B A3B run, rocWMMA
 FlashAttention compiled and passed the family gates, but the default build was
 faster for ROCmFP4 prompt processing, so rocWMMA remains opt-in rather than a
 default. The `GGML_HIP_ROCWMMA_FATTN` CMake option has since been removed
-(2026-09-15), so the harness's rocWMMA variant now builds the default.
+(2026-09-15), so the harness no longer builds a rocWMMA variant and ignores the
+rocWMMA field of `VARIANTS`.
 
 ## Imatrix Quantization
 
@@ -334,8 +335,9 @@ ROCmFP3, ROCmFP6, and ROCmFP8.
 
 Not available since 2026-09-15: `-ctk`/`-ctv` and `-ctkd`/`-ctvd` accept only
 `f32`, `f16`, `bf16`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0` and `q5_1`, so
-the wrapper below fails on `turbo4`, and `LLAMA_KV_TURBO_BOUNDARY_LAYERS` /
-`LLAMA_KV_TURBO_BOUNDARY_V` are no longer read. Kept as a record.
+the wrapper below now exits at once saying so, and
+`LLAMA_KV_TURBO_BOUNDARY_LAYERS` / `LLAMA_KV_TURBO_BOUNDARY_V` are no longer
+read. Kept as a record.
 
 TurboQuant is already available in this ROCmFPX tree through the `turbo3` and
 `turbo4` runtime cache types. It is separate from the ROCmFPX model-weight

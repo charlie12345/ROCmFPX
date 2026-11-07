@@ -6,7 +6,7 @@
 #   source "$SCRIPT_DIR/rocmfpx-lib.sh"
 #
 # Provides:
-#   - rocmfpx_setup_env          common backend env (HSA_OVERRIDE_GFX_VERSION, GGML_HIP_ENABLE_UNIFIED_MEMORY)
+#   - rocmfpx_setup_env          common backend env (HSA_OVERRIDE_GFX_VERSION, GGML_CUDA_ENABLE_UNIFIED_MEMORY)
 #   - rocmfpx_require_binary P   exit 1 with a clear message if P is not executable
 #   - rocmfpx_require_model P    skip-or-fail depending on SKIP_MISSING_MODEL
 #   - rocmfpx_skip_json REASON   print a machine-readable skip JSON and exit 0
@@ -20,7 +20,7 @@ ROCMFPX_GATE_SUMMARY="${ROCMFPX_GATE_SUMMARY:-/tmp/rocmfpx-gate-summary.json}"
 
 rocmfpx_setup_env() {
     export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-11.5.1}"
-    export GGML_HIP_ENABLE_UNIFIED_MEMORY="${GGML_HIP_ENABLE_UNIFIED_MEMORY:-1}"
+    export GGML_CUDA_ENABLE_UNIFIED_MEMORY="${GGML_CUDA_ENABLE_UNIFIED_MEMORY:-1}"
     export BACKEND="${BACKEND:-$ROCMFPX_BACKEND_DEFAULT}"
     export SKIP_MISSING_MODEL="${SKIP_MISSING_MODEL:-$ROCMFPX_SKIP_MISSING_DEFAULT}"
 }

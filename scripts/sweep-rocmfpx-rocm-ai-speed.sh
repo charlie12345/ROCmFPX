@@ -29,7 +29,9 @@ POLL="${POLL:-50}"
 
 # Format: name:rocwmma_flag:extra_hip_flags
 # Use commas inside extra flags when more than one compile definition is needed.
-VARIANTS="${VARIANTS:-default:OFF: rocwmma-fattn:ON:}"
+# rocwmma_flag is ignored: the GGML_HIP_ROCWMMA_FATTN CMake option was removed
+# upstream (llama.cpp #26046) and is gone from this tree since 2026-09-15.
+VARIANTS="${VARIANTS:-default:OFF:}"
 
 cd "$ROOT"
 mkdir -p "$OUT_DIR"
@@ -51,7 +53,7 @@ run_bench() {
     local output="$4"
 
     env HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-11.5.1}" \
-        GGML_HIP_ENABLE_UNIFIED_MEMORY="${GGML_HIP_ENABLE_UNIFIED_MEMORY:-1}" \
+        GGML_CUDA_ENABLE_UNIFIED_MEMORY="${GGML_CUDA_ENABLE_UNIFIED_MEMORY:-1}" \
         "$bin" \
         -m "$model" \
         -dev "$device" \
@@ -61,7 +63,7 @@ run_bench() {
         -ctv q4_0 \
         -b "$BATCH_SIZE" \
         -ub "$UBATCH_SIZE" \
-        -mmp 0 \
+        -lm none \
         -t "$THREADS" \
         --poll "$POLL" \
         -p "$PROMPT" \
@@ -123,13 +125,11 @@ for spec in $VARIANTS; do
 
     echo
     echo "== variant: $name =="
-    echo "rocWMMA FATTN: ${rocwmma:-OFF}"
     echo "extra HIP flags: ${extra_flags:-<none>}"
 
     BUILD_DIR="$build_dir" \
         CMAKE_HIP_ARCHITECTURES="$HIP_ARCH" \
         CMAKE_HIP_FLAGS="${extra_flags} ${CMAKE_HIP_FLAGS_EXTRA:-}" \
-        GGML_HIP_ROCWMMA_FATTN="${rocwmma:-OFF}" \
         JOBS="$JOBS" \
         "$SCRIPT_DIR/build-strix-rocmfp4-mtp.sh" llama-bench test-backend-ops
 

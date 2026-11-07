@@ -25,7 +25,7 @@ HERMES_N_PREDICT="${HERMES_N_PREDICT:-512}"
 HERMES_MAX_PROMPTS="${HERMES_MAX_PROMPTS:-20}"
 
 export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-11.5.1}"
-export GGML_HIP_ENABLE_UNIFIED_MEMORY="${GGML_HIP_ENABLE_UNIFIED_MEMORY:-1}"
+export GGML_CUDA_ENABLE_UNIFIED_MEMORY="${GGML_CUDA_ENABLE_UNIFIED_MEMORY:-1}"
 
 mkdir -p "$OUT_DIR"/raw
 
@@ -143,7 +143,7 @@ bench_case() {
             -b "$BATCH_SIZE" \
             -ub "$UBATCH_SIZE" \
             -t "$THREADS" \
-            -mmp 0 \
+            -lm none \
             -r "$BENCH_REPS")
 
     append_result "llama-bench" "$model_label" "$backend" "$status" "$seconds" "$OUT_DIR/raw/${label}.log"
@@ -205,7 +205,7 @@ hermes20_case() {
             -ngl 999 \
             --spec-draft-ngl all \
             -fa on \
-            --no-mmap \
+            --load-mode none \
             -ctk q4_0 \
             -ctv q4_0 \
             --spec-draft-type-k q4_0 \
@@ -246,7 +246,7 @@ hermes20_case() {
         -ngl 999 \
         --spec-draft-ngl all \
         -fa on \
-        --no-mmap \
+        --load-mode none \
         -ctk q4_0 \
         -ctv q4_0 \
         --spec-draft-type-k q4_0 \

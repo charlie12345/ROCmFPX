@@ -14,6 +14,10 @@ permission notice must be included in copies or substantial portions of the
 Software. This NOTICE is the project's canonical creator/founder attribution
 record and downstream projects are asked to retain it.
 
+RDNA-FAST additions, including the web UI and its artwork, are Copyright (c)
+2026 Thomas (serrynaimo) and contributors, and are distributed under the same
+MIT license; their copyright line is also in LICENSE.
+
 The MIT license does not impose a separate advertising or endorsement clause.
 Names and project marks may not be used to imply endorsement.
 
@@ -36,3 +40,12 @@ Third-party code
   in vendor/rocm_wmma_gemm/LICENSE and licenses/LICENSE-rocm_wmma_gemm and
   ships with the binaries built from it (rocm_wmma_gemm_<arch>_accf32).
   Included parts and local changes: vendor/rocm_wmma_gemm/README.md.
+- Code adapted from llama-cpp-rdna-boosts, Copyright (c) 2026 stew675,
+  https://github.com/stew675/llama-cpp-rdna-boosts, MIT license: RDNA4 WMMA
+  flash attention rows and Q6_K MMQ scales (ggml/src/ggml-cuda/fattn.cu,
+  fattn-mma-f16.cuh, mmq-vec-dot.cuh) and the meta backend compute headroom
+  (ggml/src/ggml-backend-meta.cpp). The license text is in
+  licenses/LICENSE-llama-cpp-rdna-boosts.
+
+THIRD_PARTY_NOTICES.md lists all third-party components, the code taken from
+other projects, and the third-party files the binary release packages carry.

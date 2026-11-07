@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "run-rocmfpx-turboquant-asym-server.sh: the turbo4 KV cache type is unsupported since 2026-09-15 (-ctk/-ctv take f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1)" >&2
+exit 2
+
 # Recommended TurboQuant asymmetric KV-cache profile for ROCmFPX serving.
 #
 # Keep K cache at q8_0 for attention/tool-call coherency and compress V cache
