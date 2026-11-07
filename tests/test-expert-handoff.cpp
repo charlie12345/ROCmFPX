@@ -506,6 +506,94 @@ static void bench_fill(ggml_tensor * t, std::mt19937 & rng) {
     for (size_t i = 0; i + bs <= n; i += bs) { memcpy(p + i, &d, sizeof(d)); }
 }
 
+// [TAG_EH_POOL_WAKE] a job that outlasts the pool's spin window, then the next layer's send at once: the workers other
+// than 0 used to fall asleep past the job's last barrier while worker 0 still spun, took the send and waited at the
+// next barrier for workers nothing woke (every later layer of the graph timed out; 2026-11-07, Flash-Next in prod).
+// The window runs out here by idle() during the job, as it did there by a job longer than the window.
+static bool test_pool_wake() {
+    const ggml_type type = GGML_TYPE_Q8_0;
+    const int64_t n_embd = 2560, n_ff = 640, n_expert = 16;
+    const int n_tok = 32, n_used = 8;
+    std::mt19937 rng(7);
+    ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    std::vector<std::vector<uint8_t>> mem;
+    ggml_tensor * g = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_expert);
+    ggml_tensor * u = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_expert);
+    ggml_tensor * d = ggml_new_tensor_3d(ctx, type, n_ff, n_embd, n_expert);
+    for (ggml_tensor * t : { g, u, d }) {
+        mem.emplace_back(ggml_nbytes(t) + 64);
+        t->data = (void *) (((uintptr_t) mem.back().data() + 63) & ~(uintptr_t) 63);
+        bench_fill(t, rng);
+    }
+    ggml_expert_handoff_layer hl = {};
+    hl.gate = g; hl.up = u; hl.down = d;
+    hl.act = GGML_EXPERT_HANDOFF_ACT_SILU;
+    hl.miss_slot = 0;
+
+    const ggml_expert_handoff_dims dims = { 32, (int32_t) n_embd, n_used };
+    std::vector<uint8_t> mb_mem(ggml_expert_handoff_size(dims) + 256, 0);
+    uint8_t * mb = (uint8_t *) (((uintptr_t) mb_mem.data() + 255) & ~(uintptr_t) 255);
+    auto * hdr = (ggml_expert_handoff_header *) mb;
+    auto sq_load  = [](const uint32_t * p) { return reinterpret_cast<const std::atomic<uint32_t> *>(p)->load(std::memory_order_acquire); };
+    auto sq_store = [](uint32_t * p, uint32_t v) { reinterpret_cast<std::atomic<uint32_t> *>(p)->store(v, std::memory_order_release); };
+    {
+        float * x = (float *) (mb + ggml_expert_handoff_off_x(dims));
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        for (int64_t i = 0; i < (int64_t) n_tok*n_embd; ++i) { x[i] = nd(rng); }
+        int32_t * ids   = (int32_t *) (mb + ggml_expert_handoff_off_ids(dims));
+        int32_t * slots = (int32_t *) (mb + ggml_expert_handoff_off_slots(dims));
+        float   * w     = (float   *) (mb + ggml_expert_handoff_off_weights(dims));
+        for (int t = 0; t < n_tok; ++t) {
+            for (int k = 0; k < n_used; ++k) {
+                ids[t*dims.max_used + k] = (t + k) % n_expert; slots[t*dims.max_used + k] = 0; w[t*dims.max_used + k] = 1.0f/n_used;
+            }
+        }
+        hdr->layer = 0; hdr->n_tokens = n_tok; hdr->n_embd = (int32_t) n_embd; hdr->n_used = n_used;
+    }
+
+    bool ok = true;
+    for (int nw : { 2, 6 }) {
+        ggml_expert_handoff_host_t host = ggml_expert_handoff_host_new(mb, dims.max_tokens, dims.max_embd, dims.max_used, 1, nw);
+        ggml_expert_handoff_host_set_layer(host, 0, &hl);
+        int n_late = 0;
+        double worst_ms = 0.0;
+        for (int round = 0; round < 20; ++round) {
+            // a quiet spell: the pool falls asleep (between graphs, or before a graph's first send)
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            // the first send: worker 0's poll finds it and wakes the others
+            uint32_t s = sq_load(&hdr->seq_send) + 1;
+            sq_store(&hdr->seq_send, s);
+            // the spin window runs out while the job runs, as it did for a job longer than the window
+            std::this_thread::sleep_for(std::chrono::microseconds(2500));
+            ggml_expert_handoff_host_idle(host);
+            while (sq_load(&hdr->seq_done) != s) { }
+            // the next layers, each as soon as the answer before is in (the device's join, then its next send)
+            for (int layer = 0; layer < 3; ++layer) {
+                s = sq_load(&hdr->seq_send) + 1;
+                sq_store(&hdr->seq_send, s);
+                const auto t0 = std::chrono::steady_clock::now();
+                double ms = 0.0;
+                while (sq_load(&hdr->seq_done) != s && ms < 500.0) {
+                    ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                }
+                worst_ms = std::max(worst_ms, ms);
+                if (sq_load(&hdr->seq_done) != s) {
+                    n_late++;
+                    ggml_expert_handoff_host_wake(host); // unstick it, as the next graph did
+                    while (sq_load(&hdr->seq_done) != s) { }
+                }
+            }
+        }
+        ggml_expert_handoff_host_free(host);
+        printf("  pool wake, %d workers: %d of 60 sends after an expired spin window unanswered for 500 ms (worst %.1f ms): %s\n",
+            nw, n_late, worst_ms, n_late == 0 ? "OK" : "FAIL");
+        ok = ok && n_late == 0;
+    }
+    ggml_free(ctx);
+    return ok;
+}
+
 static int run_bench(ggml_type type, int64_t n_embd, int64_t n_ff, int64_t n_expert, int n_layer,
         const std::vector<int> & workers, const std::vector<int> & miss_list, const std::vector<int> & token_list) {
     printf("bench: %s experts %lld x %lld, %lld per layer, %d layers (%.2f MiB per expert, %.1f GiB)\n",
@@ -918,6 +1006,10 @@ int main(int argc, char ** argv) {
                 n_fail++;
             }
         }
+    }
+    // the pool itself, on the host either way [TAG_EH_POOL_WAKE]
+    if (!test_pool_wake()) {
+        n_fail++;
     }
 
     if (be != cpu) {

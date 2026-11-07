@@ -139,7 +139,8 @@ void ggml_compute_forward_expert_handoff(const ggml_compute_params * params, ggm
     const int64_t timeout_ns = (int64_t) ggml_get_op_params_i32(dst, GGML_EXPERT_HANDOFF_P_TIMEOUT_MS)*1000000;
     const int64_t t0 = eh_now_ns();
     bool ok = true;
-    while (eh_load(&hdr->seq_done) != want) {
+    uint32_t done = 0;
+    while ((done = eh_load(&hdr->seq_done)) != want) {
         if (eh_now_ns() - t0 > timeout_ns) {
             ok = false;
             break;
@@ -147,6 +148,10 @@ void ggml_compute_forward_expert_handoff(const ggml_compute_params * params, ggm
         EH_PAUSE();
     }
     if (!ok) {
+        // [TAG_EH_TIMEOUT_DIAG] what it waited for and what it saw, for check()
+        eh_store(&hdr->to_want, want);
+        eh_store(&hdr->to_done, done);
+        eh_store((uint32_t *) &hdr->to_layer, (uint32_t) layer);
         eh_store(&hdr->n_timeouts, eh_load(&hdr->n_timeouts) + 1);
     }
 
@@ -228,6 +233,10 @@ struct ggml_expert_handoff_host {
     std::mutex mtx;
     std::condition_variable cv;
     uint64_t wake_gen = 0; // under mtx
+    // [TAG_EH_POOL_WAKE] the workers asleep in wait_work (worker 0 polls instead), and when the pool last answered
+    std::atomic<int>     n_asleep{0};
+    std::atomic<int64_t> t_active{0};
+    static constexpr int64_t active_ns = 1000*1000*1000; // in use: answered within the last second
 
     // spin this long after the last work or wake; the context also calls idle() once a graph's results are in, so the
     // spinning threads do not take the CPU from whatever runs between graphs (an MTP draft's own CPU work)
@@ -266,6 +275,18 @@ struct ggml_expert_handoff_host {
     std::atomic<uint64_t> st_host{0};
     std::atomic<uint64_t> st_busy_ns{0};
     int64_t t_seen = 0;
+    // [TAG_EH_TIMEOUT_DIAG] worker 0 writes these; get_stats may read a job's fields torn, which only blurs a diagnostic
+    std::atomic<uint64_t> st_multi{0};
+    std::atomic<uint64_t> st_busy_multi{0};
+    std::atomic<uint64_t> st_skipped{0};
+    std::atomic<uint64_t> st_max_ns{0};
+    std::atomic<int32_t>  st_max_layer{-1};
+    std::atomic<int32_t>  st_max_tokens{0};
+    std::atomic<int32_t>  st_max_miss{0};
+    std::atomic<int32_t>  st_max_uniq{0};
+    std::atomic<uint64_t> st_max_step[4] = {};
+    int32_t job_il = -1;
+    int64_t t_step[4] = {};      // worker 0: the end of each step of the job in run()
 
     void wake() {
         spin_until.store(eh_now_ns() + linger_ns, std::memory_order_release);
@@ -276,9 +297,23 @@ struct ggml_expert_handoff_host {
         cv.notify_all();
     }
 
+    // keep the pool spinning until at least t
+    void extend_spin(int64_t t) {
+        int64_t cur = spin_until.load(std::memory_order_relaxed);
+        while (cur < t && !spin_until.compare_exchange_weak(cur, t, std::memory_order_release, std::memory_order_relaxed)) {
+        }
+    }
+
     // wait for a new send; false if the pool stops. After a quiet spell the workers sleep, but worker 0 keeps looking
     // at the mailbox every millisecond and wakes them: a send can come long after the wake (the first kernels of a
-    // cold device load for hundreds of milliseconds), and the device cannot wake a sleeping pool itself
+    // cold device load for hundreds of milliseconds), and the device cannot wake a sleeping pool itself.
+    // [TAG_EH_POOL_WAKE] A worker can also fall asleep while worker 0 still spins: a job that ends after the spin window
+    // (a cold one, or one that follows a layer the device uploaded instead) lets the others pass the job's last barrier
+    // with the window run out, before worker 0 extends it. Worker 0 then took the next send while spinning, without
+    // waking anyone, and waited at the barrier for workers nothing woke until the context's next graph: every later
+    // layer of that graph gave up after the join's timeout (2026-11-07, Flash-Next in prod: every batch of more than one
+    // token). So the worker that finds a send wakes the sleepers (worker()), the workers extend the window before that
+    // barrier, and a sleeper of a pool in use waits a millisecond at most before it looks at the mailbox itself.
     bool wait_work(int iw, uint32_t seen, uint64_t & my_gen, uint32_t & s) {
         for (;;) {
             s = eh_load(&hdr->seq_send);
@@ -301,9 +336,22 @@ struct ggml_expert_handoff_host {
                         my_gen = wake_gen;
                     }
                 } else {
-                    std::unique_lock<std::mutex> lk(mtx);
-                    cv.wait(lk, [&] { return stop.load() || wake_gen != my_gen; });
-                    my_gen = wake_gen;
+                    // registered before it looks at the mailbox again, so a worker that finds a send after this look
+                    // also sees it asleep and wakes it
+                    n_asleep.fetch_add(1, std::memory_order_seq_cst);
+                    {
+                        std::unique_lock<std::mutex> lk(mtx);
+                        auto ready = [&] {
+                            return stop.load() || wake_gen != my_gen || eh_load(&hdr->seq_send) != seen;
+                        };
+                        if (eh_now_ns() - t_active.load(std::memory_order_relaxed) < active_ns) {
+                            cv.wait_for(lk, std::chrono::milliseconds(1), ready);
+                        } else {
+                            cv.wait(lk, ready);
+                        }
+                        my_gen = wake_gen;
+                    }
+                    n_asleep.fetch_sub(1, std::memory_order_seq_cst);
                 }
                 continue;
             }
@@ -315,10 +363,15 @@ struct ggml_expert_handoff_host {
 
     // worker 0: read the send, list the misses
     void prepare(uint32_t s) {
+        // [TAG_EH_TIMEOUT_DIAG] each send bumps seq_send by one: a bigger step means sends this pool never took up
+        if (s - seq > 1) {
+            st_skipped.fetch_add(s - seq - 1, std::memory_order_relaxed);
+        }
         seq = s;
         t_seen = eh_now_ns();
 
         const int32_t il = hdr->layer;
+        job_il = il;
         n_tokens         = hdr->n_tokens;
         const int32_t n_used = hdr->n_used;
 
@@ -508,6 +561,9 @@ struct ggml_expert_handoff_host {
             }
         }
         barrier.wait();
+        if (iw == 0) {
+            t_step[0] = eh_now_ns(); // [TAG_EH_TIMEOUT_DIAG]
+        }
 
         // 2. gate and up rows of every missed expert, each row against all the tokens that miss it while it is in
         //    the cache (with weight_before, the routing weight scales the input: it is linear up to here, so it
@@ -534,6 +590,9 @@ struct ggml_expert_handoff_host {
             }
         }
         barrier.wait();
+        if (iw == 0) {
+            t_step[1] = eh_now_ns(); // [TAG_EH_TIMEOUT_DIAG]
+        }
 
         // 3. the activation, in the down dot type
         {
@@ -549,6 +608,9 @@ struct ggml_expert_handoff_host {
             }
         }
         barrier.wait();
+        if (iw == 0) {
+            t_step[2] = eh_now_ns(); // [TAG_EH_TIMEOUT_DIAG]
+        }
 
         // 4. down rows: each worker owns a range of output columns for every token (tokens without misses get
         //    zeros); each missed expert's rows in that range are read once for all the tokens that miss it
@@ -588,6 +650,10 @@ struct ggml_expert_handoff_host {
             if (!wait_work(iw, seen, my_gen, s)) {
                 return;
             }
+            // [TAG_EH_POOL_WAKE] the barrier below needs every worker: wake those asleep
+            if (n_asleep.load(std::memory_order_seq_cst) > 0) {
+                wake();
+            }
             // every worker saw a new send; worker 0 reads it, the others wait
             barrier.wait();
             if (stop.load(std::memory_order_acquire)) {
@@ -606,11 +672,35 @@ struct ggml_expert_handoff_host {
                     memset(y + (int64_t) t*dims.max_embd, 0, n_embd*sizeof(float));
                 }
             }
+            // [TAG_EH_POOL_WAKE] the spin window counts from the end of this job for every worker, also one that took
+            // longer than the window (otherwise the others sleep past this barrier while worker 0 spins)
+            extend_spin(eh_now_ns() + linger_ns);
             barrier.wait();
             seen = seq;
             if (iw == 0) {
                 eh_store(&hdr->seq_done, seq);
-                st_busy_ns.fetch_add((uint64_t) (eh_now_ns() - t_seen), std::memory_order_relaxed);
+                const int64_t t_end = eh_now_ns();
+                t_active.store(t_end, std::memory_order_relaxed);
+                st_busy_ns.fetch_add((uint64_t) (t_end - t_seen), std::memory_order_relaxed);
+                // [TAG_EH_TIMEOUT_DIAG]
+                if (n_tokens > 1) {
+                    st_multi.fetch_add(1, std::memory_order_relaxed);
+                    st_busy_multi.fetch_add((uint64_t) (t_end - t_seen), std::memory_order_relaxed);
+                }
+                if ((uint64_t) (t_end - t_seen) > st_max_ns.load(std::memory_order_relaxed)) {
+                    const bool ran = job_layer != nullptr && !misses.empty() && !sim_nohost;
+                    st_max_ns.store((uint64_t) (t_end - t_seen), std::memory_order_relaxed);
+                    st_max_layer.store(job_il, std::memory_order_relaxed);
+                    st_max_tokens.store(n_tokens, std::memory_order_relaxed);
+                    st_max_miss.store((int32_t) misses.size(), std::memory_order_relaxed);
+                    st_max_uniq.store((int32_t) uniq.size(), std::memory_order_relaxed);
+                    int64_t prev = t_seen;
+                    for (int k = 0; k < 4; ++k) {
+                        const int64_t t = k < 3 ? (ran ? t_step[k] : prev) : t_end;
+                        st_max_step[k].store((uint64_t) std::max<int64_t>(0, t - prev), std::memory_order_relaxed);
+                        prev = std::max(prev, t);
+                    }
+                }
                 spin_until.store(std::max(spin_until.load(std::memory_order_relaxed), eh_now_ns() + linger_ns), std::memory_order_release);
             }
         }
@@ -633,6 +723,7 @@ ggml_expert_handoff_host_t ggml_expert_handoff_host_new(
 
     // a fresh mailbox: nothing sent, nothing answered
     h->seq_base = eh_load(&h->hdr->seq_send);
+    h->seq      = h->seq_base; // [TAG_EH_TIMEOUT_DIAG] prepare() counts the sends it never took up from here
     if (const char * v = getenv("ROCMFPX_EH_SIM_RESIDENT")) {
         h->sim_resident = std::max<int64_t>(0, atoll(v));
     }
@@ -731,6 +822,18 @@ void ggml_expert_handoff_host_get_stats(ggml_expert_handoff_host_t h, ggml_exper
     st->n_routed = h->st_routed.load();
     st->n_host   = h->st_host.load();
     st->busy_ns  = h->st_busy_ns.load();
+    // [TAG_EH_TIMEOUT_DIAG]
+    st->n_multi       = h->st_multi.load();
+    st->busy_ns_multi = h->st_busy_multi.load();
+    st->n_skipped     = h->st_skipped.load();
+    st->max_ns        = h->st_max_ns.load();
+    st->max_layer     = h->st_max_layer.load();
+    st->max_tokens    = h->st_max_tokens.load();
+    st->max_miss      = h->st_max_miss.load();
+    st->max_uniq      = h->st_max_uniq.load();
+    for (int k = 0; k < 4; ++k) {
+        st->max_step_ns[k] = h->st_max_step[k].load();
+    }
 }
 
 const uint64_t * ggml_expert_handoff_host_counts(ggml_expert_handoff_host_t h, int32_t il) {

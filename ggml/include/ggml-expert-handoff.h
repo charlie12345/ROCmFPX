@@ -24,7 +24,10 @@ struct ggml_expert_handoff_header {
     uint32_t seq_done;      // host: set to seq_send once y is in place
     uint32_t pad_done[15];
     uint32_t n_timeouts;    // device: joins that gave up waiting for the host (the host's experts are then missing)
-    uint32_t pad_err[15];
+    uint32_t to_want;       // device, the last join that gave up [TAG_EH_TIMEOUT_DIAG]: the send it waited for,
+    uint32_t to_done;       //   the host's last answer it saw,
+    int32_t  to_layer;      //   its layer
+    uint32_t pad_err[12];
     int32_t  layer;         // device, written before seq_send
     int32_t  n_tokens;
     int32_t  n_embd;

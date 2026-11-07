@@ -452,16 +452,17 @@ struct llama_expert_handoff::impl {
             host = api.host_new(mailbox, dims.max_tokens, dims.max_embd, dims.max_used, (int32_t) model.layers.size(), n_workers);
         }
 
+        // WARN so the server log shows the split (its default verbosity drops libllama INFO) [TAG_EH_TIMEOUT_DIAG]
         size_t n_cached = 0, n_all = 0;
         for (const group & g : groups) {
             n_cached += g.n_slots;
             n_all    += (size_t) g.layers.size()*g.n_expert;
-            LLAMA_LOG_INFO("%s: %s: %2zu layers, %s: %6d of %6d experts in VRAM (%.1f%%), %.2f MiB each\n", __func__,
+            LLAMA_LOG_WARN("%s: %s: %2zu layers, %s: %6d of %6d experts in VRAM (%.1f%%), %.2f MiB each\n", __func__,
                 ggml_backend_dev_name(devices[g.id].dev), g.layers.size(), ggml_type_name(g.ref[0]->type), g.n_slots,
                 (int32_t) (g.layers.size()*g.n_expert), 100.0*g.n_slots/std::max<size_t>(1, g.layers.size()*g.n_expert),
                 g.slot_bytes/1048576.0);
         }
-        LLAMA_LOG_INFO("%s: %zu of %zu experts cached%s, %d host workers, batches up to %d tokens split (above %d where "
+        LLAMA_LOG_WARN("%s: %zu of %zu experts cached%s, %d host workers, batches up to %d tokens split (above %d where "
             "the host is sooner than uploading)\n", __func__,
             n_cached, n_all, profile_counts.empty() ? " (no profile: the first experts of each layer)" : " by the profile",
             n_workers, dims.max_tokens, (int) n_small);
@@ -943,11 +944,25 @@ struct llama_expert_handoff::impl {
         if (mailbox == nullptr) {
             return;
         }
-        const uint32_t n = ((const volatile ggml_expert_handoff_header *) mailbox)->n_timeouts;
+        const volatile ggml_expert_handoff_header * hdr = (const volatile ggml_expert_handoff_header *) mailbox;
+        const uint32_t n = hdr->n_timeouts;
         if (n != timeouts_seen) {
             LLAMA_LOG_ERROR("%s: %u layer(s) gave up waiting for the host experts (%d ms each); their output lacks those experts\n",
                 __func__, n - timeouts_seen, timeout_ms);
             timeouts_seen = n;
+            // [TAG_EH_TIMEOUT_DIAG] whether the host was slow, never saw the send, or answered another one
+            if (host != nullptr) {
+                ggml_expert_handoff_stats st = {};
+                api.get_stats(host, &st);
+                LLAMA_LOG_ERROR("%s: the last one: layer %d waited for send %u, the host's last answer was %u (now: send %u, answer %u); "
+                    "host: %" PRIu64 " sends never taken up, %" PRIu64 " multi-token answers at %.1f ms, slowest %.1f ms "
+                    "(layer %d, %d tokens, %d misses of %d experts; inputs %.1f, gate/up %.1f, act %.1f, down %.1f ms)\n",
+                    __func__, (int) hdr->to_layer, (unsigned) hdr->to_want, (unsigned) hdr->to_done,
+                    (unsigned) hdr->seq_send, (unsigned) hdr->seq_done, st.n_skipped, st.n_multi,
+                    st.n_multi ? st.busy_ns_multi/1e6/st.n_multi : 0.0, st.max_ns/1e6, st.max_layer, st.max_tokens,
+                    st.max_miss, st.max_uniq, st.max_step_ns[0]/1e6, st.max_step_ns[1]/1e6, st.max_step_ns[2]/1e6,
+                    st.max_step_ns[3]/1e6);
+            }
         }
 
         // every 30 s of use: the hit rate and the host's time per layer since the last report
@@ -964,10 +979,13 @@ struct llama_expert_handoff::impl {
             const uint64_t d_layers = st.n_layers - last.n_layers;
             const uint64_t d_busy   = st.busy_ns - last.busy_ns;
             if (d_routed > 0) {
-                LLAMA_LOG_INFO("%s: %" PRIu64 " routed experts, VRAM hit rate %.1f%%, %" PRIu64 " layers sent to the host, %.0f us each, "
-                    "%" PRIu64 " experts swapped in\n",
+                // WARN, not INFO: the server's log drops libllama's INFO lines at its default verbosity, and this is the one
+                // line that shows how the cache does (owner, 2026-11-07: tuning Flash-Next in prod)
+                const uint64_t d_multi = st.n_multi - last.n_multi;
+                LLAMA_LOG_WARN("%s: %" PRIu64 " routed experts, VRAM hit rate %.1f%%, %" PRIu64 " layers sent to the host, %.0f us each "
+                    "(%" PRIu64 " of them multi-token, %.0f us each), %" PRIu64 " experts swapped in\n",
                     __func__, d_routed, 100.0*(1.0 - (double) d_host/d_routed), d_layers, d_layers ? d_busy/1000.0/d_layers : 0.0,
-                    n_swaps - n_swaps_reported);
+                    d_multi, d_multi ? (st.busy_ns_multi - last.busy_ns_multi)/1000.0/d_multi : 0.0, n_swaps - n_swaps_reported);
             }
             n_swaps_reported = n_swaps;
             // the estimates of host_sooner(): the share of routed experts the host computed, its bytes per second

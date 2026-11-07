@@ -199,6 +199,16 @@ extern "C" {
         uint64_t n_routed;  // experts routed in them
         uint64_t n_host;    // of which the host computed
         uint64_t busy_ns;   // time from a send to its answer
+        // [TAG_EH_TIMEOUT_DIAG] what a join that gave up needs explained
+        uint64_t n_multi;        // layers answered for batches of more than one token
+        uint64_t busy_ns_multi;  // their time from the send to the answer
+        uint64_t n_skipped;      // sends the host never took up: the device had sent the next one before it looked
+        uint64_t max_ns;         // the slowest answer so far, from the host seeing the send
+        int32_t  max_layer;      // its layer, batch, misses and distinct missed experts
+        int32_t  max_tokens;
+        int32_t  max_miss;
+        int32_t  max_uniq;
+        uint64_t max_step_ns[4]; // its steps: inputs, gate/up, activation, down
     };
 
     typedef struct ggml_expert_handoff_host * ggml_expert_handoff_host_t;

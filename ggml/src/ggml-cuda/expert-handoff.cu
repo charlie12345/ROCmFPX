@@ -138,7 +138,8 @@ static __global__ void k_expert_handoff_join(
         const uint32_t want = eh_dev_load(&hdr->seq_send);
         const uint64_t t0 = eh_dev_ticks();
         int good = 1;
-        while (eh_dev_load(&hdr->seq_done) != want) {
+        uint32_t done = 0;
+        while ((done = eh_dev_load(&hdr->seq_done)) != want) {
             if (eh_dev_ticks() - t0 > timeout_ticks) {
                 good = 0;
                 break;
@@ -146,6 +147,10 @@ static __global__ void k_expert_handoff_join(
             eh_dev_pause();
         }
         if (!good && blockIdx.x == 0) {
+            // [TAG_EH_TIMEOUT_DIAG] what it waited for and what it saw, for check()
+            eh_dev_store(&hdr->to_want, want);
+            eh_dev_store(&hdr->to_done, done);
+            eh_dev_store((uint32_t *) &hdr->to_layer, (uint32_t) layer);
             eh_dev_store(&hdr->n_timeouts, eh_dev_load(&hdr->n_timeouts) + 1);
         }
         ok = good;
